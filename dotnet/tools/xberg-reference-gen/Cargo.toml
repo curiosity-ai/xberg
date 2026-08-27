@@ -20,6 +20,25 @@ publish = false
 name = "xberg-reference-gen"
 path = "src/main.rs"
 
+# `extended` adds the xberg features the default set leaves off — the ones the C# port
+# is now growing counterparts for. Kept behind a cargo feature rather than switched on
+# outright: they change what a fixture extracts to, so the two builds answer different
+# questions and each needs its own golden set (see `--out`).
+[features]
+default = []
+extended = [
+    "xberg/tree-sitter",
+    "xberg/qr-codes",
+]
+# Layout-aware reading order. Separate from `extended` because it needs ONNX Runtime and
+# downloads model weights, so it is only worth building when the layout path is what is
+# being measured.
+layout = ["xberg/layout-detection"]
+# WordPerfect via the vendored libwpd/librevenge C++ shim. Kept separate because it needs a C++
+# toolchain and vendors boost; it exists so the managed reimplementation has a reference to be
+# measured against.
+wordperfect = ["xberg/wordperfect"]
+
 [dependencies]
 xberg = { path = "../../../crates/xberg", default-features = false, features = [
     "tokio-runtime",

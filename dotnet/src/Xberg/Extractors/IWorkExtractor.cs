@@ -21,7 +21,8 @@ public sealed class PagesExtractor : IExtractor
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         using var stream = new MemoryStream(content.ToArray(), writable: false);
-        using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+        // The outer container is validated before any package member is read.
+        using var archive = ZipBombValidator.OpenValidated(stream, config.SecurityLimits);
 
         var data = ParsePages(archive);
         var doc = Build(data);
@@ -146,7 +147,8 @@ public sealed class KeynoteExtractor : IExtractor
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         using var stream = new MemoryStream(content.ToArray(), writable: false);
-        using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+        // The outer container is validated before any package member is read.
+        using var archive = ZipBombValidator.OpenValidated(stream, config.SecurityLimits);
 
         var data = ParseKeynote(archive);
         var doc = Build(data);
@@ -236,7 +238,8 @@ public sealed class NumbersExtractor : IExtractor
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         using var stream = new MemoryStream(content.ToArray(), writable: false);
-        using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+        // The outer container is validated before any package member is read.
+        using var archive = ZipBombValidator.OpenValidated(stream, config.SecurityLimits);
 
         var data = NumbersParser.Parse(archive);
         var doc = Build(data);

@@ -79,7 +79,6 @@ public sealed class PptExtractor : IExtractor
         return doc;
     }
 
-    private sealed record PageInfoDto(uint Number);
 
     /// <summary>One slide's text, numbered by its position in the deck's own persist order.</summary>
     private readonly record struct PptSlideText(uint Number, string Text);

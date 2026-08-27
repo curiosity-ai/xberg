@@ -26,6 +26,7 @@ public sealed class OdsExtractor : IExtractor
     {
         byte[] bytes = content.ToArray();
         var sheets = ReadSheets(bytes);
+        TableBudget.ChargeSheets(SecurityBudget.FromConfig(config), sheets.Select(sh => sh.Cells));
 
         var props = ReadOfficeProperties(bytes);
 

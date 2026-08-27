@@ -51,7 +51,7 @@ internal static class HtmlPlainText
 
         if (node.Tag is null)
         {
-            string decoded = HtmlWalker.DecodeEntitiesFull(node.Text);
+            string decoded = HtmlWalker.DecodeEntitiesFull(node.Text, node.CanonicalAttrs);
             if (inPre) { buf.Append(decoded); return; }
             string normalized = NormalizeWhitespace(decoded);
             if (normalized.Length == 0) return;

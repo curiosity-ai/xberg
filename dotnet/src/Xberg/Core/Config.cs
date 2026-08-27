@@ -12,7 +12,7 @@ namespace Xberg.Core;
 [JsonConverter(typeof(OutputFormatConverter))]
 public readonly struct OutputFormat : IEquatable<OutputFormat>
 {
-    public enum Kind { Plain, Markdown, Djot, Html, Json, Structured, Custom }
+    public enum Kind { Plain, Markdown, Djot, Html, Json, Structured, DocTags, Custom }
 
     public Kind Which { get; }
     public string? CustomName { get; }
@@ -29,6 +29,7 @@ public readonly struct OutputFormat : IEquatable<OutputFormat>
     public static readonly OutputFormat Html = new(Kind.Html);
     public static readonly OutputFormat Json = new(Kind.Json);
     public static readonly OutputFormat Structured = new(Kind.Structured);
+    public static readonly OutputFormat DocTags = new(Kind.DocTags);
     public static OutputFormat Custom(string name) => new(Kind.Custom, name);
 
     /// <summary>Parse from a string (never fails; unknown → Custom of the lowercased string).</summary>
@@ -43,6 +44,7 @@ public readonly struct OutputFormat : IEquatable<OutputFormat>
             "html" => Html,
             "json" => Json,
             "structured" or "structured-ocr" => Structured,
+            "doctags" => DocTags,
             _ => Custom(lower),
         };
     }
@@ -55,6 +57,7 @@ public readonly struct OutputFormat : IEquatable<OutputFormat>
         Kind.Html => "html",
         Kind.Json => "json",
         Kind.Structured => "structured",
+        Kind.DocTags => "doctags",
         Kind.Custom => CustomName ?? "",
         _ => "plain",
     };
@@ -85,6 +88,45 @@ public sealed class ExtractionConfig
     // Content-relevant option stubs (defaults; extractors read these later).
     public bool ExtractImages { get; set; } = true;
     public bool ExtractTables { get; set; } = true;
+
+    /// <summary>
+    /// Decode the QR codes inside every extracted image, writing them to
+    /// <c>ExtractedImage.QrCodes</c> and appending their payloads to the document text.
+    /// </summary>
+    /// <remarks>
+    /// Opt-in, as upstream has it: decoding runs the detector over every image in the document,
+    /// which is real work to do on a caller's behalf without being asked.
+    /// </remarks>
+    [JsonPropertyName("qr_codes")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? QrCodes { get; set; }
+
+    /// <summary>
+    /// Limits applied to hostile input. <c>null</c> takes <see cref="SecurityLimits"/>' defaults,
+    /// which is what upstream's <c>Option&lt;SecurityLimits&gt;</c> does with <c>None</c>.
+    /// </summary>
+    [JsonPropertyName("security_limits")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public SecurityLimits? SecurityLimits { get; set; }
+
+    /// <summary>
+    /// How <c>OutputFormat.Html</c> is rendered. <c>null</c> keeps the markdown-based renderer;
+    /// setting it selects <see cref="Xberg.Rendering.StyledHtmlRenderer"/>.
+    /// </summary>
+    [JsonPropertyName("html_output")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public HtmlOutputConfig? HtmlOutput { get; set; }
+
+    /// <summary>
+    /// The input's file name, when the caller knows it. Used to fall back to extension-based
+    /// language detection where content-based detection — a shebang — says nothing.
+    /// </summary>
+    /// <remarks>
+    /// Not part of the wire format, matching upstream's <c>#[serde(skip)]</c>: it describes the
+    /// input rather than configuring the extraction.
+    /// </remarks>
+    [JsonIgnore]
+    public string? SourceName { get; set; }
 
     /// <summary>
     /// Port-local behavioural knobs (deadlines, implementation switches). Defaults to

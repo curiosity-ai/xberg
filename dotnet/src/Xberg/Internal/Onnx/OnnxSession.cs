@@ -35,11 +35,19 @@ internal sealed class OnnxSession
     /// compare every node against a reference dump; whole-graph outputs are unaffected either
     /// way.
     /// </param>
-    public OnnxSession(OnnxModel model, bool optimize = true)
+    /// <param name="reuseBuffers">
+    /// Let an element-wise node write its result over an operand that dies at it. Off is the
+    /// same graph computed into fresh buffers throughout, which is what the reuse is checked
+    /// against — see <c>--check-reuse</c> in <c>tools/Xberg.OnnxParity</c>.
+    /// </param>
+    public OnnxSession(OnnxModel model, bool optimize = true, bool reuseBuffers = true)
     {
         _model = optimize ? GraphOptimizer.Optimize(model) : model;
         _lastUse = ComputeLastUse(_model);
+        _reuseBuffers = reuseBuffers;
     }
+
+    private readonly bool _reuseBuffers;
 
     public static OnnxSession Load(string path) => new(OnnxModel.Load(path));
 
@@ -80,6 +88,9 @@ internal sealed class OnnxSession
         public required double[] NodeMicroseconds { get; init; }
         /// <summary>First output's shape per node, for reading the cost alongside the size.</summary>
         public required string[] NodeOutputShapes { get; init; }
+
+        /// <summary>Whether each node wrote its result over an operand rather than a new buffer.</summary>
+        public bool[]? NodeReusedOperand { get; init; }
     }
 
     /// <summary>
@@ -113,7 +124,15 @@ internal sealed class OnnxSession
             long startTicks = profile is null ? 0 : System.Diagnostics.Stopwatch.GetTimestamp();
             try
             {
-                outputs = Execute(node, env);
+                // A capturing run has to keep every intermediate, so nothing may be overwritten.
+                var reusable = _reuseBuffers && capture is null
+                    ? FindReusableOperand(node, env, _lastUse[i], declaredOutputs)
+                    : null;
+                outputs = Execute(node, env, reusable);
+
+                if (profile?.NodeReusedOperand is { } reused && reusable is not null)
+                    reused[i] = outputs.Length > 0
+                                && ReferenceEquals(outputs[0]?.Buffer, reusable.Buffer);
             }
             catch (Exception ex) when (ex is not NotSupportedException)
             {
@@ -177,6 +196,55 @@ internal sealed class OnnxSession
     }
 
     /// <summary>
+    /// An operand this node may write its output over, or <c>null</c> when there is none.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The element-wise operators are memory-bound: they read a buffer and write another one
+    /// the same size, and in this graph they are 17% of runtime across four hundred nodes. When
+    /// the operand they read is dead the moment they are done with it, the second buffer is
+    /// pure waste — the result can go back over the input, whose lines the producing node left
+    /// in cache.
+    /// </para>
+    /// <para>
+    /// Five conditions have to hold together, and each rules out a way this would be wrong:
+    /// the pool owns the array (an initializer is a constant shared by every run and a feed
+    /// belongs to the caller); exactly one value holds it (<c>Identity</c> and <c>Reshape</c>
+    /// bind a second name over the same storage, and that name would see the overwrite); the
+    /// name dies at this node (anything later reading it would read the result instead); it is
+    /// not a graph output (which the caller is about to be handed); and this node names it once
+    /// (an operand named twice is held once but read twice, so a count alone would call it
+    /// free).
+    /// </para>
+    /// </remarks>
+    private static Tensor? FindReusableOperand(
+        OnnxNode node, Dictionary<string, Tensor> env,
+        List<string> dying, HashSet<string> declaredOutputs)
+    {
+        if (dying.Count == 0) return null;
+
+        foreach (string input in node.Inputs)
+        {
+            if (input.Length == 0) continue;
+            if (!dying.Contains(input)) continue;
+            if (declaredOutputs.Contains(input)) continue;
+            if (!env.TryGetValue(input, out var tensor)) continue;
+            if (!tensor.IsFloat) continue;
+            if (tensor.Buffer is not { IsPooled: true, References: 1 }) continue;
+
+            // An operand named twice by the same node is held once but read twice; writing
+            // over it while the other read is still to come would corrupt the second.
+            int uses = 0;
+            foreach (string other in node.Inputs) if (other == input) uses++;
+            if (uses != 1) continue;
+
+            return tensor;
+        }
+
+        return null;
+    }
+
+    /// <summary>
     /// For each node, the values that are consumed for the last time by it. Graph outputs and
     /// initializers are excluded — the former are the result, the latter are shared constants.
     /// </summary>
@@ -187,15 +255,163 @@ internal sealed class OnnxSession
 
         var lastIndex = new Dictionary<string, int>(StringComparer.Ordinal);
         for (int i = 0; i < model.Nodes.Length; i++)
+        {
             foreach (string input in model.Nodes[i].Inputs)
                 if (input.Length > 0) lastIndex[input] = i;
+
+            // A subgraph reads outer-scope values by name, so a control-flow node keeps alive
+            // everything its body touches. Without this, a value used only inside a loop is
+            // released at its last *top-level* use and the loop finds it gone.
+            foreach (var attribute in model.Nodes[i].Attributes)
+                if (attribute.Graph is { } subgraph) MarkSubgraphReads(subgraph, i, lastIndex);
+        }
 
         foreach (var (name, index) in lastIndex)
             if (!model.Initializers.ContainsKey(name)) lastUse[index].Add(name);
         return lastUse;
     }
 
+    /// <summary>
+    /// Attribute every name a subgraph reads to the control-flow node that owns it, recursing
+    /// through nested subgraphs.
+    /// </summary>
+    /// <remarks>
+    /// Names the subgraph defines for itself are recorded too. That is deliberate: they are never
+    /// bound in the outer environment, so releasing them is a no-op, and separating them out
+    /// would buy nothing but a way to get the analysis subtly wrong.
+    /// </remarks>
+    private static void MarkSubgraphReads(OnnxSubgraph graph, int nodeIndex, Dictionary<string, int> lastIndex)
+    {
+        foreach (var inner in graph.Nodes)
+        {
+            foreach (string input in inner.Inputs)
+                if (input.Length > 0) lastIndex[input] = nodeIndex;
+            foreach (var attribute in inner.Attributes)
+                if (attribute.Graph is { } nested) MarkSubgraphReads(nested, nodeIndex, lastIndex);
+        }
+    }
+
     /// <summary>Fetch an operand, or null for an omitted optional input.</summary>
+    /// <summary>
+    /// ONNX <c>Loop</c>: run the body subgraph until the trip count runs out or its condition
+    /// goes false.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The body's formal inputs are, in order: the iteration number, the incoming condition, and
+    /// one per loop-carried value. Its outputs are the outgoing condition, the updated
+    /// loop-carried values, and then any scan outputs — per-iteration results that are stacked
+    /// along a new leading axis when the loop finishes.
+    /// </para>
+    /// <para>
+    /// Both the trip count and the initial condition are optional, and an omitted one means
+    /// "unbounded" rather than zero: a loop with neither would run forever, which the spec allows
+    /// and a body's own condition is expected to stop.
+    /// </para>
+    /// </remarks>
+    private Tensor?[] ExecuteLoop(OnnxNode node, Dictionary<string, Tensor> env)
+    {
+        var body = node.Attr("body")?.Graph
+            ?? throw new InvalidDataException("Loop: no body subgraph");
+
+        var tripCountTensor = Optional(node, env, 0);
+        long tripCount = tripCountTensor is { Count: > 0 } ? tripCountTensor.GetLong(0) : long.MaxValue;
+
+        var conditionTensor = Optional(node, env, 1);
+        bool condition = conditionTensor is not { Count: > 0 } || conditionTensor.GetLong(0) != 0;
+
+        int carriedCount = Math.Max(node.Inputs.Length - 2, 0);
+        var carried = new Tensor[carriedCount];
+        for (int i = 0; i < carriedCount; i++) carried[i] = Required(node, env, i + 2);
+
+        // Body outputs past the condition and the carried values are scan outputs, stacked at the
+        // end rather than carried between iterations.
+        int scanCount = Math.Max(body.Outputs.Length - 1 - carriedCount, 0);
+        var scans = new List<Tensor>[scanCount];
+        for (int i = 0; i < scanCount; i++) scans[i] = new List<Tensor>();
+
+        for (long iteration = 0; iteration < tripCount && condition; iteration++)
+        {
+            var inner = new Dictionary<string, Tensor>(StringComparer.Ordinal);
+            if (body.Inputs.Length > 0)
+                inner[body.Inputs[0].Name] = Tensor.Scalar(iteration);
+            if (body.Inputs.Length > 1)
+                inner[body.Inputs[1].Name] = Tensor.FromLongs([condition ? 1 : 0], ElementType.Bool);
+            for (int i = 0; i < carriedCount && i + 2 < body.Inputs.Length; i++)
+                inner[body.Inputs[i + 2].Name] = carried[i];
+
+            var produced = RunSubgraph(body, env, inner);
+
+            condition = produced[body.Outputs[0].Name].GetLong(0) != 0;
+            for (int i = 0; i < carriedCount; i++)
+                carried[i] = produced[body.Outputs[i + 1].Name];
+            for (int i = 0; i < scanCount; i++)
+                scans[i].Add(produced[body.Outputs[carriedCount + 1 + i].Name]);
+        }
+
+        var result = new Tensor?[carriedCount + scanCount];
+        for (int i = 0; i < carriedCount; i++) result[i] = carried[i];
+        for (int i = 0; i < scanCount; i++) result[carriedCount + i] = StackScanOutput(scans[i]);
+        return result;
+    }
+
+    /// <summary>Stack per-iteration scan results along a new leading axis.</summary>
+    /// <remarks>
+    /// A loop that never ran produces a zero-length leading axis, which is a legal shape and must
+    /// not be turned into an error or a scalar.
+    /// </remarks>
+    private static Tensor StackScanOutput(List<Tensor> slices)
+    {
+        if (slices.Count == 0) return Tensor.AllocateFloat(0);
+
+        var first = slices[0];
+        var shape = new int[first.Shape.Length + 1];
+        shape[0] = slices.Count;
+        Array.Copy(first.Shape, 0, shape, 1, first.Shape.Length);
+
+        var result = first.IsFloat ? Tensor.AllocateFloat(shape) : Tensor.AllocateLong(first.Type, shape);
+        int stride = first.Count;
+        for (int i = 0; i < slices.Count; i++)
+        {
+            if (first.IsFloat) Array.Copy(slices[i].Floats, 0, result.Floats, i * stride, stride);
+            else Array.Copy(slices[i].Longs, 0, result.Longs, i * stride, stride);
+        }
+        return result;
+    }
+
+    /// <summary>
+    /// Run a subgraph, returning every value it produced.
+    /// </summary>
+    /// <remarks>
+    /// A subgraph reads outer-scope values by name, so the outer environment seeds the inner one;
+    /// the explicit bindings then shadow it, which is what makes a body input named the same as
+    /// an outer value resolve to the iteration's own copy.
+    /// </remarks>
+    private Dictionary<string, Tensor> RunSubgraph(
+        OnnxSubgraph graph, IReadOnlyDictionary<string, Tensor> outer, Dictionary<string, Tensor> bindings)
+    {
+        var env = new Dictionary<string, Tensor>(outer, StringComparer.Ordinal);
+        foreach (var (name, tensor) in graph.Initializers) env[name] = tensor;
+        foreach (var (name, tensor) in bindings) env[name] = tensor;
+
+        foreach (var inner in graph.Nodes)
+        {
+            // A subgraph's values are bound by name into a shared scope and never unbound, so
+            // nothing here is known to be dead and nothing may be overwritten.
+            var outputs = Execute(inner, env, null);
+            for (int o = 0; o < inner.Outputs.Length && o < outputs.Length; o++)
+            {
+                if (inner.Outputs[o].Length == 0 || outputs[o] is null) continue;
+                env[inner.Outputs[o]] = outputs[o]!;
+            }
+        }
+
+        foreach (var output in graph.Outputs)
+            if (!env.ContainsKey(output.Name))
+                throw new InvalidOperationException($"onnx: subgraph output '{output.Name}' was never produced");
+        return env;
+    }
+
     private static Tensor? Optional(OnnxNode node, IReadOnlyDictionary<string, Tensor> env, int index)
     {
         if (index >= node.Inputs.Length) return null;
@@ -235,9 +451,9 @@ internal sealed class OnnxSession
     /// wrong kernel from a correct one amplifying drift that arrived from upstream; this can.
     /// </para>
     /// </summary>
-    public Tensor?[] ExecuteNode(OnnxNode node, Dictionary<string, Tensor> env) => Execute(node, env);
+    public Tensor?[] ExecuteNode(OnnxNode node, Dictionary<string, Tensor> env) => Execute(node, env, null);
 
-    private Tensor?[] Execute(OnnxNode node, Dictionary<string, Tensor> env)
+    private Tensor?[] Execute(OnnxNode node, Dictionary<string, Tensor> env, Tensor? reusable)
     {
         switch (node.OpType)
         {
@@ -247,11 +463,11 @@ internal sealed class OnnxSession
             case "Identity":
                 return [Required(node, env, 0)];
 
-            case "Add": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Add)];
-            case "Sub": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Sub)];
-            case "Mul": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Mul)];
-            case "Div": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Div)];
-            case "Pow": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Pow)];
+            case "Add": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Add, reusable)];
+            case "Sub": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Sub, reusable)];
+            case "Mul": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Mul, reusable)];
+            case "Div": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Div, reusable)];
+            case "Pow": return [Elementwise.Binary(Required(node, env, 0), Required(node, env, 1), BinaryKind.Pow, reusable)];
 
             case "Min":
             case "Max":
@@ -263,8 +479,124 @@ internal sealed class OnnxSession
                 return [accumulator];
             }
 
-            case "Relu": return [Elementwise.Relu(Required(node, env, 0))];
-            case "Sigmoid": return [Elementwise.Sigmoid(Required(node, env, 0))];
+            case "Loop":
+                return ExecuteLoop(node, env);
+
+            case "If":
+            {
+                bool condition = Required(node, env, 0).GetLong(0) != 0;
+                var branch = node.Attr(condition ? "then_branch" : "else_branch")?.Graph
+                    ?? throw new InvalidDataException($"If: no {(condition ? "then" : "else")} branch");
+                var produced = RunSubgraph(branch, env, new Dictionary<string, Tensor>(StringComparer.Ordinal));
+                return branch.Outputs.Select(o => (Tensor?)produced[o.Name]).ToArray();
+            }
+
+            case "OneHot":
+                return [Indexing.OneHot(
+                    Required(node, env, 0), Required(node, env, 1), Required(node, env, 2),
+                    (int)node.AttrInt("axis", -1))];
+
+            case "ScatterElements":
+                return [Indexing.ScatterElements(
+                    Required(node, env, 0), Required(node, env, 1), Required(node, env, 2),
+                    (int)node.AttrInt("axis", 0))];
+
+            case "Not": return [Elementwise.Not(Required(node, env, 0))];
+
+            case "And":
+            case "Or":
+            case "Xor":
+            {
+                var kind = node.OpType switch
+                {
+                    "And" => LogicalKind.And,
+                    "Or" => LogicalKind.Or,
+                    _ => LogicalKind.Xor,
+                };
+                return [Elementwise.Logical(Required(node, env, 0), Required(node, env, 1), kind)];
+            }
+
+            case "Floor": return [Elementwise.Floor(Required(node, env, 0))];
+            case "Sin": return [Elementwise.Sin(Required(node, env, 0))];
+            case "Cos": return [Elementwise.Cos(Required(node, env, 0))];
+
+            case "CumSum":
+                return [Reductions.CumSum(
+                    Required(node, env, 0), (int)Required(node, env, 1).GetLong(0),
+                    node.AttrInt("exclusive", 0) != 0, node.AttrInt("reverse", 0) != 0)];
+
+            case "DynamicQuantizeLinear":
+            {
+                var (quantized, scale, zeroPoint) = Quantized.DynamicQuantizeLinear(Required(node, env, 0));
+                return [quantized, scale, zeroPoint];
+            }
+
+            case "MatMulInteger":
+                return [Quantized.MatMulInteger(
+                    Required(node, env, 0), Required(node, env, 1),
+                    Optional(node, env, 2), Optional(node, env, 3))];
+
+            case "ConvInteger":
+                return [Quantized.ConvInteger(
+                    Required(node, env, 0), Required(node, env, 1),
+                    Optional(node, env, 2), Optional(node, env, 3),
+                    node.AttrInts("strides"), node.AttrInts("pads"), node.AttrInts("dilations"),
+                    node.AttrInt("group", 1), node.AttrString("auto_pad", "NOTSET"))];
+
+            case "Greater":
+            case "GreaterOrEqual":
+            case "Less":
+            case "LessOrEqual":
+            case "Equal":
+            {
+                var kind = node.OpType switch
+                {
+                    "Greater" => CompareKind.Greater,
+                    "GreaterOrEqual" => CompareKind.GreaterOrEqual,
+                    "Less" => CompareKind.Less,
+                    "LessOrEqual" => CompareKind.LessOrEqual,
+                    _ => CompareKind.Equal,
+                };
+                return [Elementwise.Compare(Required(node, env, 0), Required(node, env, 1), kind)];
+            }
+
+            case "Mod":
+                return [Elementwise.Mod(
+                    Required(node, env, 0), Required(node, env, 1), node.AttrInt("fmod", 0) != 0)];
+
+            case "GatherND":
+                return [Indexing.GatherND(
+                    Required(node, env, 0), Required(node, env, 1), (int)node.AttrInt("batch_dims", 0))];
+
+            case "ScatterND":
+                return [Indexing.ScatterND(
+                    Required(node, env, 0), Required(node, env, 1), Required(node, env, 2))];
+
+            case "EyeLike":
+            {
+                var dtype = node.Attr("dtype");
+                return [Indexing.EyeLike(
+                    Required(node, env, 0), (int)node.AttrInt("k", 0),
+                    dtype is null ? null : (ElementType)dtype.Int)];
+            }
+
+            case "Einsum":
+            {
+                var operands = new List<Tensor>(node.Inputs.Length);
+                for (int i = 0; i < node.Inputs.Length; i++) operands.Add(Required(node, env, i));
+                return [EinsumKernel.Apply(node.AttrString("equation", ""), operands)];
+            }
+
+            case "Range":
+                return [Shapes.Range(
+                    Required(node, env, 0), Required(node, env, 1), Required(node, env, 2))];
+
+            case "Where":
+                return [Elementwise.Where(
+                    Required(node, env, 0), Required(node, env, 1), Required(node, env, 2))];
+
+            case "Relu": return [Elementwise.Relu(Required(node, env, 0), reusable)];
+            case "Sigmoid": return [Elementwise.Sigmoid(Required(node, env, 0), reusable)];
             case "Sqrt": return [Elementwise.Sqrt(Required(node, env, 0))];
             case "Exp": return [Elementwise.Exp(Required(node, env, 0))];
             case "Log": return [Elementwise.Log(Required(node, env, 0))];

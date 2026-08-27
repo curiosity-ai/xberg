@@ -154,41 +154,9 @@ internal sealed class RtDetrModel
         Math.Clamp(y2, 0f, height));
 
     /// <summary>
-    /// The Docling export's preprocessing contract: bilinear resize to an exact
-    /// <see cref="InputSize"/> square, then a plain <c>/255</c> rescale into NCHW.
-    /// <para>
-    /// Two things here are easy to get wrong and both shift every predicted box. The resize
-    /// does <em>not</em> preserve aspect ratio — the model is told the true page geometry
-    /// through <c>orig_target_sizes</c> and undoes the distortion itself — and there is no
-    /// ImageNet mean/standard-deviation normalisation, unlike most detection exports.
-    /// </para>
+    /// Rescale-only preprocessing at this model's input resolution.
     /// </summary>
-    internal static void PreprocessRescale(Image<Rgb24> page, float[] destination, int offset = 0)
-    {
-        using var resized = page.Clone(context => context.Resize(new ResizeOptions
-        {
-            Size = new Size(InputSize, InputSize),
-            Sampler = KnownResamplers.Triangle, // bilinear, matching image::imageops::Triangle
-            Mode = ResizeMode.Stretch,
-        }));
-
-        int plane = InputSize * InputSize;
-        const float scale = 1f / 255f;
-
-        resized.ProcessPixelRows(accessor =>
-        {
-            for (int y = 0; y < accessor.Height; y++)
-            {
-                var row = accessor.GetRowSpan(y);
-                int rowOffset = offset + y * InputSize;
-                for (int x = 0; x < row.Length; x++)
-                {
-                    var pixel = row[x];
-                    destination[rowOffset + x] = pixel.R * scale;
-                    destination[plane + rowOffset + x] = pixel.G * scale;
-                    destination[2 * plane + rowOffset + x] = pixel.B * scale;
-                }
-            }
-        });
-    }
+    /// <remarks>Delegates to the shared implementation; see <see cref="LayoutPreprocessing"/>.</remarks>
+    internal static void PreprocessRescale(Image<Rgb24> page, float[] destination, int offset = 0) =>
+        LayoutPreprocessing.PreprocessRescale(page, destination, InputSize, offset);
 }

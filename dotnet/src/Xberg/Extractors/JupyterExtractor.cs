@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Xberg.Core;
 using Xberg.Internal.Markup;
+using Xberg.Internal.MathMarkup;
 using Xberg.Types;
 
 namespace Xberg.Extractors;
@@ -19,6 +20,10 @@ public sealed class JupyterExtractor : IExtractor
 
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
+        // Upstream's one-line growth guard: the input's own size is charged against
+        // `max_content_size` before parsing, so a document too large to render is refused
+        // rather than rendered and then found to be too large.
+        SecurityBudget.FromConfig(config).AccountText(content.Length);
         var node = JsonNode.Parse(content.ToArray()) ?? throw new JsonException("invalid notebook");
         var notebook = node.AsObject();
 
@@ -235,6 +240,20 @@ public sealed class JupyterExtractor : IExtractor
                 if (output["data"] is not JsonObject data) break;
                 if (!plain)
                 {
+                    // A tool that ships `text/latex` has already decided the output is math, and
+                    // the LaTeX states the equation exactly — nothing richer can be recovered
+                    // from the HTML or the repr of the same result. `text/latex` arrives
+                    // delimited; the formula element holds bare LaTeX and the renderers put the
+                    // delimiters back.
+                    if (data.TryGetPropertyValue("text/latex", out var latex))
+                    {
+                        string text = ExtractSource(latex);
+                        if (text.Trim().Length != 0)
+                        {
+                            string bare = MathMl.StripMathDelimiters(text);
+                            if (bare.Length != 0) { builder.PushFormula(bare, null, null); break; }
+                        }
+                    }
                     if (data.TryGetPropertyValue("text/html", out var html))
                     {
                         string text = ExtractSource(html).Trim();

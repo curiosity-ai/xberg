@@ -18,7 +18,7 @@ public static class Mime
     private static readonly Dictionary<string, string> ExtToMime = BuildExtTable();
 
     /// <summary>Extension-only detection (never reads content). Returns null when unknown.</summary>
-    public static string? DetectMimeType(string path, bool checkExists)
+    public static string? DetectMimeType(string path, bool checkExists, bool sourceCode = true)
     {
         if (checkExists && !File.Exists(path))
             throw new FileNotFoundException($"File does not exist: {path}", path);
@@ -28,11 +28,20 @@ public static class Mime
         ext = ext.ToLowerInvariant();
         if (ext.Length > 0 && ExtToMime.TryGetValue(ext, out var mime))
             return mime;
+
+        // Only after the format table has had its say: `.json`, `.yaml`, `.md` and `.html` are
+        // languages tree-sitter knows and formats xberg handles, and the format wins.
+        if (sourceCode && Internal.Code.CodeLanguages.FromPath(path) is not null)
+            return CodeMimeType;
+
         return null;
     }
 
+    /// <summary>The MIME every source file resolves to, whatever language it turns out to be.</summary>
+    public const string CodeMimeType = "text/x-source-code";
+
     /// <summary>Content-based detection. Returns null when the type cannot be determined.</summary>
-    public static string? DetectMimeTypeFromBytes(ReadOnlySpan<byte> content)
+    public static string? DetectMimeTypeFromBytes(ReadOnlySpan<byte> content, bool sourceCode = true)
     {
         string? magic = SniffMagic(content);
         if (magic is not null)
@@ -43,7 +52,20 @@ public static class Mime
                 if (office is not null) return office;
             }
             if (SupportedMimeTypes.Contains(magic) || magic.StartsWith("image/"))
+            {
+                // The magic sniff reads the `<?xml` declaration and stops at generic XML, so the
+                // vocabulary check has to run before that result is returned. A caller may pass a
+                // truncated header, so decode lossily: a split multi-byte character must not
+                // suppress the check.
+                if (IsGenericXmlMime(magic))
+                {
+                    string prolog = System.Text.Encoding.UTF8.GetString(
+                        content[..Math.Min(content.Length, 8192)]);
+                    string? vocabulary = XmlVocabulary(prolog.TrimStart());
+                    if (vocabulary is not null) return vocabulary;
+                }
                 return magic;
+            }
             // else fall through to PST/text heuristics
         }
 
@@ -72,9 +94,14 @@ public static class Mime
             if (!trimmed.StartsWith("<?xml", StringComparison.Ordinal) && LooksLikeHtml(SkipLeadingComments(trimmed)))
                 return "text/html";
             if (trimmed.StartsWith("<?xml", StringComparison.Ordinal) || trimmed.StartsWith('<'))
-                return "application/xml";
+                return XmlVocabulary(trimmed) ?? "application/xml";
             if (trimmed.StartsWith("%PDF", StringComparison.Ordinal))
                 return "application/pdf";
+            // A shebang is the last thing checked: every signature above is more specific than
+            // "some script", and a file that matched one of them is not source whatever its
+            // first line says.
+            if (sourceCode && Internal.Code.CodeLanguages.FromContent(trimmed) is not null)
+                return CodeMimeType;
             return "text/plain";
         }
 
@@ -96,10 +123,10 @@ public static class Mime
     /// says nothing at all; generic XML cannot tell FictionBook from DocBook; generic JSON cannot
     /// tell a notebook from line-delimited JSON.
     /// </remarks>
-    public static string ResolveWithContent(string? extensionMime, ReadOnlySpan<byte> content)
+    public static string ResolveWithContent(string? extensionMime, ReadOnlySpan<byte> content, bool sourceCode = true)
     {
         if (extensionMime is null)
-            return DetectMimeTypeFromBytes(content) ?? OctetStream;
+            return DetectMimeTypeFromBytes(content, sourceCode) ?? OctetStream;
 
         // Upstream reads a 4 KiB header rather than the whole file, which is visible behaviour:
         // the JSON check parses what it was given, so a large JSON body in a mis-named file does
@@ -107,7 +134,7 @@ public static class Mime
         var header = content.Length > MagicHeaderBytes ? content[..MagicHeaderBytes] : content;
         if (header.IsEmpty) return extensionMime;
 
-        string? fromMagic = DetectMimeTypeFromBytes(header);
+        string? fromMagic = DetectMimeTypeFromBytes(header, sourceCode);
         if (fromMagic is null || fromMagic == extensionMime) return extensionMime;
 
         if (fromMagic == "text/plain") return extensionMime;
@@ -122,6 +149,118 @@ public static class Mime
 
     /// <summary>How much of a file upstream reads when checking content against the extension.</summary>
     private const int MagicHeaderBytes = 4096;
+
+    private const string DocbookMimeType = "application/docbook+xml";
+    private const string JatsMimeType = "application/x-jats+xml";
+
+    /// <summary>
+    /// The XML vocabulary <paramref name="trimmed"/> declares, if it declares one.
+    /// </summary>
+    /// <remarks>
+    /// Real DocBook and JATS documents use the <c>.xml</c> extension, so the extension map alone
+    /// routes them to the generic XML extractor and their structure and equations are lost. The
+    /// test is structural rather than a search of the text: a public identifier counts only
+    /// inside the DOCTYPE declaration, and a namespace only when the root element declares it, so
+    /// a stylesheet, schema or catalog that merely names DocBook keeps its generic routing.
+    /// </remarks>
+    private static string? XmlVocabulary(string trimmed)
+    {
+        string? doctype = DeclarationOf(trimmed, "<!DOCTYPE");
+        if (doctype is not null)
+        {
+            if (doctype.Contains("//OASIS//DTD DocBook", StringComparison.Ordinal)) return DocbookMimeType;
+            if (doctype.Contains("//NLM//DTD JATS", StringComparison.Ordinal)
+                || doctype.Contains("//NLM//DTD Journal", StringComparison.Ordinal)) return JatsMimeType;
+        }
+        string? root = RootStartTag(trimmed);
+        if (root is null) return null;
+        return RootIsInNamespace(root, "http://docbook.org/ns/docbook") ? DocbookMimeType : null;
+    }
+
+    /// <summary>
+    /// Whether the root element itself belongs to <paramref name="ns"/>. A declaration alone
+    /// proves nothing — an XSL stylesheet that transforms DocBook binds the namespace on its own
+    /// root — so the element belongs to it only when the binding it carries is the one its name
+    /// uses.
+    /// </summary>
+    private static bool RootIsInNamespace(string root, string ns)
+    {
+        string name = root.TrimStart('<').Split(' ', '\t', '\n', '\r', '>', '/')[0];
+        int colon = name.IndexOf(':');
+        string binding = colon >= 0 ? $"xmlns:{name[..colon]}=" : "xmlns=";
+        int start = root.IndexOf(binding, StringComparison.Ordinal);
+        if (start < 0) return false;
+        string value = root[(start + binding.Length)..];
+        if (value.Length == 0) return false;
+        char quote = value[0];
+        if (quote != '"' && quote != '\'') return false;
+        int end = value.IndexOf(quote, 1);
+        return end > 0 && value[1..end] == ns;
+    }
+
+    /// <summary>
+    /// The declaration beginning with <paramref name="opener"/>, delimiters included. An internal
+    /// subset may hold a <c>&gt;</c> inside its brackets, so the scan tracks bracket depth rather
+    /// than searching for a <c>]</c> anywhere in the document — a <c>]</c> in the body would
+    /// otherwise stretch the declaration over the whole file.
+    /// </summary>
+    private static string? DeclarationOf(string trimmed, string opener)
+    {
+        int start = trimmed.IndexOf(opener, StringComparison.Ordinal);
+        if (start < 0) return null;
+        string rest = trimmed[start..];
+        int end = DoctypeEnd(rest[opener.Length..]);
+        return end < 0 ? null : rest[..(opener.Length + end)];
+    }
+
+    /// <summary>
+    /// The offset of the <c>&gt;</c> that closes a <c>&lt;!DOCTYPE</c> declaration whose tail
+    /// starts at <paramref name="tail"/>, or -1 when it never closes.
+    /// </summary>
+    private static int DoctypeEnd(string tail)
+    {
+        int bracketDepth = 0;
+        for (int i = 0; i < tail.Length; i++)
+        {
+            char c = tail[i];
+            if (c == '[') bracketDepth++;
+            else if (c == ']') { if (bracketDepth > 0) bracketDepth--; }
+            else if (c == '>' && bracketDepth == 0) return i;
+        }
+        return -1;
+    }
+
+    /// <summary>The document's root start tag, skipping declarations and processing instructions.</summary>
+    private static string? RootStartTag(string trimmed)
+    {
+        string rest = trimmed;
+        while (true)
+        {
+            int open = rest.IndexOf('<');
+            if (open < 0) return null;
+            rest = rest[open..];
+            if (rest.StartsWith("<?", StringComparison.Ordinal) || rest.StartsWith("<!", StringComparison.Ordinal))
+            {
+                int skip;
+                if (rest.StartsWith("<!DOCTYPE", StringComparison.Ordinal))
+                {
+                    string? decl = DeclarationOf(rest, "<!DOCTYPE");
+                    if (decl is null) return null;
+                    skip = decl.Length;
+                }
+                else
+                {
+                    skip = rest.IndexOf('>');
+                    if (skip < 0) return null;
+                }
+                if (skip + 1 > rest.Length) return null;
+                rest = rest[(skip + 1)..];
+                continue;
+            }
+            int close = rest.IndexOf('>');
+            return close < 0 ? null : rest[..(close + 1)];
+        }
+    }
 
     private static bool IsGenericXmlMime(string mime) => mime is "application/xml" or "text/xml";
 
@@ -336,6 +475,10 @@ public static class Mime
         void Add(string mime, params string[] exts) { foreach (var e in exts) m[e] = mime; }
 
         Add("text/plain", "txt");
+        // Extension only, as upstream has it. The corpus's DocTags streams are named
+        // `*.doctags.txt` and so resolve as plain text, which is why none of them reaches the
+        // DocTags extractor and why adding a content sniff here would move them.
+        Add(Xberg.Internal.DocTags.DocTagsMime.MimeType, "doctags");
         Add("text/markdown", "md", "markdown");
         Add("text/x-commonmark", "commonmark");
         Add("text/x-quarto", "qmd");
@@ -367,6 +510,7 @@ public static class Mime
         Add("application/vnd.oasis.opendocument.presentation", "odp");
         Add("application/x-dbf", "dbf");
         Add("application/x-hwp", "hwp");
+        Add("application/vnd.wordperfect", "wpd", "wp", "wp5", "wp6");
         Add("application/haansofthwpx", "hwpx");
         Add("image/bmp", "bmp");
         Add("image/gif", "gif");

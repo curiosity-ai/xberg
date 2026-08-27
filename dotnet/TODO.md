@@ -6,26 +6,186 @@ Each format is "done" when the `Xberg.TestRunner` output matches the locally gen
 `{filename}-results-rust.json` golden files for its fixtures (documented deviations allowed).
 See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate them.
 
-> **Status.** Goldens are generated for **3165 fixtures**, the corpus having grown when the
-> August upstream merge advanced `test_documents` — the new ones are maths-heavy HTML/XML and a
-> large `office/regression` set of real-world HTML.
+> **Status — read this before trusting any number below.** The goldens are **not committed**,
+> and a fresh container starts without them. They were regenerated on 2026-08-24 against the
+> current Rust tree: 3165 fixtures, one sorted single-process run, `failed=0`.
 >
-> **2770 of 2787 comparable fixtures (99.4%) match on every hard dimension**; **0
-> catastrophes**; **0 content losses**; 1466 unit tests. **Genuine port gaps: 0** — every one of
-> the 17 remaining failures is an order-dependent golden (7), an upstream defect or corpus drift
-> (7), a wall-clock truncation (2), or one deliberate non-port where matching upstream would
-> cost silent content loss (1). Classified fixture by fixture below. The denominator is the
-> fixtures Rust itself can extract —
-> 155 of the 2,942 walked, it cannot, and counting those against this port measures nothing.
-> Measured on the whole corpus in one run, which is the only figure that means anything: a
-> per-format run validated the mime sniff on md and txt while it was quietly handing three PDFs
-> to the HTML extractor.
+> **That regeneration moved the target.** Every figure in the rest of this file was measured
+> against goldens generated on **2026-08-12**, and 18 commits have landed under `crates/` since.
+> Two of them matter most:
+>
+> - **`13cdad2f` upgraded `html-to-markdown-rs` from 3.10.6 to the 3.11 line** — 5327 lines of
+>   converter diff. This port was written against 3.10.6, so the HTML fixtures went from nearly
+>   all passing to nearly all failing overnight. Porting that upgrade is the open work; see
+>   "The 3.11 converter upgrade" below.
+> - **`ec94d8c0` (#1414) populates formulas for every format** — ~10k lines across docx, odt,
+>   orgmode, pptx, rst, typst, jats and pdf. `$$…$$` inline math now leaves the paragraph and
+>   becomes its own Formula element; `org/math/latex_0d83c6.org` is the shortest example.
+>
+> Also fixed here: `dotnet/tools/xberg-reference-gen`'s own lock had drifted to
+> **html-to-markdown-rs 3.11.2** where the root workspace lock resolves **3.11.0** — 362 lines
+> apart across the converter, so goldens generated from it would have encoded a converter
+> upstream does not ship. It is pinned to the root lock now, and `--precise` is the way to keep
+> it there after any dependency bump. `pdf_oxide` (0.3.77) and `comrak` (0.54.0) match on both
+> sides. The generator also walks sorted (it was readdir order, which is irreproducible against
+> a process-global font cache) and runs each fixture on its own task, so a backend parser's
+> panic costs one golden rather than aborting the run.
+>
+> **Where it stands against the new goldens**, whole corpus in one run — the only figure that
+> means anything:
+>
+> | | at regeneration | 2026-08-24 | now |
+> |---|---|---|---|
+> | fixtures walked | 3165 | 3165 | 3165 |
+> | comparable (Rust extracts something) | 3007 | 3007 | 3007 |
+> | **matching on every hard dimension** | **2839 (94.4%)** | **2841 (94.5%)** | **2926 (97.3%)** |
+> | with `--strict-md` | 2839 | 2841 | 2849 (94.7%) |
+> | failing at least one | 168 | 166 | 81 |
+> | catastrophes | 0 | 0 | 0 |
+> | content losses | 3 (html) | 3 (html) | 2 (html) |
+>
+> Re-run whole-corpus after this session's work: **2926 of 3007, unchanged**. The only line
+> that moved is "rust failed, C# produced output", 78 to 82 — the four HEIF-family fixtures the
+> reference cannot open and this port now reads. They are not comparable, so they neither help
+> nor hurt the figure above; the per-format table is identical row for row.
+>
+> **Two formats added since sit outside that run.** WordPerfect's fixtures live in the upstream
+> `wordperfect` corpus rather than `test_documents`, and its goldens need
+> `xberg-reference-gen --features wordperfect` (a C++ toolchain and vendored boost); against
+> those it is 7 of 7 comparable fixtures on every hard dimension. HEIC/HEIF/AVIF has no golden
+> at all — the reference generator has never enabled the `images` feature, so every image
+> fixture in `test_documents` reads "Unsupported format" — and is measured against libheif
+> directly. Neither moves the numbers above in either direction.
+>
+> The 81 remaining, by format: **html 71**, pdf 8, and one each in xml and dbf. Every other
+> format in the corpus is at full parity on the hard dimensions. Both the xml and the dbf
+> failures are upstream defects this port deliberately does not reproduce (see "Genuine upstream
+> defects"), so outside html and pdf there is nothing left to fix.
+>
+> Formats brought to full parity since the regeneration: org (7 -> 12 of 12), ipynb
+> (7 -> 16 of 16), docbook (3 -> 4 of 4), typ (6 -> 12 of 12), adoc (0 -> 6 of 6),
+> jats (1 -> 3 of 3), rst (11 -> 15 of 15), docx (44 -> 46 of 46), odt (20 -> 21 of 21),
+> qmd (2 -> 3 of 3), mdx (4 -> 5 of 5), txt (990 -> 991 of 991). Improved: html
+> (15 -> 86 of 157), xml (5 -> 14 of 15).
+>
+> **The last pass, format by format** (each closed by a fix traced to an upstream line, with a
+> unit test alongside it):
+>
+> - **rst** — no handler at all for `.. figure::`, `.. list-table::` or `.. csv-table::`, so all
+>   three fell through to the generic directive path: the figure emitted its `:target:` and
+>   `:scale:` option lines as paragraphs, and the two table directives read as bullet lists.
+> - **qmd / mdx** — two places where the markdown parser flattened text pulldown-cmark keeps
+>   verbatim. Trailing whitespace was stripped where paragraph lines are *joined*, and a math
+>   span reads its body straight out of that joined string, so a display equation ending a line
+>   in a space lost it; pulldown-cmark drops that whitespace at the line ending instead, in the
+>   inline scanner. And block-level raw HTML was emitted one event per line without the line
+>   ending, which collapsed a multi-line `<summary>` inside a list item onto one line.
+> - **docx** — `<w:lastRenderedPageBreak/>` reached mid-paragraph was emitted ahead of the
+>   paragraph it sits inside, putting the page boundary a whole paragraph early. Upstream defers
+>   such a break until the paragraph is pushed; reproducing that needs to know whether the
+>   paragraph has a closed run yet, which a flat `Descendants()` sweep cannot see.
+> - **odt** — a captioned figure nests a frame inside a text box inside an outer frame, and the
+>   walk took every `draw:image` beneath every frame, so the image was emitted twice.
+> - **txt** — the DocTags groundtruth files, which parse as xml; see the heading-level wrap
+>   below.
+>
+> **What is left in html** (157 comparable, `--strict-md`: ok 83, plain 102, markdown 117,
+> html 111, json 105, metadata 101, tables 122).
+>
+> An earlier revision of this note said the tail was "dominated by parser recovery" and that
+> "the cheap systematic rules are spent". Both were wrong, and the triage below them was
+> measured rather than reasoned this time. Across the 83 fixtures failing before this pass:
+> **20 had byte-identical text** and failed on metadata alone, **21 differed by one to three
+> hunks**, 21 by four to twelve, and only **12 diverged wholesale**. Recovery is a sixth of the
+> tail, not the bulk of it. Three systematic rules found by measuring rather than reading have
+> since taken it from 74 to 83:
+>
+> - **Inert subtrees in the metadata pass.** The converter skips `<template>` and `<noscript>`
+>   outright, and its metadata collector runs inside that walk. This port collects metadata
+>   separately and skipped only `<script>`/`<style>`, so every Wikipedia page contributed its
+>   1x1 `<noscript>` tracking pixel to the image list. Six fixtures were off by exactly one
+>   image, three by exactly one link.
+> - **Comment end.** Upstream truncates a comment that reads like a self-closing tag; see the
+>   entry below on `office/regression/000_000413.html`.
+> - **C1 numeric character references.** `&#146;` is U+2019, not U+0092 — the HTML5 tokenizer's
+>   replacement table — but only on the html5ever repair path, which is where the port already
+>   models canonical spelling. Seven fixtures.
+>
+> **Sanity-checked against a real browser, which is where this should have started.** Chromium
+> (via Playwright, scripting off, `<script>/<style>/<noscript>/<template>` removed from the DOM
+> first) gives `document.body.textContent` for all 158 fixtures; comparing word recall against
+> that says how much of what a browser actually shows each extractor recovers:
+>
+> | | mean word recall vs the browser |
+> |---|---|
+> | upstream (the goldens) | 0.8753 |
+> | this port | **0.8967** |
+>
+> The port recovers *more* browser-visible text than the reference does. Four fixtures are
+> materially worse than upstream (205, 070, 071, 191) and nine are materially better — three of
+> those dramatically, where upstream extracts essentially nothing from a document the browser
+> renders in full: `000_000069.html` (port 1.000 vs upstream 0.000), `000_000420.html`
+> (0.989 vs 0.000), `000_000136.html` (0.991 vs 0.010). Six fixtures are below 0.30 for *both*,
+> which is upstream dropping content this port faithfully drops with it.
+>
+> So the residual golden mismatches are overwhelmingly formatting and metadata, not content
+> loss, and the remaining tail is not worth aligning tree builders for. The harness is
+> `$SP/browser/extract2.mjs` plus `compare.py` — cheap to rebuild and the right first move next
+> time.
+>
+> `office/regression/000_000202.html` used to be this file's named specimen of the recovery
+> class. It is not one any more: the malformed-tag fix below took it from 0.000 to 0.872 word
+> recall while upstream still reports 0.000 for it.
+>
+> **What the metadata dimension still holds** (56 of the 74, measured per fixture rather than
+> per differing field, since one missing link shifts every index after it):
+>
+> | fixtures | class |
+> |---|---|
+> | 17 | `links[].text` differs — five sub-classes, none larger than 8 |
+> | ~25 | `headers[].depth` off, which is the tree-shape class |
+> | 10 | `title` differs |
+> | 6 | `keywords`/`description`/`subject` together, so probably one cause |
+> | 4 | `images` count |
+>
+> Of the title ten, two were CRLF (fixed), two are `&deg;` left undecoded on documents the
+> reference repairs and this port does not (see below), one is a title the port misses entirely,
+> and **four have a `<title>` the reference does not report at all**. That last group is worth a warning: those documents
+> carry a *second* `<head>` deep inside the body, and the port takes its title from it. The
+> reference does not — but the rule for when it does is not a rule I could state. Probing the
+> converter directly, a second `<head>` in the body yields its title when the first head is
+> empty, holds only whitespace, a `<link>`, or a `<script>`, and yields nothing when the first
+> head holds a `<meta>` or a comment. `office/regression/000_000071.html`'s first head holds
+> only scripts and links, which by that model should yield the title, and the reference still
+> reports none — so the model is already wrong. Do not implement from the shape above; measure
+> from the fixtures.
+>
+> **The repair predicate is incomplete, and that is a tree-shape problem, not a rule.**
+> `office/regression/000_000073.html` and `000_000074.html` are repaired by the reference and
+> not by this port, so their head metadata keeps `&deg;` where the golden has the degree sign.
+> Bisecting 073 against the converter puts the trigger in a `<form>`/`<table>` region about
+> 2 KB into the body, and the port's `HasInlineBlockMisnest` reports no misnest on the same
+> fragment — because the two parsers build different trees there in the first place. `tl` also
+> mangles that document's `<!DOCTYPE HTML PUBLIC "…">`, leaving `ublic "-//W3C…">` as the
+> document's first node (confirmed by probing `astral-tl` directly). So the misnest the
+> reference sees exists in `tl`'s tree and not in this port's, and no predicate change closes
+> it. This belongs to the recovery class.
+>
+> A probe against the real converter is the tool that made this tractable and is worth
+> rebuilding: `htmlprobe` (see the scratchpad pattern in "Re-syncing after an upstream merge")
+> links `html-to-markdown-rs` directly with the options `extraction/html/converter.rs` sets, so
+> any fragment can be put to the reference in isolation. Two of the three rules above were
+> characterised by differential testing against it, and the first spelling of the comment rule
+> was wrong in a way only that testing caught.
+>
+> The last figure measured against the **old** goldens, kept for reference only: 2770 of 2787
+> comparable fixtures (99.4%) on every hard dimension. It is not comparable with the table
+> above — the denominator changed and so did what the goldens encode. Re-derive rather than
+> carry forward; the running count in this file has gone stale twice.
 >
 > Read the last digit with care. `PdfExtractor` enforces a per-document wall-clock deadline and
-> drops whole pages when it trips, so a loaded machine moves the total by one to three fixtures
-> between runs of identical code — two consecutive runs here gave 2639 and 2638, and PDF `ok`
-> 274 and 273, with nothing changed in between. Treat a single-fixture move as noise and measure
-> a real change on a quiet machine.
+> drops whole pages when it trips, so a loaded machine can move the total between runs of
+> identical code. Do not run a sweep and a build at the same time.
 >
 > The largest single pass since: **pdf_oxide's text pipeline is ported** — fonts, content
 > stream, span assembly, reading order — and PDF spans now come from it. See "The PDF gap,
@@ -92,16 +252,35 @@ See "Re-syncing after an upstream merge" in `Claude.md` for how to regenerate th
 > - **UTF-16 XML** (`vendored/unstructured/xml/factbook-utf-16.xml`). Upstream ignores the
 >   byte-order mark and reads the file as UTF-8, emitting `? x m l` with the NULs as spaces.
 >   This port decodes it. One fixture, permanently red.
+> - **A wrapping heading level past depth 255** (`vendored/docling/.../multi_page.doctags.txt`
+>   and the other DocTags groundtruth files). `extractors/xml.rs` computes an element's heading
+>   level as `((depth as u8) + 1).min(6)` over a `u16` depth: in a release build the cast keeps
+>   only the low byte and the add wraps, so a document that never closes its tags — DocTags nests
+>   `<loc_12>`, `<page_1>` and friends and closes none of them — walks past depth 255 and its
+>   levels start over from 0 instead of staying pinned at 6.
+>   **Reproduced rather than flagged**, on the same reasoning as the `/>` comment below: the
+>   level is derived structure rather than content — nothing is lost or corrupted, only nested
+>   differently — and it lands in the rendered section tree, so leaving it straight would put the
+>   port's JSON at odds with every deeply-nested XML document upstream emits. `HeadingLevel` in
+>   `XmlExtractor.cs` is the one line to change if that call should go the other way.
 > - **Escaped markup in XMP `dc:description`.** quick-xml emits an entity reference as its own
 >   event, splitting the text run, so upstream keeps only the first fragment — `div` for a value
 >   that is a whole HTML document. This port returns the value. Four PDF fixtures.
+> - **A comment ending at `/>`** (`office/regression/000_000413.html` and ten others). Upstream's
+>   converter truncates a comment that reads like a self-closing tag: for a comment opening with
+>   whitespace or a slash it scans quote-aware to the first `>`, and stops there if that `>` is
+>   preceded by `/`. The rest of the comment reaches the document as text. This is neither
+>   html5ever's behaviour nor `tl`'s — both were probed directly on the same input — so it comes
+>   from the converter's own preprocessing. Reproduced rather than flagged, because eleven
+>   fixtures turn on it and there is no reading of the goldens that does not encode it.
+> - **An empty table over a paragraph** (`vendored/docling/pdf/2305.03393v1.pdf`). Upstream's
+>   table detector claims a region that holds an ordinary paragraph and emits `|  |` / `| --- |`
+>   in place of it, dropping 18 lines of body text. Its golden is stable across regenerations, so
+>   this is deterministic rather than the font-cache instability the other PDF failures sit on.
+>   This port emits the text.
 > - **Inherited `/MediaBox`** (`pdf/pdfa_034.pdf`). ISO 32000-1 §7.7.3.4 inherits from the
 >   nearest ancestor that defines the attribute; on a document with two nested `Pages` nodes
 >   upstream reports the root's A4 box where the page's own parent says Letter.
-> - **AsciiDoc math macros.** Upstream's current source converts `latexmath:`/`asciimath:`/
->   `stem:` and `[latexmath]` + `++++` blocks; the reference outputs predate that and carry them
->   verbatim. The port matches the references, which is also what the AsciiMath path can do
->   without a converter it does not have.
 > - **`H2SO4` on `pdf/embedded_images_tables.pdf`**, where upstream reads `H SO4`.
 > - **Duplicated body text on `office/regression/000_000213.html`.** A 7 KB page extracts to
 >   39 KB upstream, with one paragraph repeated ten times. The page leaves `<p>` and `<a>`
@@ -316,58 +495,206 @@ file cannot hang extraction, and upstream simply has no deadline to match.
   apart, the same `segments_need_space` geometry difference documented for
   `pdf/copy_protected.pdf` above, with the sides reversed.
 
-### The goldens are frozen at 2026-08-12, and cannot be regenerated here
+### The goldens were regenerated on 2026-08-24 — what that changed
 
 This bounds every claim in this file, so read it before concluding anything about a failing
 fixture.
 
-`dotnet/tools/xberg-reference-gen/target/release/xberg-reference-gen` was dated **2026-08-12
-16:44**, every golden is stamped 16:45, and **79 files under `crates/xberg/src` are newer than
-the binary**. So the goldens record what upstream did on 12 August, not what its source says
-today.
+The corpus was previously frozen at goldens generated on **2026-08-12**, which the last session
+could not regenerate (no network). That is done now: `cargo build --release --locked` succeeds
+and takes about 7 minutes, and one sorted single-process run over `test_documents` produced
+**3165 goldens, `failed=0`**. The generator no longer aborts on the `mathemascii` char-boundary
+panic — `xberg` already catches it as a blocking-pool `JoinError` and turns it into a captured
+extraction error, and the per-fixture task guard added here covers anything that does not.
 
-**This has now been settled empirically, not just argued.** `--offline` does fail on the
-unvendored `mathemascii`, but a plain `cargo build --release --locked` succeeds — it took 7m17s
-and fetched `html-to-markdown-rs` 3.11.2, which until then had never been vendored. Regenerating
-with the rebuilt binary:
+**Regenerating moved everything at once**, exactly as the old note warned it would. The 18
+commits under `crates/` since 12 August include two large behavioural ones:
 
-| fixture | committed golden | rebuilt binary |
-|---|---|---|
-| `epub/features.epub` | `\overset{⏞}` | `\overbrace` |
-| `html/sinthgunt.html` | — | does not reproduce |
+- **`13cdad2f`** upgraded `html-to-markdown-rs` **3.10.6 → the 3.11 line**. The old note
+  predicted `"template" | "noscript"` would need re-porting; it is one arm out of 5327 diff
+  lines. See "The 3.11 converter upgrade" below.
+- **`ec94d8c0` (#1414)** populates formulas for every format, ~10k lines across docx, odt,
+  orgmode, pptx, rst, typst, jats and pdf. This is also what the old note's `epub/features.epub`
+  `\overbrace` entry was tracking: that fixture's golden is current now, and the port matches
+  what the source does rather than what the August snapshot did.
 
-So both categories below are confirmed: the goldens genuinely predate current upstream, and this
-port matches the source rather than the snapshot. Note the hazard this creates — the binary in
-the tree is no longer the one that made the corpus, so a regeneration now would move every
-format at once.
+Two hazards the old note raised are settled rather than inherited:
 
-That makes one obvious-looking test worthless. Running the existing binary over a fixture and
-finding it reproduces the committed golden byte for byte proves only that the August binary still
-agrees with itself — it says nothing about whether current source would agree. This was used
-here to argue a golden was current, and the argument does not hold.
+- **Version drift in the generator's own lock.** It is a standalone workspace, so its lock
+  floats independently of the root's — and it had reached **3.11.2** where the root lock
+  resolves **3.11.0**. The two differ by 362 lines across `text_node`, `main_helpers`, the
+  tier-1 router and scanner, and `block/preformatted.rs` (which 3.11.2 removes). Goldens built
+  from it would have encoded a converter upstream does not ship, and every HTML fixture would
+  have been ported against the wrong target. Pinned with `cargo update -p … --precise`; do the
+  same after any dependency bump. `pdf_oxide` 0.3.77 and `comrak` 0.54.0 match on both sides.
+- **Reproducibility of the run itself.** `WalkDir`'s default is readdir order, and `xberg` keeps
+  a process-global font cache, so a run's output depended on filesystem ordering. The walk is
+  sorted now.
 
-A worked example of the difference it makes. `epub/features.epub` renders U+23DE/U+23DF as
-`\overbrace`/`\underbrace` in this port, where the golden keeps them literal inside
-`\overset`/`\underset`. Both sides' `over_script_command` map U+23DE to `\overbrace`
-identically, and the EPUB path reaches the same converter, so the port and *current* upstream
-agree — but commit `ec94d8c0bd` (16 August, "populate formulas for every format") postdates the
-golden. This is a third category: neither a port bug nor an upstream defect, but a golden the
-current source would not reproduce. Confirmed by the rebuild above: the fresh binary emits
-`\overbrace`, exactly as this port does.
+The ~222 extra goldens the old note feared (for fixtures the extractors fail on) are simply
+present, and the harness counts them as `rust failed` rather than against the port.
 
-The same bound applies to the seven HTML fixtures. Their goldens are `html-to-markdown-rs`
-**3.10.6** output — the only version vendored — while the lock records 3.11.2. Porting against
-3.10.6 is what took html to 41/41, and that is correct *while these goldens stand*; 3.11.0 added
-a `"template" | "noscript" => {}` dispatch arm that 3.10.6 lacks, so a regenerated corpus would
-need those arms re-ported in the other direction.
+### The 3.11 converter upgrade
 
-**To settle any of this**, restore network access, `cargo update`/vendor `mathemascii`, rebuild
-the generator, regenerate, and re-measure. Expect the generator to abort partway: it panics in
-`mathemascii-0.4.0/src/scanner.rs:48` on a char boundary inside `≤` via the asciidoc extractor,
-and a full run also creates ~222 goldens for fixtures the extractors fail on, which changes the
-denominator. Back up `*-results-rust.json` first.
+The largest open work item. `html-to-markdown-rs` 3.10.6 → 3.11.0 is 5327 lines across the
+converter, and it is mostly a security-hardening release ("audit #23"/"audit #24" in its own
+comments) plus two structural fixes (its issues #13, #453, #454, #455). Ported so far:
+
+- `<template>` and `<noscript>` are dropped rather than rendered.
+- A table cell can no longer hold a hard line break: `<br>`, `<div>` and `<p>` continuations all
+  collapse to one space through a shared `EmitTableCellBreak`, and cell text folds `\n`/`\r`
+  before collapsing whitespace.
+- Link and image destinations share one writer: balanced-paren detection replaces the naive
+  open-count-equals-close-count test, `\`/`<`/`>` are escaped inside an angle-bracket
+  destination, titles escape backslashes before quotes, and image alt text is escaped as a link
+  label.
+- The table scan is two passes: own structure (row counts, nested-table count, spans) stops at a
+  nested `<table>`; whole-subtree content (text, links, headers, caption) does not.
+- List content indents to its marker's content column (`ListIndentColumns`), not a flat
+  four-spaces-per-level.
+- Attribute names match case-sensitively outside the html5ever repair path — `<A HREF>` reaches
+  the link handler with no href and degrades to its label.
+- Code fences size themselves to their content, in both the fenced-block and inline-span
+  directions (opposite rules — CommonMark 4.5 vs 6.1).
+- Blockquote lines keep their leading whitespace; nested quotes separate by trimming to one
+  blank line.
+- SVG/MathML attribute values escape `"`; SVG data-URI titles and media `src` labels are escaped.
+- The table-grid walk runs with its collectors detached, so a cell's links, images and nested
+  tables are not recorded a second time.
+
+- A table's cells are recorded **once**, not once per pass over them. The handler still walks a
+  table up to three times — a column-width pre-pass, the render, and the grid the structure
+  collector wants — but only one of those walks now carries the collectors: the pre-pass
+  detaches them (a column measurement must not show up in the result) and so does the grid walk
+  (the render already recorded the same cells). Upstream keeps the pre-pass's handles instead
+  when it can reuse that pass's markdown verbatim, but that needs no structure collector
+  installed, and this port's options always install one. This was the single largest source of
+  wrong metadata: every link, image and heading inside a cell appeared three times, and one
+  inside a nested table six.
+- A heading inside a table carries its real DOM depth (it read 0 while the re-walks recorded
+  it), and emphasis leaves its whitespace outside the delimiters in recorded markdown.
+- A `<li>` inside a table cell takes a `<br>` boundary; the head `<title>` is entity-decoded.
+
+### Tried and reverted: excluding a nested list from its parent item's recorded text
+
+`office/regression/000_000059.html` records a nav menu's submenu items where upstream records
+only the top-level ones, and reducing it looked like a clean rule:
+`<ul><li>one<ul><li>n1</li><li>n2</li></ul></li><li>two</li></ul>` records `["one","two"]`
+upstream and `["one\n  * n1\n  * n2","two"]` here. Implemented — the nested list notes the output
+span it writes and the item that holds it leaves that span out — the reduction matched exactly
+and the corpus fell: html ok 74 -> 69, plain 97 -> 93, json 100 -> 96.
+
+The rule flips on whitespace. Write the same markup the way a real document does —
+
+```
+<ul>
+  <li>
+    one
+    <ul>
+      <li>n1</li>
+```
+
+— and upstream records `["one\n  * n1\n  * n2","two"]`, keeping the nested markdown. Every
+corpus fixture is formatted that way, so this port's unconditional "keep it" is right for all
+of them and the reduction was the outlier. Whatever 059 is doing, it is not this; do not re-derive
+the rule from a minified reduction.
+
+Not yet ported, in rough order of expected value: the tier-1 router/scanner changes (168 + 654
+lines, and they decide which documents take the fast path at all), the rest of
+`block/table/builder.rs` and `cells.rs` (129 + 170 — the `CellTextCache` reuse path, which this
+port never takes, and the ragged-table separator width), `strip_hidden_elements`' nesting-aware
+closing-tag scan, and `parse_ordered_list_start`'s clamping.
+
+### What else the regeneration exposed, and what was done about it
+
+Beyond the converter upgrade, `ec94d8c0` (#1414) moved five other formats. Ported:
+
+- **org** — display math (`\[…\]`, `$$…$$`, a LaTeX math environment) leaves the paragraph and
+  becomes its own formula element, before the inline-markup parser runs, because Org's markup
+  characters (`_`, `/`, `=`) also occur inside LaTeX. 7 -> 12 of 12.
+- **rst** — a `.. math::` body that uses alignment columns is wrapped in `aligned`. 11 -> 13
+  of 15.
+- **jupyter** — a `text/latex` output is the equation itself and becomes a formula, ahead of the
+  `text/html` and `text/plain` reprs of the same result. 7 -> 16 of 16.
+- **xml/docbook/jats** — a `.xml` file is routed by the vocabulary it declares (a DocBook or
+  JATS public identifier in the DOCTYPE, or the DocBook namespace bound on the root by the
+  prefix the root's own name uses) rather than by its extension alone, and both extractors read
+  their equations through a new shared `FormulaXml` capture: verbatim TeX first, then the `math`
+  subtree through the MathML converter, then the flattened text, with a `<label>` becoming a
+  LaTeX `\tag`. xml 5 -> 10 of 15, docbook 3 -> 4 of 4.
+- **typst** — a line that opens and closes its own math is one formula; it used to become the
+  start of a display block and swallow everything up to the next `$` in the document.
+
+Both maths converters are **now ported**, and with them every adoc and typ fixture:
+
+- **asciidoc (0 -> 6 of 6).** `mathemascii` 0.4.0 (scanner, lexer, parser, AST) and the slice of
+  `alemat` 0.8.0 it renders MathML through, both translated to C# under
+  `src/Xberg/Internal/Math/AsciiMath*.cs`, with the AsciiDoc extractor's inline macros and
+  `++++` math blocks wired to them. The MathML then goes through this port's existing
+  MathML-to-LaTeX converter — the same indirection upstream chose, so AsciiMath inherits that
+  converter's fixes. Validated against a probe built on the real crate: 322 expressions — every
+  `stem:`/`asciimath:` macro and math-block body in the corpus, plus the crate's own test
+  inputs — render byte-identical MathML, panics included.
+- **typst (6 -> 12 of 12).** The math-mode slice of `typst-syntax` 0.15.1 — its scanner, lexer,
+  syntax tree and parser — translated to C# under `src/Xberg/Internal/Math/Typst*.cs`, plus the
+  540-line render walk. Validated the same way: 486 of the 487 `$…$` spans in the corpus parse
+  to a tree identical to the crate's own, the last being a documentation placeholder that
+  renders the same either way.
+
+Both crates are Apache-2.0, where everything else the port derives from is MIT or dual
+`MIT OR Apache-2.0`. See `dotnet/THIRD_PARTY_NOTICES.md`: the derived files stay under
+Apache-2.0, which is why `<Packagelicense>MIT</Packagelicense>` in `Xberg.csproj` no longer
+describes the whole assembly.
+
+Two reductions, both recorded in the file headers:
+
+- The AsciiMath port raises an exception where the crate panics — on a multi-byte character
+  (`Symbol::as_str` slices by byte while indexing by character) and on `cancel` (left
+  `unimplemented!()`). Upstream contains those panics and drops the equation rather than the
+  document; the port does the same, in the same place.
+- Typst's **code mode**, which math enters at a `#`, is reduced to the shapes a `#` takes inside
+  math. The crate's full code grammar is the other two-thirds of its parser, and none of it
+  reaches the output: the converter renders a `Hash` as nothing and drops `Named` and `Spread`
+  arguments whole, so only where the code expression *ends* has to be right.
+
+### The 8 remaining PDF failures, classified (2026-08-25)
+
+Measured, not reasoned: each failing golden was regenerated from the same Rust binary and the
+result compared both against the committed golden and against this port's output.
+
+- **5 sit on an unstable upstream heuristic** — `nougat_012`, `pdfa_027`, `pdfa_044`, and the
+  two copies of `vendored/pdfplumber/.../WARN-Report-for-7-1-2015-to-03-25-2016`. A sixth,
+  `user_reports/mp_axmp_rec_en`, is in the same class and no longer counted below only because
+  its golden was replaced (see the caution two paragraphs down). Regenerating each of the six
+  goldens alone produced *different text from the committed golden*, and for five of them that
+  fresh golden is byte-identical to this port's output. `pdfa_044` is the clearest specimen: two fresh
+  generations of the same file from the same binary disagree with each other, one carrying
+  spurious spaces (`Hong Kong Exchange s`, `liability whatsoever fo r`, `8 6,440,000`) and the
+  other not — and the clean one matches this port exactly. The mechanism is the one already
+  named for the earlier order-dependent set: pdf_oxide's process-global font cache
+  (`fonts/global_cache.rs:111`) makes a document's spacing decisions a function of what was
+  extracted before it in the same process.
+
+  `user_reports/mp_axmp_rec_en.pdf`'s golden **in this working tree has been replaced** with
+  such an isolated regeneration, which is why it now passes; treat that pass as batch-dependent,
+  not as evidence about the port. It is worth one line of caution in reverse too: a fixture in
+  this class passing after a corpus-wide regeneration means no more than its failing does.
+
+- **1 upstream content loss** — `vendored/docling/pdf/2305.03393v1.pdf`, the only regenerated
+  golden that *is* stable across runs. Upstream's table detector claims a region that
+  holds an ordinary paragraph and emits an empty table (`|  |` / `| --- |`) in place of it,
+  dropping 18 lines of body text. This port emits the text. Flagged, not reproduced.
+
+- **2 large documents with a table-tier divergence** — the Intel SDM (`tables` only) and
+  `algebra_topology` (`json` and `tables`), unchanged and traced below. Both pass `plain`.
 
 ### The 17 remaining failures, classified
+
+> **Stale — superseded twice.** This classification was measured against the 2026-08-12 goldens;
+> the counts and the HTML entries were already wrong after the converter upgrade, and the PDF
+> entries are now superseded by "The 8 remaining PDF failures, classified (2026-08-25)" above,
+> which re-measured every one of them by regenerating its golden. Kept only for the mechanism
+> notes. Re-derive with `--list-fail` before quoting any figure here.
 
 Re-derived with `--list-fail` on the current tree rather than carried forward — the running
 count has gone stale twice now (it read "about eleven port gaps" long after the real figure was
@@ -440,14 +767,28 @@ Rust, sort stability included), the rounding mode (`MidpointRounding.AwayFromZer
 matches Rust's `.round()`, which is the obvious banker's-rounding trap and is not present), and
 any difference in table count or page distribution.
 
-Not yet established: why the word coordinates differ from Rust's at all. Closing it needs a
-Rust-side word dump for one page — the probe-crate approach that settled `right_to_left_03`.
+**Ruled out since, by measurement rather than reading: the spans themselves.** A probe crate
+built against the real `pdf_oxide 0.3.77` dumps
+`extract_page_text_with_options(page, ReadingOrder::TopToBottom)` — the exact call
+`extract_segments_from_page_inner` makes — for one page. On `algebra_topology` page 807 all 348
+spans are **byte-identical** to the ported pipeline's `HierarchySpans`: text, bbox and
+`rotation_degrees`. They stay identical when the probe walks every earlier page first, so the
+process-global font cache does not move them either. Whatever the 5 tables differ by, it enters
+after the spans — in `PdfOxideSegments.FromPage`'s reorder/rejoin, or in the table tiers
+themselves. Rebuild the probe in the scratchpad with `pdf_oxide = "=0.3.77"` and
+`CARGO_TARGET_DIR` pointed at the reference generator's target directory so the dependency is
+not compiled twice; dump C# spans through a scratch project whose `AssemblyName` is
+`Xberg.Tests`, which is how it reaches the internals without touching the repo.
 
-Found while tracing, and fixed separately because it is a real divergence in its own right:
-`SplitSegmentToWords` took its origin from raw page-space `seg.X`/`seg.Y` where upstream uses
-`seg.upright_origin()` in both `segment_to_hocr_word` and `split_segment_to_words`. Identity for
-an unrotated segment, so it is invisible here and is *not* the cause of the 5 tables; wrong axis
-for a rotated run.
+**Settled: the upright-frame revert was fitting the port to stale goldens.** `988b17ba14` made
+`SplitSegmentToWords` take its origin from `seg.UprightOrigin()` — where upstream's
+`segment_to_hocr_word` and `split_segment_to_words` both do — and `048aade8fc` reverted it
+because the corpus lost nine fixtures on `tables`. The measurement was right and the conclusion
+was wrong: upstream added that call in **`fd53e448` on 2026-08-13**, one day *after* the goldens
+being measured against were generated. The open question the revert recorded — whether the
+ported spans carry different rotation values — is answered no by the probe above:
+`senate-expenditures` page 1 has 1052 of its 1054 spans rotated and every one matches. The
+change is re-applied.
 
 ### The four port gaps, and what each turned out to be
 
@@ -470,8 +811,12 @@ diffing, not by reasoning from the fixture.
   unrelated ruling-line clusters and dragging `cluster.bbox.x` with them.
 - `2305.03393v1` — two independent gaps. `stitch_fragmented_tables` (`pipeline.rs:2553-2843`)
   was documented in `PdfExtractor.cs` as knowingly unported; now ported, which makes this
-  fixture's `markdown` and `html` byte-identical. The residual `plain`/`json` diff is the
-  html-to-markdown behavior above, deliberately not ported.
+  fixture's `markdown` and `html` byte-identical. The residual `plain`/`json` diff was re-measured
+  on 2026-08-25 and is not what this bullet used to say: upstream's table detector claims a region
+  that holds an ordinary paragraph and emits an empty table (`|  |` / `| --- |`) where the text
+  should be, losing 18 lines of body text that appear nowhere else in its output. Its golden is
+  stable across regenerations, so this is deterministic, not the font-cache instability the other
+  PDF failures sit on. Flagged as an upstream defect; this port emits the text.
 - `proof_of_concept_or_gtfo_v13` (plain, json) — not XY-cut region splitting: all 197 spans were
   byte-identical to Rust. Three HTML tokenizer bugs, fixed by porting astral-tl 0.7.11's
   `parse_tag`/`parse_attributes` in place of the approximated `>`-scanner.
@@ -488,7 +833,8 @@ Each is traced to a specific line, not assumed.
   `Franconia-Springfield blue #0000ff rail-metro` on the next. This port emits declared order
   consistently and is correct.
 - **`<h0>` from a truncated heading depth** (`vendored/docling/.../multi_page.doctags.txt`), the
-  `u16` depth through `((depth as u8) + 1).min(6)` described below.
+  `u16` depth through `((depth as u8) + 1).min(6)` described below. **Reproduced**, unlike the
+  rest of this list — see the note under "Upstream defects, flagged and left alone".
 - **UTF-16 BOM ignored** (`vendored/unstructured/xml/factbook-utf-16.xml`).
 - **Corpus drift** (`ATTRIBUTIONS.md`, `LICENSES.md`, `scripts/corpus-patterns.txt`): the fixtures
   are `test_documents`' own docs and grew after their goldens were made.
@@ -1148,8 +1494,18 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       ModelProto/GraphProto/NodeProto/TensorProto/AttributeProto decoding
       (`Internal/Onnx/ProtoReader.cs`, `OnnxModel.cs`). No dependency, no codegen; tensor
       payloads are slices over the model bytes rather than copies.
-- [x] **Operator kernels** (`Internal/Onnx/Ops/`) covering both pinned graphs — the 40
-      operators RT-DETR uses and the table classifier's set. Vectorised through
+- [x] **Operator kernels** (`Internal/Onnx/Ops/`) covering all five pinned graphs. Beyond
+      RT-DETR's original 40 and the table classifier's set, 2026-08-26 added what PP-DocLayout-V3
+      needed (Where, Range, GatherND, ScatterND, EyeLike, Floor, the comparison family, Mod,
+      Einsum), what TATR's int8 export needed (DynamicQuantizeLinear, MatMulInteger, ConvInteger,
+      CumSum, Sin, Cos), and what SLANeXt needed (OneHot, ScatterElements, the boolean family).
+      Integer accumulation runs in double: over a few thousand reduction steps an int8 product sum
+      passes float's exact-integer range, and a quantized path only means anything if it is exact.
+- [x] **Control flow.** `Loop` and `If`, with graph-typed attribute decoding and subgraph
+      execution against a seeded outer scope. Two things had to change beyond the operators
+      themselves: liveness analysis now walks subgraphs, because a value used only inside a loop
+      body was being released at its last top-level use, and the `--onnx-ops` census recurses, so
+      a graph is not reported runnable when a body needs a kernel that does not exist. Vectorised through
       `System.Numerics.Tensors`; convolution lowers to GEMM via im2col with dedicated
       pointwise and depthwise paths, and MatMul uses an axpy-ordered kernel so the inner
       loop is a contiguous fused multiply-add.
@@ -1161,8 +1517,16 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
 - [x] **Layer-by-layer validation** against ONNX Runtime via `tools/onnx-parity` and
       `tools/Xberg.OnnxParity`. Every operator instance matches in isolation; all detections
       above threshold agree in class, confidence and geometry.
-- [ ] **Model acquisition** — port `layout/model_manager.rs`: Hugging Face download, on-disk
-      cache, SHA-256 verification, atomic publish with rollback.
+- [x] **Model acquisition** — `layout/model_manager.rs` ported 2026-08-26
+      (`Internal/Layout/LayoutModelManager.cs`): seven models each pinned to a Hugging Face
+      repository revision *and* a SHA-256 digest, resolved cache-first, published through a
+      staging name and an atomic rename with rollback. The digest is what decides, not the
+      size: an interrupted download looks fine to a size check. The cache root and the offline
+      switch come through `XbergOptions` rather than the environment, because the library reads
+      no ambient process state — a rule the suite enforces, and which caught the first draft.
+      Verified against the real service: the expected `models--<repo>/snapshots/<revision>/`
+      layout at exactly the pinned sizes, a 0.06 s cache hit on repeat, and a byte-tampered
+      entry detected and re-fetched.
 - [x] **Graph optimisation and buffer reuse.** Decomposed batch-norm folded into convolution
       weights, activations fused into the convolution's output pass, and activation storage
       recycled through a pool with reference counts on the buffer (so `Reshape` views and
@@ -1176,34 +1540,330 @@ hand-written ONNX runtime instead of a binding. See `tools/onnx-parity/README.md
       rejected, and how to measure anything at all on a VM whose host throughput moves by 2x
       between runs, is recorded in `tools/onnx-parity/README.md`.
 
-      The routes still open, in rough order of expected value: a direct convolution for
-      small-channel layers, where the nine-fold im2col expansion stops paying for itself;
-      in-place unary operators, since the session already knows which values die at each node;
-      and a specialised max-pooling path. Past those it is what C# cannot express — prefetch
-      hints and hand-scheduled assembly — plus MLAS's per-CPU kernel variants.
-- [ ] **Page rasterisation.** The blocker for end-to-end use: layout detection needs a
-      rendered page bitmap, and the C# port has no PDF renderer. Until one exists the model
-      can only be driven from images supplied by the caller.
-- [ ] **Remaining models**: PP-DocLayout-V3, TATR, SLANeXt wired/wireless, PP-LCNet table
-      classifier. The runtime already executes the classifier; the others need their own
-      pre/postprocessing ported.
-- [ ] **Layout-aware reading order** (`extractors/pdf/reading_order.rs`). Note this is
-      entirely `#[cfg(feature = "layout-detection")]`, so it is absent from the goldens —
-      measuring it needs `xberg-reference-gen` rebuilt with that feature enabled.
+      **Re-measured 2026-08-26, which overturned the recorded next step twice.** It was "a
+      direct convolution for small-channel layers": the profile says those run at 195-277
+      GFLOP/s, mid-pack, and the slowest shapes are 1x1 convolutions with a large channel count
+      at 113-128. So the entry became "the shallow reduction" — also wrong: `--gemm` runs those
+      exact products at 365-379, near the best in the set. **The multiply was never slow.**
+
+      What was missing was a measurement. `--gemm` measures the product a convolution lowers to;
+      nothing measured the convolution, which is 61% of the graph. `--conv` does, and every hot
+      shape — 1x1 included — runs at 71-113% of the calibrated ceiling. Only the shortcut
+      convolutions are genuinely slower in the graph than in isolation, worth ~2% between them.
+
+      **The one win: writing an element-wise result over a dying operand.** Four hundred nodes
+      read a buffer and write another the same size, and when the operand is dead at that node
+      the second buffer is waste. `Relu` 35.7 -> 27.5 ms, `Add` 50.3 -> 42.3, `Mul` 10.6 -> 8.4;
+      buffer rentals per inference 734 -> 473 and pool memory 214 -> 168 MiB. Whole-model that
+      is **1.00-1.04x over three interleaved same-process runs** — two percent, at the edge of
+      what this host resolves, though the per-operator figures are solid and consistent with it
+      and the memory figures are counts rather than timings.
+
+      Correctness is the whole risk in that change: reusing a buffer too eagerly corrupts a
+      value a later node reads, and it surfaces as a plausible detection rather than a crash.
+      `--check-reuse` runs the graph with reuse on and off and compares every output bitwise —
+      RT-DETR's three are identical to the bit — and twelve tests cover the predicate, each of
+      which fails when its condition is removed. The whole corpus re-ran unchanged at 2926 of
+      3007, per-format table identical row for row.
+
+      Two things bound what is left: `Conv` is 61% of the graph and `MatMul` 14%, and 1,649 of
+      the 2,315 nodes take under 10 us each — 0.2% of runtime between them.
+
+      **One thing measured and still unexplained**: the shortcut convolutions (a 1x1 after an
+      average pool) run about twice as slow in the graph as in isolation — 7.0 ms under `--conv`
+      against 15.1 ms as a node — where every 3x3 shape matches to within a millisecond. Worth
+      ~2% between them. Three explanations were tested and disproved: cold weights (the traffic
+      per flop is the same for the fast shapes, and flushing the cache does not slow the
+      isolated run), pool misses (the warm run misses 14 times for 4 MiB, the rest below the
+      16 KB floor), and values nothing consumes (RT-DETR has none; releasing them moved nothing
+      and the change was backed out, since it also lets an output fed back in as the next run's
+      input be recycled underneath the caller). Recorded in the parity README so the next
+      attempt starts past them.
+
+      `--benchmark` no longer needs a reference dump: a timing run measures time, and time does
+      not depend on the numbers, so inputs are synthesised from the shapes the graph declares.
+      Requiring hundreds of megabytes of promoted intermediates before anyone could measure a
+      kernel change was enough friction to stop the measurement happening.
+- [ ] **Page rasterisation.** The blocker for end-to-end use, and assessed rather than
+      assumed: layout detection needs a rendered page bitmap, and the C# port has no PDF
+      renderer. Upstream reaches one through pdf_oxide — 21,560 lines under `src/rendering/`
+      plus `tiny_skia` (~20k) plus font glyph outlines — and the model's output depends on the
+      pixels, so an approximate renderer would not give matching detections. Everything else in
+      this phase is therefore reachable only from images the caller supplies. That is not a
+      hypothetical restriction: it is why the model work above is verified against image
+      fixtures and probes rather than against the golden corpus.
+- [x] **Detection postprocessing** — `layout/postprocessing/{heuristics,nms}.rs` ported
+      2026-08-26 (`Internal/Layout/LayoutPostprocessing.cs`). Upstream carries no tests for
+      either file, so this is verified by differential probe: `LayoutEngine::detect` is public
+      and `apply_heuristics` is a public flag, so `tools/heuristics-probe` runs the same page
+      twice — raw and postprocessed — with no change to the xberg crate. Over all 44 image
+      fixtures, 979 raw detections reduce to 267 and every page matches upstream exactly.
+- [x] **PP-LCNet table classifier** ported 2026-08-26 (`Internal/Layout/TableClassifier.cs`).
+      All 44 fixtures agree with upstream on wired/wireless. The probe also captures the raw
+      logits upstream logs at debug level, which showed deltas up to 1.05e-2 — every one on a
+      JPEG. Re-decoding those to PNG and feeding both sides identical pixels drops the worst
+      delta to 6.17e-4, the rounding granularity of the 3dp reference. See the JPEG note below.
+- [x] **PP-DocLayout-V3** ported 2026-08-26 (`Internal/Layout/PpDocLayoutV3Model.cs`), with
+      upstream's 29 tests and a real-model probe: over 43 page images every page matches in
+      detection count and class, worst confidence delta 2.5e-3, worst box delta 0.17 px
+      (median 0.0007 px). Running the graph needed seven operators the runtime lacked — Where,
+      Range, GatherND, ScatterND, EyeLike, Floor, Greater, Mod, Einsum — now implemented with
+      31 tests of their own. `--onnx-ops` censuses a graph's operators against what exists, so
+      the next model names its gaps in one run.
+- [x] **TATR** ported 2026-08-26 (`Internal/Layout/TatrModel.cs`) with all 36 of upstream's
+      tests: DETR preprocessing, the query decode, and the cell-grid reconstruction with its
+      header-row count and merged spans. Three details decide the output rather than the style —
+      the resize matches Hugging Face's `get_resize_output_image_size` including its truncation
+      order, suppression is intersection-over-*box* with different thresholds for rows and
+      columns, and normalisation is ImageNet in RGB rather than the PaddleOCR models' BGR.
+- [x] **SLANeXt** ported 2026-08-26 (`Internal/Layout/SlanetModel.cs`), with nine decode tests
+      for the token walk. Verified against ONNX Runtime per node: all 1035 graph values match and
+      both declared outputs match, worst absolute difference 1.3e-4.
+- [x] **YOLO wrapper** ported 2026-08-26 (`Internal/Layout/YoloModel.cs`), covering all three
+      families the Rust supports: YOLOv10/v8 on DocLayNet, DocLayout-YOLO on DocStructBench, and
+      YOLOX with its grid decoding.
+
+      There is no model to test it against — nothing YOLO is pinned in the model manager, and the
+      Rust reaches these only through `ModelBackend::Custom` with a caller's own file. So the
+      comparison uses synthetic ONNX files whose single output is a fixed tensor: both sides then
+      run the *same* numbers through their own decode, which is the half that differs. Over the
+      three variants that is **5,636 detections agreeing** on class, confidence and every
+      coordinate, worst delta 4.8e-5 — one float ulp at those magnitudes, i.e. JSON round-tripping.
+      `tools/yolo-probe` drives the real `YoloModel` through the public `LayoutEngine`.
+
+      What the comparison had to get right, and unit tests now pin: the YOLOX anchor grid is
+      walked finest-stride-first and row-major, which is what ties output row *i* to a place on
+      the page; a six-column output is already suppressed by the export and a wider one is not;
+      and a tie between class scores keeps the earlier class, which is also what leaves an
+      all-zero row scoring zero instead of reading as a confident class 0.
+- [x] **Layout engine facade** ported 2026-08-26 (`Internal/Layout/LayoutEngine.cs`) from
+      `layout/engine.rs`: backend selection, a confidence-threshold override, the heuristics
+      toggle, and batching where the model supports it. The model differences — one wants the
+      page size alongside the pixels, one decodes anchors against a grid, one is already free of
+      duplicates — stop at this boundary.
+
+      Not ported, and deliberately: `layout/mod.rs`'s session pool and `inference_timings.rs`.
+      Both are about *when* a model is loaded and how long it took, not about what comes out;
+      the C# runtime is in-process with no ORT session to pool.
+- [x] **Layout-aware reading order** — `extractors/pdf/reading_order.rs` ported 2026-08-26
+      (`Internal/Layout/ReadingOrder.cs`), together with the rotation-aware assembly in
+      `rotation.rs`. Verified by porting upstream's own test module: 58 of its 59 tests, fixture
+      for fixture (the 59th asserts a Rust config default with no counterpart here). Reading
+      order is a permutation rather than text, so no golden file can reach it.
+
+      Three Rust semantics C# does not share, each of which changes output: `f32::total_cmp` is
+      not `float.CompareTo`; `sort_by` is stable and `List.Sort` is not; `f32::min`/`max` return
+      the other operand on NaN where `MathF` propagates it. Also worth recording: Rust's
+      `f32::NAN` is `0x7fc00000` and .NET's `float.NaN` is `0xffc00000`, a *negative* quiet NaN,
+      and the sign bit decides which end of a total order NaN sorts to.
+
+      Note it is entirely `#[cfg(feature = "layout-detection")]` *and* gated on
+      `pdf_options.reading_order`, which defaults to false — so it is absent from the goldens.
+      `xberg-reference-gen --features layout` now enables both.
+- [ ] **JPEG decoding divergence.** ImageSharp and the Rust `image` crate disagree slightly on
+      JPEG (chroma upsampling and IDCT rounding), which is the only difference left between the
+      two layout stacks on identical models. It never changed a classification or a class across
+      the fixtures measured, but it does move confidences by ~1e-2, which is enough to reorder
+      near-tied detections in a confidence-sorted list. Not a layout bug; recorded here because
+      layout is where it shows up.
 
 ## Cross-cutting
 
-- [ ] `Metadata` extraction parity (office core/app props, EXIF, PDF info dict).
-- [ ] URI/link collection.
-- [ ] Per-page content splitting.
-- [ ] Document-structure tree derivation (for the structured object output).
-- [ ] Security limits (max size, zip-bomb guards — `extractors/security.rs`).
+- [x] `Metadata` extraction parity (office core/app props, EXIF, PDF info dict). Measured green
+      on the `meta` dimension across the corpus.
+- [x] URI/link collection.
+- [x] Per-page content splitting.
+- [x] Document-structure tree derivation (for the structured object output).
+- [x] **Security limits** (`extractors/security.rs`). Ported 2026-08-26: `SecurityLimits` with
+      upstream's defaults value for value, the five validators, the zip central-directory check
+      and the path-traversal predicate, threaded where upstream threads them. A refusal carries
+      upstream's `security`/1006 error item, or `validation`/1002 where the archive and HWPX
+      extractors deliberately downgrade it. `--no-security` on the test runner lifts every limit
+      so any difference can be attributed to them in one A/B.
+
+      Twelve fixtures stopped extracting, and all twelve are correct: the same three DocTags
+      groundtruth files in four corpus copies, which nest `<loc_*>` and `<page_*>` without ever
+      closing them and so pass the 1024 nesting cap. Upstream refuses them too — its golden for
+      `redp5110_sampled.doctags.txt` records exactly the message this port now produces. Corpus
+      parity was unchanged at 2926/3007.
 - [ ] CI: build + run `Xberg.TestRunner` on the fixtures; publish NuGet on tag. Note the
       corpus is no longer self-contained: CI must run `test_documents/scripts/fetch_corpus.py`
       and regenerate goldens, since neither the binaries nor the goldens are in git.
 - [ ] Performance: the 55 MB `parsebench/text_content.jsonl` fixture takes ~29s to render
       markdown now that structured formats build an element tree. Not wrong, but far off
       Rust; the harness timeout was raised to 120s to keep it measured rather than skipped.
+
+## Formats and features added after the first pass (2026-08-26)
+
+Each was verified against the real implementation with a probe crate rather than by reading it,
+and each probe lives in `dotnet/tools/` alongside the reference generator.
+
+- [x] **Source-code extractor** (`extractors/code.rs`). Language detection by extension, compound
+      suffix and shebang, reproducing `tree_sitter_language_pack`'s tables (430 extensions,
+      generated from the same JSON), then one verbatim code element carrying the language.
+
+      **The tree-sitter chunking half is not ported and cannot be** — it is a C library with a
+      grammar per language. What that costs is bounded and measured: under the default
+      configuration `tslp::process` returns no chunks, so all eighteen source fixtures in the
+      corpus have `chunks: []` and `data: null`, and every one matches the extended golden
+      exactly. A caller who turns chunking on upstream gets headings and per-chunk code elements
+      this port will not produce.
+
+      Detection is a runtime switch (`XbergOptions.SourceCodeDetection`) where upstream has a
+      compile-time feature, so both golden sets stay measurable: `--features code` alongside
+      `--goldens`. Against the extended set the port is **2931/3013**.
+- [x] **Styled HTML renderer** (`rendering/html_styled.rs`) and `HtmlOutputConfig`. Byte-identical
+      to upstream across 58 fixtures and 8 configurations — 464 of 464. The probe caught two
+      things reading would not have: the escape set is `v_htmlescape`'s (OWASP's), which escapes
+      the slash, so a URL in an `href` comes out with `&#x2f;`; and a C# raw string literal drops
+      the newline before its closing delimiter, which silently ate the trailing newline of all
+      three stylesheets.
+
+      Upstream's two OCR branches in the image path are unreachable here — OCR is out of scope, so
+      no document this port produces carries an OCR result to render.
+- [x] **DocTags** (`extraction/doctags.rs`, `rendering/doctags.rs`) and the `OutputFormat::DocTags`
+      variant the port's enum was missing. Byte-identical across 70 fixtures at both stages —
+      render, then parse-and-render — including 12 real Docling streams. 140 of 140, first run.
+
+      Page dimensions now travel on a shared `PageInfoDto`. **No extractor in this port records
+      them yet**, so a PDF rendered to DocTags here carries no `<loc_*>` tokens where upstream's
+      would; the round-trip case works because the parser supplies them. Wiring the PDF page sizes
+      through would close that.
+- [x] **QR decoding** — all of rqrr 0.10.1, not just the `extractors/qr.rs` shim over it: adaptive
+      binarisation, capstone finding, grid fitting with the perspective jiggle, format-bit BCH
+      correction, the zig-zag read, block de-interleaving, Reed-Solomon over GF(256), and the
+      numeric/alphanumeric/byte/kanji/ECI segments. Plus the post-processor.
+
+      Agrees with the real rqrr on **271 of 271** images: every version from 1 to 40, all four
+      error-correction levels, an occluded code that only decodes because error correction works,
+      and the 75 images rqrr itself cannot read, where the port fails identically. Two details the
+      comparison forced: `f64::round` is half-away-from-zero where .NET's default is half-to-even,
+      and `Perspective::create` rejects on a *signed* `wden < EPSILON`.
+
+- [x] **WordPerfect** — a managed reimplementation of libwpd 0.10.3, not a binding to it. Five
+      unrelated binary formats live behind one extension: WP4.2 (DOS, no header), WP5.0/5.1 (DOS,
+      `\xFFWPC`), WP6.x (DOS/Windows), WP1 (Mac 1.x, no header) and WP3 (Mac 2.x/3.x). Each gets
+      its own parser; detection reads the header first and falls back to two structural
+      heuristics for the two headerless formats.
+
+      libwpd was built once — to *generate goldens*, never to be called — and the port is diffed
+      against them. Against the ten-fixture corpus it is **7 of 7 comparable fixtures matching on
+      every hard dimension**, including the three deliberately-malformed CVE samples, which
+      libwpd refuses and this port refuses identically.
+
+      Three things the diff caught that reading would not have:
+
+      - The table state machine lives in libwpd's *content listener*, not in any of its five
+        parsers: the file writes a row code and a cell code and no closes at all, so the
+        bracketing — open the row, close the previous cell, pad the row out to the definition's
+        column count, consume the grid slots a vertical span already covers — is derived. Ported
+        into `WpdEventSink`, which is what turned `corel_wp6.wpd`'s tables from one run-on line
+        into the reference's grid. The two Macintosh formats keep their own simpler bracketing:
+        they carry no column definition for the machine to pad against, and their fixtures match
+        as they are.
+      - A tab before any text on a line is not a tab. WordPerfect expresses a paragraph's
+        first-line indent with the same codes it uses for a typed tab, and a back tab is a hanging
+        indent that never reaches the text at all.
+      - A note's anchor number and every other automatic number sit inline in the byte stream as
+        literal digits, bracketed by codes that say what they are. Read as text they come out as
+        bare digits glued to the neighbouring word.
+
+      6.x holds a footnote's body in a prefix packet elsewhere in the file, addressed by number
+      from the anchor; `Wp6PrefixData` reads the index and the block-split packet bodies, and the
+      note body parses as a document of its own.
+
+      **The one gap, measured**: `corel_wp6.wpd`'s markdown and html (both soft dimensions) differ
+      from upstream in a single hunk, where upstream's output carries a bold span across a
+      paragraph boundary that this port ends at it. libwpd re-emits the attribute bits at every
+      span it opens, so its stream repeats the attribute per paragraph; reproducing that in the
+      sink also reopened attributes inside table cells, which cost plain and tables parity on the
+      same fixture — so it was reverted and recorded here rather than traded for a hard-dimension
+      regression. Plain, json, metadata and tables all match.
+
+      **The two older formats' tables had never run.** No fixture in the corpus has a 5.x or a
+      3.x table, so both paths were unexercised — and 3.x had a real defect: nothing in these
+      files has to turn a table off, it can simply run to the end of the document, and a row
+      never closed is a row the builder never pushes. Every Macintosh table was silently losing
+      its last row. Both are now routed through the same state machine and checked against
+      libwpd on purpose-built documents: a 5.x definition group with two columns and two rows,
+      and a 3.x table function left unterminated. Both match on every dimension, including the
+      3.x last row libwpd keeps and this port was dropping.
+
+      **Also deliberately absent**: the Japanese character sets, which need libwpd's
+      31,936-entry Shift-JIS table; headers and footers, which libwpd routes through page spans
+      rather than the content listener and which no fixture in the corpus exercises.
+
+- [~] **HEIC / HEIF / AVIF** — the container is read; the picture is not decoded. Say plainly
+      what that means: `test.heic`, `test.heif`, `alpha.heif` and `test.avif` now extract, with
+      the dimensions and EXIF the upstream extractor reports, and no pixels.
+
+      The measurement that made this the right shape. Upstream takes the dimensions from the PNG
+      it gets back from libheif — but those are the coded extent with the clean aperture and the
+      rotation applied, which is exactly what the container itself states. Checked against
+      libheif on all four fixtures: 1652×1791, 2048×1440, 256×256, 2048×1440, matching in every
+      case, and `test.heic`'s EXIF block comes out **byte-identical** to the one libheif hands
+      out — 2,326 bytes. `test.heic` is the interesting one: its spatial extent is 1652×1792 and
+      a clean aperture crops one row away, so a reader that ignores the property is a pixel out
+      on precisely the files most likely to be photographs.
+
+      **What decoding would take, and why it is not here.** HEIC carries an HEVC intra picture
+      and AVIF an AV1 one. Decoding either means CABAC or the AV1 symbol decoder, the coding-unit
+      quadtree, thirty-five (HEVC) or sixty-plus (AV1) intra prediction modes, the transform
+      families, deblocking, SAO, and for AV1 also CDEF, loop restoration and film grain — each of
+      the two larger than everything else in this port put together, and each needing to be
+      bit-exact for its output to be worth anything. Upstream does not write that either: it
+      vendors libheif.
+
+      **What that costs, bounded.** The C# image extractor reports metadata only — it has no OCR
+      and attaches no image bytes — so for these four fixtures its output is complete. A caller
+      who wants the pixels, or upstream's rebinding of the document's MIME type to `image/png`
+      after decoding, does not get them. There is no golden for this: the reference generator has
+      never enabled the `images` feature, so every image fixture in the corpus reads
+      "Unsupported format" and the comparison above is against libheif directly, through
+      `pillow-heif`.
+
+## Speed against the Rust library (measured 2026-08-26)
+
+`dotnet/tools/bench.sh` runs both implementations over the same corpus in one process tree,
+`--format plain`, and compares only files **both** sides extracted — a file one side refuses
+would otherwise quietly reward whichever did less work. 3,003 files compared; 97 the port
+extracts and Rust does not, 4 the other way.
+
+| metric | Rust | C# | C# / Rust |
+|---|---:|---:|---:|
+| total | 258.8 s | 168.1 s | **0.65x** |
+| median | 0.407 ms | 0.192 ms | 0.47x |
+| p90 | 16.7 ms | 13.7 ms | 0.82x |
+| p99 | 370.2 ms | 270.6 ms | 0.73x |
+
+Per-file ratio: median 0.42x, geomean 0.36x, p10 0.06x, p90 1.65x. **The port is faster on
+2,383 of 3,003 files (79.4%).**
+
+**The total is PDF.** 251 s of Rust's 259 s is 388 PDFs, where the port's median is 18.9 ms
+against 33.9 ms — 0.56x. So the headline ratio is essentially the PDF ratio, and everything
+else is rounding.
+
+**It is not faster by doing less.** The two files that dominate the corpus produce *more* text
+from the port than from Rust: the 53 MB Intel manual 12,335,597 characters against 12,269,452
+(+0.5%) in 35.5 s against 72.8 s, and the 35 MB Bayesian book 2,156,892 against 2,128,319
+(+1.3%) in 31.1 s against 37.6 s. Corpus parity independently puts pdf at 380 of 389 on the
+hard dimensions.
+
+**Where the port is slower**: adoc 2.85x, jsonl 2.78x, rst 1.65x, rtf 1.25x, json 1.18x,
+odt 1.05x. The jsonl figure is the 55 MB `parsebench/text_content.jsonl` fixture already
+recorded below as a known slow path.
+
+Three caveats worth carrying:
+
+- The comparison uses the minimum of three timed passes, which favours a runtime with garbage
+  collection. Recomputing on medians gives the same 0.65x and a per-file median of 0.44x
+  against 0.42x, so the choice does not decide anything.
+- The sub-millisecond formats — txt at 0.23x, eml 0.16x, opml 0.03x — are measuring fixed
+  per-call cost, not parsing throughput. Both sides do almost no work on those files, and what
+  the ratio reflects there has not been investigated.
+- Run on a 2.80 GHz Xeon. Every ONNX figure elsewhere in this file was taken on a 2.10 GHz one,
+  because the host changed underneath the session; the two sets of absolute milliseconds are
+  not comparable, though each ratio is internally sound.
 
 ## Excluded (dropped per requirements)
 

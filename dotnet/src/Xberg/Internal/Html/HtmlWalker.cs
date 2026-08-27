@@ -1,4 +1,5 @@
 using System.Text;
+using Xberg.Core;
 using Xberg.Types;
 
 namespace Xberg.Internal.Html;
@@ -48,10 +49,59 @@ public sealed class HtmlWalker
     private readonly StringBuilder _dtText = new();
     private readonly StringBuilder _ddText = new();
 
-    public HtmlWalker(string src, InternalDocumentBuilder builder)
+    /// <summary>
+    /// The hostile-input counters for this walk. Charged where upstream's node walk charges:
+    /// one loop turn per tag, a descent per nested container, the emitted text of every block,
+    /// and a table's cells before the table is built.
+    /// </summary>
+    private readonly SecurityBudget _budget;
+
+    public HtmlWalker(string src, InternalDocumentBuilder builder, SecurityLimits? limits = null)
     {
         _src = src;
         _b = builder;
+        _budget = new SecurityBudget(limits ?? new SecurityLimits());
+    }
+
+    /// <summary>
+    /// The index just past the end of the comment that starts at <paramref name="start"/>, or
+    /// the end of the input when it is never closed.
+    /// </summary>
+    /// <remarks>
+    /// A comment normally ends at <c>--&gt;</c>. Upstream's converter ends it early when the
+    /// comment reads like a self-closing tag: for a comment whose content opens with whitespace
+    /// or a slash, it scans quote-aware to the first <c>&gt;</c>, and if that <c>&gt;</c> is
+    /// preceded by <c>/</c> the comment stops there — leaking the rest of it into the document
+    /// as text. A <c>&gt;</c> that is not preceded by a slash ends the scan without truncating,
+    /// which is why a comment holding <c>&lt;a href="…"&gt;…&lt;img … /&gt;</c> survives intact
+    /// while one holding <c>&lt;br /&gt;</c> does not.
+    ///
+    /// This is neither html5ever's behaviour nor `tl`'s — both were probed directly and parse
+    /// such comments correctly — so it comes from the converter's own preprocessing. The rule was
+    /// characterised by differential testing against the real converter: 243 generated shapes,
+    /// including quoted attributes, conditional comments and multiple <c>/&gt;</c>, all agree.
+    /// Eleven fixtures in the corpus contain a comment this applies to.
+    /// </remarks>
+    internal static int CommentEnd(string src, int start)
+    {
+        int contentStart = start + 4;
+        int normalEnd = src.IndexOf("-->", contentStart, StringComparison.Ordinal);
+        int end = normalEnd < 0 ? src.Length : normalEnd + 3;
+
+        if (contentStart >= src.Length) return end;
+        char first = src[contentStart];
+        if (!char.IsWhiteSpace(first) && first != '/') return end;
+
+        char quote = '\0';
+        for (int i = contentStart; i < src.Length; i++)
+        {
+            char c = src[i];
+            if (quote != '\0') { if (c == quote) quote = '\0'; continue; }
+            if (c == '"' || c == '\'') { quote = c; continue; }
+            // The first unquoted `>` settles it either way.
+            if (c == '>') return i > contentStart && src[i - 1] == '/' ? i + 1 : end;
+        }
+        return end;
     }
 
     public void Walk()
@@ -60,10 +110,10 @@ public sealed class HtmlWalker
         {
             if (Starts("<!--"))
             {
-                int end = _src.IndexOf("-->", _pos, StringComparison.Ordinal);
-                _pos = end < 0 ? _src.Length : end + 3;
+                _pos = CommentEnd(_src, _pos);
                 continue;
             }
+            _budget.Step();
             if (_src[_pos] == '<' && OpensTag(_src, _pos)) HandleTag();
             else HandleText();
         }
@@ -72,6 +122,14 @@ public sealed class HtmlWalker
 
         if (_b.NodeCount == 0 && _discarded.Length != 0)
             _b.PushParagraph(_discarded.ToString(), new(), null, null);
+    }
+
+    /// <summary>Charge a table's cells before it is handed to the builder.</summary>
+    private void ChargeCells(List<List<string>> grid)
+    {
+        long count = 0;
+        foreach (var row in grid) count += row.Count;
+        _budget.AddCells(count);
     }
 
     private bool Starts(string s) => string.CompareOrdinal(_src, _pos, s, 0, s.Length) == 0 && _pos + s.Length <= _src.Length;
@@ -477,6 +535,7 @@ public sealed class HtmlWalker
         }
         _b.PushGroupStart(null, null);
         _groupStack.Add(level);
+        _budget.AccountText(Encoding.UTF8.GetByteCount(text));
         _b.PushHeading(level, text, null, null);
     }
 
@@ -490,6 +549,7 @@ public sealed class HtmlWalker
                 display = text.Length == 0 ? $"![]({src})" : $"![{text}]({src})";
             else
                 display = text;
+            _budget.AccountText(Encoding.UTF8.GetByteCount(display));
             _b.PushParagraph(display, new(), null, null);
         }
         if (!string.IsNullOrEmpty(src))
@@ -510,8 +570,7 @@ public sealed class HtmlWalker
             p = lt;
             if (string.CompareOrdinal(_src, p, "<!--", 0, 4) == 0)
             {
-                int e = _src.IndexOf("-->", p + 4, StringComparison.Ordinal);
-                p = e < 0 ? _src.Length : e + 3;
+                p = CommentEnd(_src, p);
                 continue;
             }
             int gt = _src.IndexOf('>', p);
@@ -540,7 +599,7 @@ public sealed class HtmlWalker
         if (table is null) return;
         HtmlToMarkdown.EmitTableTree(table, grid =>
         {
-            if (grid.Count > 0) _b.PushTableFromCells(grid, null, null);
+            if (grid.Count > 0) { ChargeCells(grid); _b.PushTableFromCells(grid, null, null); }
         }, (alt, src) => EmitImage(alt, src));
     }
 
@@ -564,6 +623,7 @@ public sealed class HtmlWalker
         if (!hasSpans)
         {
             var simple = rows.Select(r => r.Select(c => CellNormalize(c.Text)).ToList()).ToList();
+            ChargeCells(simple);
             _b.PushTableFromCells(simple, null, null);
             return;
         }
@@ -571,6 +631,7 @@ public sealed class HtmlWalker
         // covers, which slides every cell beneath one leftwards and out from under its header.
         var grid = Tables.GridFlatten.FlattenSpannedRows<CellMeta>(
             rows, c => (int)c.ColSpan, c => (int)c.RowSpan, c => CellNormalize(c.Text));
+        ChargeCells(grid);
         _b.PushTableFromCells(grid, null, null);
     }
 
@@ -687,6 +748,7 @@ public sealed class HtmlWalker
         if (text.Length > 0)
         {
             var anns = new List<TextAnnotation>(_annotations);
+            _budget.AccountText(Encoding.UTF8.GetByteCount(text));
             _b.PushParagraph(text, anns, null, null);
         }
         DiscardParagraph();
@@ -763,7 +825,11 @@ public sealed class HtmlWalker
         foreach (var item in lst.Items)
         {
             string text = ItemText(item, nl, ud);
-            if (text.Length > 0) _b.PushListItem(text, lst.Ordered, new(), null, null);
+            if (text.Length > 0)
+            {
+                _budget.AccountText(Encoding.UTF8.GetByteCount(text));
+                _b.PushListItem(text, lst.Ordered, new(), null, null);
+            }
         }
         _b.EndList();
         foreach (var item in lst.Items)
@@ -941,8 +1007,7 @@ public sealed class HtmlWalker
             _pos = lt;
             if (Starts("<!--"))
             {
-                int e = _src.IndexOf("-->", _pos + 4, StringComparison.Ordinal);
-                _pos = e < 0 ? _src.Length : e + 3;
+                _pos = CommentEnd(_src, _pos);
                 continue;
             }
             int gt = _src.IndexOf('>', _pos);
@@ -976,6 +1041,28 @@ public sealed class HtmlWalker
     /// The element's attributes in source order, each as its name and its value (null when the
     /// attribute was written with no value at all).
     /// </summary>
+    /// <summary>
+    /// Drop the leading characters an attribute name cannot begin with.
+    /// </summary>
+    /// <remarks>
+    /// The parser upstream discards them rather than keeping them in the name, which is what a
+    /// stray character in a tag comes down to: <c>&lt;a href="…" \&gt;</c> has no third
+    /// attribute at all, <c>&lt;a href="…"&lt;u&gt;</c> — a tag left unterminated, running the
+    /// next element's bracket into its own attribute list — carries one named <c>u</c>, and
+    /// <c>@click</c> records as <c>click</c>. A name may still start with <c>_</c>, <c>:</c>,
+    /// <c>-</c> or a digit, all of which real documents use.
+    /// </remarks>
+    internal static string TrimAttributeNameStart(string key)
+    {
+        int i = 0;
+        while (i < key.Length && !IsAttributeNameStart(key[i])) i++;
+        return i == 0 ? key : key[i..];
+    }
+
+    private static bool IsAttributeNameStart(char c) =>
+        (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+        || c == '_' || c == ':' || c == '-';
+
     internal static IEnumerable<(string Key, string? Value)> EnumerateAttributes(string attrs)
     {
         int i = 0, n = attrs.Length;
@@ -985,7 +1072,7 @@ public sealed class HtmlWalker
             if (i >= n) break;
             int ks = i;
             while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>' && attrs[i] != '/') i++;
-            string key = attrs[ks..i];
+            string key = TrimAttributeNameStart(attrs[ks..i]);
             // Nothing that can start a name here — a stray `=` or `/` between attributes. Step
             // over that one character and look again; the `=` does not adopt what follows it as
             // its value, so `<a =` + `href=…` still yields the href.
@@ -1022,6 +1109,18 @@ public sealed class HtmlWalker
         return null;
     }
 
+    /// <summary>
+    /// Attribute lookup by exact name, for the markdown converter — the crate it ports matches
+    /// attribute names case-sensitively, so an uppercase <c>HREF</c> or <c>SRC</c> is simply not
+    /// there as far as its handlers are concerned.
+    /// </summary>
+    internal static string? ExtractAttrExact(string attrs, string name)
+    {
+        foreach (var (key, value) in EnumerateAttributes(attrs))
+            if (key.Equals(name, StringComparison.Ordinal)) return value ?? "";
+        return null;
+    }
+
     private static string? ExtractLanguageFromClass(string? cls)
     {
         if (cls is null) return null;
@@ -1043,7 +1142,15 @@ public sealed class HtmlWalker
     /// because the structure walker it serves ports a Rust function that knows only a few dozen
     /// names, and widening it there would diverge from the reference the other way.
     /// </remarks>
-    internal static string DecodeEntitiesFull(string s)
+    internal static string DecodeEntitiesFull(string s) => DecodeEntitiesFull(s, false);
+
+    /// <param name="html5NumericTable">
+    /// Resolve a numeric reference the way the HTML5 tokenizer does, through the replacement
+    /// table of §13.2.5.80. Only a document that reaches the walk through the html5ever repair
+    /// gets this: the converter's own fast path decodes <c>&amp;#146;</c> to U+0092 and leaves it
+    /// there, where the repair resolves it to U+2019.
+    /// </param>
+    internal static string DecodeEntitiesFull(string s, bool html5NumericTable)
     {
         if (!s.Contains('&')) return s;
         var outp = new StringBuilder(s.Length);
@@ -1065,7 +1172,7 @@ public sealed class HtmlWalker
                 continue;
             }
 
-            if (name[0] == '#' && DecodeNumericReference(name) is { } numeric)
+            if (name[0] == '#' && DecodeNumericReference(name, html5NumericTable) is { } numeric)
             {
                 outp.Append(numeric);
                 i = semi + 1;
@@ -1077,7 +1184,22 @@ public sealed class HtmlWalker
         return outp.ToString();
     }
 
-    private static string? DecodeNumericReference(string name)
+    /// <summary>
+    /// The HTML5 tokenizer's numeric character reference replacement table (§13.2.5.80). A
+    /// reference in the C1 range names a Windows-1252 character rather than the control it
+    /// nominally points at, because that is what the pages doing it meant.
+    /// </summary>
+    private static readonly Dictionary<int, int> Html5NumericReplacements = new()
+    {
+        [0x00] = 0xFFFD, [0x80] = 0x20AC, [0x82] = 0x201A, [0x83] = 0x0192, [0x84] = 0x201E,
+        [0x85] = 0x2026, [0x86] = 0x2020, [0x87] = 0x2021, [0x88] = 0x02C6, [0x89] = 0x2030,
+        [0x8A] = 0x0160, [0x8B] = 0x2039, [0x8C] = 0x0152, [0x8E] = 0x017D, [0x91] = 0x2018,
+        [0x92] = 0x2019, [0x93] = 0x201C, [0x94] = 0x201D, [0x95] = 0x2022, [0x96] = 0x2013,
+        [0x97] = 0x2014, [0x98] = 0x02DC, [0x99] = 0x2122, [0x9A] = 0x0161, [0x9B] = 0x203A,
+        [0x9C] = 0x0153, [0x9E] = 0x017E, [0x9F] = 0x0178,
+    };
+
+    private static string? DecodeNumericReference(string name, bool html5NumericTable = false)
     {
         string num = name[1..];
         int cp;
@@ -1088,6 +1210,8 @@ public sealed class HtmlWalker
         else if (!int.TryParse(num, out cp)) return null;
 
         if (cp < 0 || cp > 0x10FFFF) return null;
+        if (html5NumericTable && Html5NumericReplacements.TryGetValue(cp, out int replacement))
+            cp = replacement;
         try { return char.ConvertFromUtf32(cp); }
         catch { return null; }
     }

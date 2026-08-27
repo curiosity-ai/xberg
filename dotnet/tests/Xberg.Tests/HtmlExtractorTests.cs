@@ -410,6 +410,158 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
+    /// A start tag with no `>` of its own costs the tag, not the document. astral-tl's
+    /// `parse_tag` gives up when it cannot find the bracket, and `parse_single` ignores that
+    /// failure and carries on from wherever the scan stopped — so everything after the malformed
+    /// tag is still parsed. `<input … value="" </span>` is the shape that exposed it: on
+    /// office/regression/000_000061.html it was hiding every heading and paragraph that followed.
+    /// </summary>
+    [Fact]
+    public void AStartTagWithNoClosingBracketDoesNotSwallowTheDocument()
+    {
+        var doc = Html("<html><body><p>before</p>"
+                       + "<input type=\"text\" name=\"i\" value=\"\" </span>"
+                       + "<h3>AFTER</h3><p>tail</p></body></html>");
+        string[] texts = doc.Elements.Select(e => e.Text).ToArray();
+        Assert.Contains("before", texts);
+        Assert.Contains("AFTER", texts);
+        Assert.Contains("tail", texts);
+        // The raw markup must not reach the output as a literal text run.
+        Assert.DoesNotContain(texts, t => t.Contains("<h3>"));
+    }
+
+    /// <summary>
+    /// A document that reaches the walk through the html5ever repair arrives with its character
+    /// references already resolved, and that applies to head metadata too: a `<title>`'s text and
+    /// a `<meta content>`'s value read as the resolved character. Off the repair path both keep
+    /// the reference as written. `<div>` inside `<span>` is what puts this document on the repair
+    /// path — a block element under an inline ancestor.
+    /// </summary>
+    [Fact]
+    public void HeadMetadataResolvesItsReferencesOnTheRepairPath()
+    {
+        const string Head = "<title>x &deg; y</title>"
+                          + "<meta name=\"description\" content=\"a &reg; b\">"
+                          + "<meta name=\"keywords\" content=\"p &reg; q\">";
+
+        var repaired = Meta($"<html><head>{Head}</head><body><span><div>z</div></span></body></html>");
+        Assert.Equal("x \u00b0 y", repaired.Title);
+        Assert.Equal("a \u00ae b", repaired.Description);
+        Assert.Equal(new[] { "p \u00ae q" }, repaired.Keywords.ToArray());
+
+        var plain = Meta($"<html><head>{Head}</head><body><p>z</p></body></html>");
+        Assert.Equal("x &deg; y", plain.Title);
+        Assert.Equal("a &reg; b", plain.Description);
+    }
+
+    /// <summary>
+    /// Upstream normalizes its input once, before anything reads it, so its metadata collector —
+    /// which runs inside the conversion — never sees a carriage return. This port collects
+    /// metadata in a separate pass and has to normalize for itself, or a title spanning two
+    /// source lines keeps the CRLF the golden does not have.
+    /// </summary>
+    [Fact]
+    public void ATitleSpanningTwoLinesKeepsOnlyTheNewline()
+    {
+        var doc = Html("<html><head><title>A\r\nB</title></head><body><p>x</p></body></html>");
+        Assert.Equal("A\nB", doc.Metadata.Title);
+    }
+
+    /// <summary>
+    /// A numeric character reference in the C1 range names a Windows-1252 character rather than
+    /// the control it nominally points at — the HTML5 tokenizer's replacement table of §13.2.5.80.
+    /// Only a document that reaches the walk through the html5ever repair gets that: the
+    /// converter's own fast path decodes `&#146;` to U+0092 and leaves it there. `<my-el>` is what
+    /// puts this document on the repair path, since a tag name holding a hyphen is a custom
+    /// element. Measured against the real converter across the whole 0x80-0x9F range.
+    /// </summary>
+    [Theory]
+    [InlineData("&#146;", "\u2019")]
+    [InlineData("&#145;", "\u2018")]
+    [InlineData("&#151;", "\u2014")]
+    [InlineData("&#128;", "\u20ac")]
+    [InlineData("&#159;", "\u0178")]
+    // The five code points the table leaves alone.
+    [InlineData("&#129;", "\u0081")]
+    [InlineData("&#141;", "\u008d")]
+    [InlineData("&#143;", "\u008f")]
+    [InlineData("&#144;", "\u0090")]
+    [InlineData("&#157;", "\u009d")]
+    public void ACOneReferenceResolvesThroughTheWindows1252TableOnTheRepairPath(string reference, string expected)
+    {
+        var doc = Html($"<html><body><my-el></my-el><p>x{reference}y</p></body></html>");
+        Assert.Contains($"x{expected}y", string.Join("\n", doc.Elements.Select(e => e.Text)));
+    }
+
+    /// <summary>Without the repair, the same reference keeps its C1 code point.</summary>
+    [Fact]
+    public void TheSameReferenceKeepsItsCodePointOffTheRepairPath()
+    {
+        var doc = Html("<html><body><p>x&#146;y</p></body></html>");
+        Assert.Contains("x\u0092y", string.Join("\n", doc.Elements.Select(e => e.Text)));
+    }
+
+    /// <summary>
+    /// Upstream's converter ends a comment early when it reads like a self-closing tag: for a
+    /// comment opening with whitespace or a slash, it scans quote-aware to the first `>` and
+    /// stops there if that `>` is preceded by `/`. The rest of the comment then leaks into the
+    /// document as text. Neither html5ever nor `tl` does this — both were probed directly — but
+    /// the goldens record it, so the port reproduces it. The expectations below were measured
+    /// against the real converter.
+    /// </summary>
+    [Theory]
+    // Opens with whitespace and the first unquoted `>` closes a self-closing tag: ends there.
+    [InlineData("<!-- x <br /> y -->", " y -->")]
+    [InlineData("<!-- /> y -->", " y -->")]
+    [InlineData("<!--/>-->", "-->")]
+    // Opens with a non-space, so the rule never applies and the comment runs to `-->`.
+    [InlineData("<!--x <br /> y-->", "")]
+    [InlineData("<!--<br />y-->", "")]
+    // The first unquoted `>` is a plain tag close, which ends the scan without truncating.
+    [InlineData("<!-- <a href=\"q/>r\">z</a> -->", "")]
+    [InlineData("<!-- <a href=\"i\"><img src=\"i\" /></a> -->", "")]
+    // A conditional comment opens with `[`.
+    [InlineData("<!--[if IE]><br /><![endif]-->", "")]
+    // No `>` at all before the close.
+    [InlineData("<!-- plain -->", "")]
+    public void ACommentReadingAsASelfClosingTagEndsEarly(string comment, string leaked)
+    {
+        int end = HtmlWalker.CommentEnd(comment, 0);
+        Assert.Equal(leaked, comment[end..]);
+    }
+
+    /// <summary>
+    /// `<template>` holds an inert document fragment and `<noscript>` only renders with
+    /// scripting disabled, which a Markdown conversion never is. The converter skips both
+    /// subtrees, so nothing inside them belongs to the document — including the images and links
+    /// this pass collects. Wikipedia ships a 1×1 tracking pixel in `<noscript>` on every page,
+    /// which is what this was over-counting.
+    /// </summary>
+    [Fact]
+    public void ImagesAndLinksInsideInertSubtreesAreNotCollected()
+    {
+        var m = Meta("<html><body>" +
+                     "<img src=\"real.png\" alt=\"real\">" +
+                     "<a href=\"/real\">real</a>" +
+                     "<noscript><img src=\"pixel.gif\" alt=\"\"><a href=\"/tracked\">t</a></noscript>" +
+                     "<template><img src=\"tpl.png\"><a href=\"/tpl\">x</a></template>" +
+                     "</body></html>");
+
+        // The collected entries are private records, so they are checked through the shape they
+        // serialize to — which is also what reaches the golden.
+        string images = System.Text.Json.JsonSerializer.Serialize(m.Images);
+        string links = System.Text.Json.JsonSerializer.Serialize(m.Links);
+        Assert.Single(m.Images);
+        Assert.Single(m.Links);
+        Assert.Contains("real.png", images);
+        Assert.DoesNotContain("pixel.gif", images);
+        Assert.DoesNotContain("tpl.png", images);
+        Assert.Contains("/real", links);
+        Assert.DoesNotContain("/tracked", links);
+        Assert.DoesNotContain("/tpl", links);
+    }
+
+    /// <summary>
     /// Preprocessing removes navigation and form subtrees before anything is collected, so a
     /// sidebar's heading is not one of the document's headings.
     /// </summary>
@@ -477,14 +629,24 @@ public class HtmlExtractorTests
 
     /// <summary>
     /// A title is trimmed but not collapsed: one written with two spaces between its halves
-    /// keeps them, and its entities are resolved.
+    /// keeps them. Its references are read as written — only a document that reaches the walk
+    /// through the html5ever repair arrives with them resolved, and there the serializer's own
+    /// spelling is what is recorded, so `&amp;mdash;` becomes an em dash while `&amp;nbsp;`
+    /// stays as it was written.
     /// </summary>
     [Fact]
-    public void ATitleKeepsItsInternalSpacing()
+    public void ATitleKeepsItsInternalSpacingAndItsReferencesAsWritten()
     {
         Assert.Equal(
-            "Understanding Output \u2014 aequitas  documentation",
+            "Understanding Output &mdash; aequitas  documentation",
             Meta("<html><head><title>\n  Understanding Output &mdash; aequitas  documentation\n</title></head></html>").Title);
+
+        // A block misnested under an inline ancestor is one of the conditions that sends a
+        // document through the repair.
+        Assert.Equal(
+            "A\u00b0B \u2014 C&nbsp;D",
+            Meta("<html><head><title>A&deg;B &mdash; C&nbsp;D</title></head>"
+                 + "<body><p><em><div>b</div></em></p></body></html>").Title);
     }
 
     /// <summary>
@@ -725,11 +887,11 @@ public class HtmlExtractorTests
     /// copy of that image.
     /// </summary>
     [Fact]
-    public void TemplateAndNoscriptContentIsRendered()
+    public void TemplateAndNoscriptContentIsDropped()
     {
-        Assert.Equal("before\n\n![](/y.png)\n\nafter\n", HtmlToMarkdown.Convert(
+        Assert.Equal("before\n\nafter\n", HtmlToMarkdown.Convert(
             "<p>before</p><noscript><img src=\"/y.png\" alt=\"\"></noscript><p>after</p>"));
-        Assert.Equal("a\n\ninside\n\nb\n", HtmlToMarkdown.Convert(
+        Assert.Equal("a\n\nb\n", HtmlToMarkdown.Convert(
             "<p>a</p><template><p>inside</p></template><p>b</p>"));
     }
 
@@ -741,19 +903,37 @@ public class HtmlExtractorTests
         => Assert.Equal("a\n\nStray\n\nb\n", HtmlToMarkdown.Convert("<body><p>a</p><title>Stray</title><p>b</p></body>"));
 
     /// <summary>
-    /// `strip_hidden_elements` runs over the source text and looks for the word `hidden`
-    /// anywhere after the tag name, so a quoted attribute value containing it takes the whole
-    /// element with it. `data-hidden` and `aria-hidden` still do not match.
+    /// `strip_hidden_elements` walks name=value pairs rather than scanning the tag's text for
+    /// the word `hidden`, so a quoted value containing it no longer takes the whole visible
+    /// element with it. `data-hidden` and `aria-hidden` are different names and never matched.
     /// </summary>
     [Fact]
-    public void AnAttributeValueContainingTheWordHiddenStripsTheElement()
+    public void OnlyTheHiddenAttributeItselfStripsTheElement()
     {
         Assert.Equal("kept\n", HtmlToMarkdown.Convert(
             "<p>kept</p><p hidden>gone</p>"));
-        Assert.Equal("kept\n", HtmlToMarkdown.Convert(
-            "<p>kept</p><p title=\"pages with hidden wikidata\">gone</p>"));
+        Assert.Equal("kept\n\nstays\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><p title=\"pages with hidden wikidata\">stays</p>"));
         Assert.Equal("kept\n\nstays\n", HtmlToMarkdown.Convert(
             "<p>kept</p><p data-hidden=\"1\" aria-hidden=\"true\">stays</p>"));
+    }
+
+    /// <summary>
+    /// An inline `style` that hides the element strips it too. The last declaration for a
+    /// property wins, so `display:none; display:block` is visible, and a comment before the
+    /// property name does not defeat the check.
+    /// </summary>
+    [Fact]
+    public void AnInlineStyleThatHidesTheElementStripsIt()
+    {
+        Assert.Equal("kept\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><div style=\"display: none\">gone</div>"));
+        Assert.Equal("kept\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><div style=\"visibility:hidden\">gone</div>"));
+        Assert.Equal("kept\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><div style=\"/* note */ display:none\">gone</div>"));
+        Assert.Equal("kept\n\nshown\n", HtmlToMarkdown.Convert(
+            "<p>kept</p><div style=\"display:none; display:block\">shown</div>"));
     }
 
     /// <summary>
@@ -768,14 +948,15 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
-    /// A `<span>` pops the newline before it so an element boundary does not break a line, but
-    /// never a markdown hard break: `<td>a<br>b</td>` keeps its break even when `b` is wrapped.
+    /// A `<br>` inside a table cell collapses to a single space: a GFM cell cannot hold a hard
+    /// break, so neither newline style is emitted there and the source whitespace around the
+    /// break is trimmed rather than leaked.
     /// </summary>
     [Fact]
-    public void ASpanDoesNotSwallowAHardBreak()
+    public void ABrInATableCellCollapsesToASpace()
     {
         var doc = Html("<table><tr><td><span>A</span><br /><span>B</span></td></tr></table>");
-        Assert.Equal(new List<string> { "A \nB" }, Assert.Single(doc.Tables).Cells[0]);
+        Assert.Equal(new List<string> { "A B" }, Assert.Single(doc.Tables).Cells[0]);
     }
 
     /// <summary>
@@ -837,12 +1018,14 @@ public class HtmlExtractorTests
     }
 
     /// <summary>
-    /// The collector records what it sees on every pass the table handler makes: three for a
-    /// markdown table, two for one rendered as a layout list, and a nested table is re-entered
-    /// once per pass of its parent except the width pre-pass, which never descends into it.
+    /// A table's links are recorded once, however many times the handler walks its cells. The
+    /// width pre-pass and the grid walk both run with the collectors detached — the first
+    /// because a column measurement is an internal detail, the second because the render has
+    /// already recorded the same cells — so the render is the only pass that records, and a
+    /// nested table is recorded once too rather than once per pass of its parent.
     /// </summary>
     [Fact]
-    public void ATablesLinksAreRecordedOncePerPassOverIt()
+    public void ATablesLinksAreRecordedOnceHoweverManyPassesWalkIt()
     {
         static int Count(string html, string href)
         {
@@ -855,19 +1038,19 @@ public class HtmlExtractorTests
         }
 
         const string simple = "<table><tr><td><a href=\"/a\">a</a></td></tr></table>";
-        Assert.Equal(3, Count(simple, "/a"));
+        Assert.Equal(1, Count(simple, "/a"));
 
-        // Rows of differing width read as a layout table: no width pre-pass, so two walks.
+        // Rows of differing width read as a layout table, which has no width pre-pass. The
+        // nested table's link is recorded once as well.
         const string layout = "<table><tr><td><a href=\"/a\">a</a></td>"
             + "<td><table><tr><td><a href=\"/b\">b</a></td></tr></table></td></tr></table>";
-        Assert.Equal(2, Count(layout, "/a"));
-        Assert.Equal(6, Count(layout, "/b"));
+        Assert.Equal(1, Count(layout, "/a"));
+        Assert.Equal(1, Count(layout, "/b"));
 
-        // A caption is walked by the render pass alone.
         const string caption = "<table><caption><a href=\"/c\">c</a></caption>"
             + "<tr><td><a href=\"/a\">a</a></td></tr></table>";
         Assert.Equal(1, Count(caption, "/c"));
-        Assert.Equal(3, Count(caption, "/a"));
+        Assert.Equal(1, Count(caption, "/a"));
     }
 
     // ── tag-open state and attribute recovery ───────────────────────────────

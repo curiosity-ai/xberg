@@ -1,0 +1,18 @@
+# Probe crate for the C# port: runs the real `rqrr` over image files and prints what it found,
+# so the ported detector/decoder can be diffed against it. Not part of the xberg workspace.
+[workspace]
+
+[package]
+name = "qr-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "qr-probe"
+path = "src/main.rs"
+
+[dependencies]
+rqrr = "0.10.1"
+image = "0.25"
+serde_json = "1"

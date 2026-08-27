@@ -45,6 +45,419 @@ if (args.Length >= 2 && args[0] == "--dump-metadata")
     return 0;
 }
 
+// Layout-model fetch: `--fetch-layout-model <type> [<cacheDir>]` runs the ported model manager,
+// printing where the verified file landed. Used to check the download, digest and publish path
+// against the pinned checksums without a full layout run.
+if (args.Length >= 2 && args[0] == "--fetch-layout-model")
+{
+    // The harness is a caller, so it is the one that may opt into the HF_* variables.
+    var manager = new Xberg.Internal.Layout.LayoutModelManager(
+        args.Length > 2 ? args[2] : null, Xberg.Core.XbergOptions.FromEnvironment());
+    try
+    {
+        string path = manager.EnsureModelAsync(args[1]).GetAwaiter().GetResult();
+        Console.WriteLine($"OK\t{args[1]}\t{path}\t{new FileInfo(path).Length}");
+        return 0;
+    }
+    catch (Exception e)
+    {
+        Console.Error.WriteLine($"FAIL\t{args[1]}\t{e.Message}");
+        return 1;
+    }
+}
+
+// QR probe mode: `--dump-qr <image>...` prints what the ported detector/decoder found, in the
+// same JSON shape as `tools/qr-probe`, so the two can be diffed.
+if (args.Length >= 2 && args[0] == "--dump-qr")
+{
+    var qr = new System.Text.Json.Nodes.JsonObject();
+    for (int i = 1; i < args.Length; i++)
+    {
+        var found = new System.Text.Json.Nodes.JsonArray();
+        foreach (var code in Xberg.Internal.Qr.QrScanner.Detect(File.ReadAllBytes(args[i])))
+            found.Add(new System.Text.Json.Nodes.JsonObject
+            {
+                ["payload"] = code.Payload,
+                ["x"] = code.X,
+                ["y"] = code.Y,
+                ["width"] = code.Width,
+                ["height"] = code.Height,
+            });
+        qr[args[i]] = found;
+    }
+    Console.Out.Write(qr.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
+// YOLO probe mode: `--dump-yolo <image> <variant>=<model.onnx>...` runs the ported YOLO
+// wrapper over each model and prints what it decoded, in the same JSON shape as
+// `tools/yolo-probe`, so the two can be diffed.
+if (args.Length >= 3 && args[0] == "--dump-yolo")
+{
+    using var page = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgb24>(args[1]);
+    var byVariant = new System.Text.Json.Nodes.JsonObject();
+
+    for (int i = 2; i < args.Length; i++)
+    {
+        int split = args[i].IndexOf('=');
+        string name = args[i][..split];
+        string path = args[i][(split + 1)..];
+
+        var (variant, width, height) = name switch
+        {
+            "doclaynet" => (Xberg.Internal.Layout.YoloVariant.DocLayNet, 640, 640),
+            "docstructbench" => (Xberg.Internal.Layout.YoloVariant.DocStructBench, 1024, 1024),
+            "yolox" => (Xberg.Internal.Layout.YoloVariant.Yolox, 768, 1024),
+            _ => throw new ArgumentException($"unknown variant {name}"),
+        };
+
+        var model = Xberg.Internal.Layout.YoloModel.FromFile(path, variant, width, height, name);
+        var found = new System.Text.Json.Nodes.JsonArray();
+        foreach (var detection in model.Detect(page))
+            found.Add(new System.Text.Json.Nodes.JsonObject
+            {
+                ["class"] = Xberg.Internal.Layout.LayoutClassExtensions.WireName(detection.ClassName),
+                ["confidence"] = detection.Confidence,
+                ["x1"] = detection.Box.X1,
+                ["y1"] = detection.Box.Y1,
+                ["x2"] = detection.Box.X2,
+                ["y2"] = detection.Box.Y2,
+            });
+        byVariant[name] = found;
+    }
+
+    Console.Out.Write(byVariant.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
+// WordPerfect probe mode: `--dump-wpd <file>...` parses each document with the managed
+// WordPerfect reader and prints the event stream plus the plain text it renders to, so both can
+// be diffed against what libwpd produced.
+if (args.Length >= 2 && args[0] == "--dump-wpd")
+{
+    var documents = new System.Text.Json.Nodes.JsonArray();
+    for (int i = 1; i < args.Length; i++)
+    {
+        var entry = new System.Text.Json.Nodes.JsonObject { ["file"] = args[i] };
+        try
+        {
+            var parsed = Xberg.Internal.WordPerfect.WordPerfectReader.Parse(File.ReadAllBytes(args[i]));
+            var events = new System.Text.Json.Nodes.JsonArray();
+            foreach (var e in parsed.Events)
+                events.Add(e.Kind == Xberg.Internal.WordPerfect.WpdEventKind.Text
+                    ? $"Text:{e.Text}"
+                    : e.Kind.ToString());
+            entry["format"] = Xberg.Internal.WordPerfect.WordPerfectReader.Detect(
+                File.ReadAllBytes(args[i])).ToString();
+            entry["events"] = events;
+            entry["plain"] = Xberg.Internal.WordPerfect.WordPerfectReader.RenderPlain(parsed);
+        }
+        catch (Exception e)
+        {
+            entry["error"] = e.Message;
+        }
+        documents.Add(entry);
+    }
+    Console.Out.Write(documents.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
+// SLANeXt probe mode: `--dump-slanet <model.onnx> <image>...` runs the ported table-structure
+// model and prints its decoded token stream, grid shape and cell boxes.
+if (args.Length >= 3 && args[0] == "--dump-slanet")
+{
+    var slanet = Xberg.Internal.Layout.SlanetModel.FromFile(args[1]);
+    var pages = new System.Text.Json.Nodes.JsonArray();
+    for (int i = 2; i < args.Length; i++)
+    {
+        using var image = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgb24>(args[i]);
+        var recognized = slanet.Recognize(image);
+        var cells = new System.Text.Json.Nodes.JsonArray();
+        foreach (var cell in recognized.Cells)
+            cells.Add(new System.Text.Json.Nodes.JsonObject
+            {
+                ["row"] = cell.Row,
+                ["col"] = cell.Col,
+                ["bbox"] = new System.Text.Json.Nodes.JsonArray(
+                    cell.Box[0], cell.Box[1], cell.Box[2], cell.Box[3]),
+            });
+        pages.Add(new System.Text.Json.Nodes.JsonObject
+        {
+            ["file"] = args[i],
+            ["num_rows"] = recognized.NumRows,
+            ["num_cols"] = recognized.NumCols,
+            ["confidence"] = recognized.Confidence,
+            ["tokens"] = string.Join("", recognized.StructureTokens),
+            ["cells"] = cells,
+        });
+    }
+    Console.Out.Write(pages.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
+// TATR probe mode: `--dump-tatr <model.onnx> <image>...` runs the ported table-structure model
+// over each image and prints its detections plus the reconstructed grid shape, matching
+// tools/tatr-probe so the two can be diffed.
+if (args.Length >= 3 && args[0] == "--dump-tatr")
+{
+    var tatr = Xberg.Internal.Layout.TatrModel.FromFile(args[1]);
+    var pages = new System.Text.Json.Nodes.JsonArray();
+    for (int i = 2; i < args.Length; i++)
+    {
+        using var image = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgb24>(args[i]);
+        var recognized = tatr.Recognize(image);
+
+        static System.Text.Json.Nodes.JsonArray Render(
+            IEnumerable<Xberg.Internal.Layout.TatrDetection> detections)
+        {
+            var array = new System.Text.Json.Nodes.JsonArray();
+            foreach (var d in detections)
+                array.Add(new System.Text.Json.Nodes.JsonObject
+                {
+                    ["class_name"] = d.ClassName.ToString(),
+                    ["confidence"] = d.Confidence,
+                    ["bbox"] = new System.Text.Json.Nodes.JsonArray(d.X1, d.Y1, d.X2, d.Y2),
+                });
+            return array;
+        }
+
+        var (grid, structure) = Xberg.Internal.Layout.TatrModel.BuildCellGridWithStructure(
+            recognized, recognized.TableBox);
+        pages.Add(new System.Text.Json.Nodes.JsonObject
+        {
+            ["file"] = args[i],
+            ["rows"] = Render(recognized.Rows),
+            ["columns"] = Render(recognized.Columns),
+            ["headers"] = Render(recognized.Headers),
+            ["spanning"] = Render(recognized.Spanning),
+            ["table_bbox"] = recognized.TableBox is { } tb
+                ? new System.Text.Json.Nodes.JsonArray(tb[0], tb[1], tb[2], tb[3])
+                : null,
+            ["grid_rows"] = grid.Count,
+            ["grid_cols"] = grid.Count > 0 ? grid[0].Count : 0,
+            ["header_row_count"] = structure.HeaderRowCount,
+            ["spans"] = structure.Spans.Count,
+        });
+    }
+    Console.Out.Write(pages.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
+// ONNX op census: `--onnx-ops <model.onnx>` lists the distinct operators a graph uses and how
+// many nodes use each, so a model that needs a kernel the port lacks names all of them at once
+// rather than one exception per run.
+if (args.Length >= 2 && args[0] == "--onnx-ops")
+{
+    var model = Xberg.Internal.Onnx.OnnxModel.Load(args[1]);
+    var census = new SortedDictionary<string, int>(StringComparer.Ordinal);
+    int total = 0;
+
+    // Control-flow nodes carry their own graphs, and a body's operators are just as required as
+    // the top level's — counting only top-level nodes reports a graph as runnable when it is not.
+    void Walk(IEnumerable<Xberg.Internal.Onnx.OnnxNode> nodes)
+    {
+        foreach (var node in nodes)
+        {
+            census[node.OpType] = census.TryGetValue(node.OpType, out int n) ? n + 1 : 1;
+            total++;
+            foreach (var attribute in node.Attributes)
+                if (attribute.Graph is { } subgraph) Walk(subgraph.Nodes);
+        }
+    }
+
+    Walk(model.Nodes);
+    foreach (var (op, count) in census) Console.WriteLine($"{count,6}  {op}");
+    Console.WriteLine($"distinct={census.Count} nodes={total}");
+    return 0;
+}
+
+// PP-DocLayout-V3 probe mode: `--dump-ppdoclayout <model.onnx> <image>...` runs the ported model
+// and prints the same JSON shape as tools/ppdoclayout-probe so the two can be diffed.
+if (args.Length >= 3 && args[0] == "--dump-ppdoclayout")
+{
+    var layoutModel = Xberg.Internal.Layout.PpDocLayoutV3Model.FromFile(args[1]);
+    var pages = new System.Text.Json.Nodes.JsonArray();
+    for (int i = 2; i < args.Length; i++)
+    {
+        using var image = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgb24>(args[i]);
+        var found = new System.Text.Json.Nodes.JsonArray();
+        foreach (var d in layoutModel.Detect(image))
+            found.Add(new System.Text.Json.Nodes.JsonObject
+            {
+                ["class_name"] = Xberg.Internal.Layout.LayoutClassExtensions.WireName(d.ClassName),
+                ["confidence"] = d.Confidence,
+                ["bbox"] = new System.Text.Json.Nodes.JsonArray(d.Box.X1, d.Box.Y1, d.Box.X2, d.Box.Y2),
+            });
+        pages.Add(new System.Text.Json.Nodes.JsonObject { ["file"] = args[i], ["detections"] = found });
+    }
+    Console.Out.Write(pages.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
+// Table-classifier probe mode: `--dump-tablecls <model.onnx> <image>...` classifies each image
+// wired/wireless through the ported PP-LCNet path, printing the same JSON shape as
+// tools/tablecls-probe so the two can be diffed.
+if (args.Length >= 3 && args[0] == "--dump-tablecls")
+{
+    var classifier = Xberg.Internal.Layout.TableClassifier.FromFile(args[1]);
+    var classified = new System.Text.Json.Nodes.JsonArray();
+    for (int i = 2; i < args.Length; i++)
+    {
+        using var image = SixLabors.ImageSharp.Image.Load<SixLabors.ImageSharp.PixelFormats.Rgb24>(args[i]);
+        var (type, rawWired, rawWireless) = classifier.ClassifyWithLogits(image);
+        classified.Add(new System.Text.Json.Nodes.JsonObject
+        {
+            ["file"] = args[i],
+            ["table_type"] = Xberg.Internal.Layout.TableTypeExtensions.Name(type),
+            ["raw_wired"] = rawWired,
+            ["raw_wireless"] = rawWireless,
+        });
+    }
+    Console.Out.Write(classified.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
+// Layout heuristics check: `--check-heuristics <probe.json>` reads the differential dump from
+// tools/heuristics-probe — the same pages detected twice by the real engine, once with
+// apply_heuristics off and once on — applies the ported heuristics to each raw set, and reports
+// where the result differs from what upstream produced. Upstream's heuristics carry no tests of
+// their own, so this real-detection differential is what verifies them.
+if (args.Length >= 2 && args[0] == "--check-heuristics")
+{
+    using var probe = System.Text.Json.JsonDocument.Parse(File.ReadAllText(args[1]));
+
+    static Xberg.Internal.Layout.LayoutClass ParseClass(string label)
+    {
+        foreach (Xberg.Internal.Layout.LayoutClass value
+                 in Enum.GetValues<Xberg.Internal.Layout.LayoutClass>())
+            if (Xberg.Internal.Layout.LayoutClassExtensions.WireName(value) == label) return value;
+        throw new InvalidOperationException($"unknown layout class '{label}'");
+    }
+
+    static List<Xberg.Internal.Layout.LayoutDetection> ReadDetections(System.Text.Json.JsonElement page)
+    {
+        var list = new List<Xberg.Internal.Layout.LayoutDetection>();
+        foreach (var d in page.GetProperty("detections").EnumerateArray())
+        {
+            var box = d.GetProperty("bbox");
+            list.Add(new Xberg.Internal.Layout.LayoutDetection(
+                ParseClass(d.GetProperty("class_name").GetString()!),
+                d.GetProperty("confidence").GetSingle(),
+                new Xberg.Internal.Layout.BBox(
+                    box[0].GetSingle(), box[1].GetSingle(), box[2].GetSingle(), box[3].GetSingle())));
+        }
+        return list;
+    }
+
+    static string Render(Xberg.Internal.Layout.LayoutDetection d) =>
+        string.Create(System.Globalization.CultureInfo.InvariantCulture,
+            $"{Xberg.Internal.Layout.LayoutClassExtensions.WireName(d.ClassName)}@{d.Confidence:F6}{d.Box}");
+
+    int pages = 0, matched = 0, rawTotal = 0, expectedTotal = 0;
+    foreach (var entry in probe.RootElement.EnumerateArray())
+    {
+        pages++;
+        var rawPage = entry.GetProperty("raw");
+        var cookedPage = entry.GetProperty("cooked");
+        var raw = ReadDetections(rawPage);
+        var expected = ReadDetections(cookedPage);
+        rawTotal += raw.Count;
+        expectedTotal += expected.Count;
+
+        var actual = Xberg.Internal.Layout.LayoutPostprocessing.ApplyHeuristics(
+            raw, rawPage.GetProperty("page_width").GetSingle(), rawPage.GetProperty("page_height").GetSingle());
+
+        var expectedText = expected.Select(Render).ToList();
+        var actualText = actual.Select(Render).ToList();
+        if (expectedText.SequenceEqual(actualText)) { matched++; continue; }
+
+        Console.WriteLine($"MISMATCH {entry.GetProperty("file").GetString()}");
+        Console.WriteLine($"  expected ({expectedText.Count}): {string.Join(", ", expectedText)}");
+        Console.WriteLine($"  actual   ({actualText.Count}): {string.Join(", ", actualText)}");
+    }
+
+    Console.WriteLine($"pages={pages} matched={matched} raw={rawTotal} expected={expectedTotal}");
+    return matched == pages ? 0 : 1;
+}
+
+// DocTags probe mode: `--dump-doctags <file>...` renders each file to DocTags and then feeds
+// that stream back through the DocTags extractor, printing the same JSON shape as
+// `tools/doctags-probe` so the two can be diffed. Both stages are printed, so a divergence pins
+// to the renderer or to the parser.
+if (args.Length >= 2 && args[0] == "--dump-doctags")
+{
+    var doctags = new System.Text.Json.Nodes.JsonObject();
+    var dtExtractor = new Extractor();
+    string RenderDocTags(ExtractInput input)
+    {
+        var cfg = new ExtractionConfig { OutputFormat = OutputFormat.DocTags };
+        try
+        {
+            var r = dtExtractor.Extract(input, cfg);
+            if (r.Errors.Count > 0) return $"<<error: {r.Errors[0].Message}>>";
+            return r.Results.FirstOrDefault()?.Content ?? "";
+        }
+        catch (Exception e) { return $"<<error: {e.Message}>>"; }
+    }
+    for (int i = 1; i < args.Length; i++)
+    {
+        // A real Docling stream is fed in as DocTags bytes rather than by extension: the corpus
+        // names them `*.doctags.txt`, which resolves as plain text, so the extractor would never
+        // otherwise see one.
+        string first = args[i].EndsWith(".doctags.txt", StringComparison.Ordinal)
+            ? RenderDocTags(ExtractInput.FromBytes(File.ReadAllBytes(args[i]), "text/vnd.docling.doctags"))
+            : RenderDocTags(ExtractInput.FromUri(args[i]));
+        string second = RenderDocTags(ExtractInput.FromBytes(
+            System.Text.Encoding.UTF8.GetBytes(first), "text/vnd.docling.doctags"));
+        doctags[args[i]] = new System.Text.Json.Nodes.JsonObject
+        {
+            ["render"] = first,
+            ["roundtrip"] = second,
+        };
+    }
+    Console.Out.Write(doctags.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
+// Styled-HTML probe mode: `--dump-styled-html <file>...` renders each file through
+// `StyledHtmlRenderer` under every configuration `tools/htmlstyled-probe` covers, printing the
+// same JSON shape so the two can be diffed byte for byte.
+if (args.Length >= 2 && args[0] == "--dump-styled-html")
+{
+    var cases = new (string Name, HtmlOutputConfig Config)[]
+    {
+        ("unstyled-embed", new HtmlOutputConfig()),
+        ("default-embed", new HtmlOutputConfig { Theme = HtmlTheme.Default }),
+        ("github-embed", new HtmlOutputConfig { Theme = HtmlTheme.GitHub }),
+        ("dark-embed", new HtmlOutputConfig { Theme = HtmlTheme.Dark }),
+        ("light-embed", new HtmlOutputConfig { Theme = HtmlTheme.Light }),
+        ("default-noembed", new HtmlOutputConfig { Theme = HtmlTheme.Default, EmbedCss = false }),
+        ("unstyled-prefix", new HtmlOutputConfig { ClassPrefix = "zz-" }),
+        ("unstyled-usercss", new HtmlOutputConfig { Css = ".kb-p { color: red; }" }),
+    };
+    var probe = new System.Text.Json.Nodes.JsonObject();
+    var probeExtractor = new Extractor();
+    for (int i = 1; i < args.Length; i++)
+    {
+        var perCase = new System.Text.Json.Nodes.JsonObject();
+        foreach (var (name, html) in cases)
+        {
+            var cfg = new ExtractionConfig { OutputFormat = OutputFormat.Html, HtmlOutput = html };
+            string content;
+            try
+            {
+                var r = probeExtractor.Extract(ExtractInput.FromUri(args[i]), cfg);
+                content = r.Results.FirstOrDefault()?.Content ?? "";
+            }
+            catch (Exception e) { content = $"<<error: {e.Message}>>"; }
+            perCase[name] = content;
+        }
+        probe[args[i]] = perCase;
+    }
+    Console.Out.Write(probe.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
+    return 0;
+}
+
 // Table dump mode: `--dump-tables <file>` prints the C# tables as JSON, so a mismatch can be
 // diffed cell-by-cell against the golden's `tables` array.
 if (args.Length >= 2 && args[0] == "--dump-tables")
@@ -57,14 +470,18 @@ if (args.Length >= 2 && args[0] == "--dump-tables")
 var opts = ParseArgs(args);
 if (opts is null) return 2;
 
+// Goldens live next to their fixtures by default. `--goldens <dir>` reads them from a
+// mirror of the fixture tree instead, which is how one corpus carries several golden sets —
+// one per xberg feature configuration — without either overwriting the other.
+var goldenRoot = opts.GoldenRoot ?? opts.Root;
 var goldenFiles = Directory
-    .EnumerateFiles(opts.Root, "*-results-rust.json", SearchOption.AllDirectories)
+    .EnumerateFiles(goldenRoot, "*-results-rust.json", SearchOption.AllDirectories)
     .OrderBy(p => p, StringComparer.Ordinal)
     .ToList();
 
 if (goldenFiles.Count == 0)
 {
-    Console.Error.WriteLine($"No *-results-rust.json golden files under {opts.Root}");
+    Console.Error.WriteLine($"No *-results-rust.json golden files under {goldenRoot}");
     return 2;
 }
 
@@ -77,8 +494,11 @@ var clusters = new Dictionary<string, (int Count, string Rel, string Want, strin
 
 foreach (var goldenPath in goldenFiles)
 {
-    var sourcePath = goldenPath[..^"-results-rust.json".Length];
-    var rel = Path.GetRelativePath(opts.Root, sourcePath).Replace('\\', '/');
+    var goldenStem = goldenPath[..^"-results-rust.json".Length];
+    // With `--goldens`, the golden sits at the fixture's relative position under the golden
+    // root; the fixture itself is still under `--root`.
+    var rel = Path.GetRelativePath(goldenRoot, goldenStem).Replace('\\', '/');
+    var sourcePath = opts.GoldenRoot is null ? goldenStem : Path.Combine(opts.Root, rel);
     var ext = Path.GetExtension(sourcePath).TrimStart('.').ToLowerInvariant();
 
     if (opts.Filter is not null && !rel.Contains(opts.Filter, StringComparison.OrdinalIgnoreCase)) continue;
@@ -100,6 +520,10 @@ foreach (var goldenPath in goldenFiles)
     var got = new Dictionary<string, string>();
     ExtractedDocument? plainDoc = null;
     bool csharpFailed = false;
+    // The extractor reports a refusal as an error item rather than throwing, and a fixture that
+    // starts being refused is exactly what a change to the security limits would do; without
+    // this the sweep only shows it as a fixture quietly moving into the "both empty" bucket.
+    string csharpError = "";
     foreach (var (name, fmt) in Formats())
     {
         try
@@ -107,7 +531,7 @@ foreach (var goldenPath in goldenFiles)
             // Per-file guard: a pathological fixture must not stall the whole sweep.
             var capturedPath = sourcePath;
             var task = System.Threading.Tasks.Task.Run(() =>
-                extractor.Extract(ExtractInput.FromUri(capturedPath), new ExtractionConfig { OutputFormat = fmt }));
+                extractor.Extract(ExtractInput.FromUri(capturedPath), Cfg.Make(fmt, opts)));
             if (!task.Wait(TimeSpan.FromSeconds(120)))
             {
                 csharpFailed = true;
@@ -117,12 +541,21 @@ foreach (var goldenPath in goldenFiles)
             }
             var doc = task.Result.Results.FirstOrDefault();
             got[name] = doc?.Content ?? "";
-            if (name == "plain") plainDoc = doc;
+            if (name == "plain")
+            {
+                plainDoc = doc;
+                if (task.Result.Errors.Count > 0)
+                {
+                    csharpFailed = true;
+                    csharpError = $"{task.Result.Errors[0].ErrorType}: {task.Result.Errors[0].Message}";
+                }
+            }
         }
-        catch
+        catch (Exception ex)
         {
             csharpFailed = true;
             got[name] = "";
+            if (csharpError.Length == 0) csharpError = ex.Message;
         }
     }
 
@@ -130,7 +563,33 @@ foreach (var goldenPath in goldenFiles)
     bool csharpEmpty = string.IsNullOrEmpty(got["plain"]) && (plainDoc is null || plainDoc.Metadata.Format is null);
     if (!rustSuccess)
     {
-        if (csharpFailed || csharpEmpty) { es.BothUnsupported++; stats.BothUnsupported++; }
+        if (csharpFailed || csharpEmpty)
+        {
+            es.BothUnsupported++; stats.BothUnsupported++;
+            // Rust extracts nothing from this fixture, so parity says nothing about it either
+            // way — but if the port would have produced something with the security limits
+            // lifted, then the limits are what emptied it, and that is worth naming. Only the
+            // non-comparable set is re-run, which is small.
+            if (opts.ListFail && !opts.NoSecurity)
+            {
+                try
+                {
+                    var loose = Cfg.Make(OutputFormat.Plain, new Options { NoSecurity = true });
+                    var again = extractor.Extract(ExtractInput.FromUri(sourcePath), loose);
+                    var got2 = again.Results.FirstOrDefault();
+                    bool wouldHaveContent = !string.IsNullOrEmpty(got2?.Content)
+                        || (got2 is not null && got2.Metadata.Format is not null);
+                    if (wouldHaveContent && again.Errors.Count == 0)
+                        Console.WriteLine($"SECEMPTY\t{ext}\t{rel}\t{csharpError}");
+                }
+                catch { /* the loose run failing too means the limits were not the cause */ }
+            }
+            // Rust extracts nothing here either, so this is not a parity failure — but a
+            // fixture that moves into this bucket after a change is one the port stopped
+            // handling, and `--list-fail` is where that has to be visible.
+            if (opts.ListFail && csharpFailed)
+                Console.WriteLine($"CSFAIL\t{ext}\t{rel}\t{csharpError}");
+        }
         else { es.Extra++; stats.Extra++; }
         continue;
     }
@@ -496,10 +955,44 @@ static Options? ParseArgs(string[] args)
             case "--list-ok": o.ListOk = true; break;
             case "--list-fail": o.ListFail = true; break;
             case "--dump": o.Dump = args[++i]; break;
+            case "--goldens": o.GoldenRoot = args[++i]; break;
+            case "--no-security": o.NoSecurity = true; break;
+            case "--features":
+                foreach (var f in args[++i].Split(',', StringSplitOptions.RemoveEmptyEntries))
+                    if (f.Trim() == "code") o.SourceCodeDetection = true;
+                break;
         }
     }
     if (!Directory.Exists(o.Root)) { Console.Error.WriteLine($"not a directory: {o.Root}"); return null; }
     return o;
+}
+
+static partial class Cfg
+{
+    /// <summary>The extraction config for one sweep run.</summary>
+    public static ExtractionConfig Make(OutputFormat fmt, Options o) => new()
+    {
+        OutputFormat = fmt,
+        SecurityLimits = o.NoSecurity ? Unbounded : null,
+        // Upstream gates source-code detection behind the `tree-sitter` cargo feature, so a
+        // golden set generated without it reads a `.py` file as plain text. The port decides at
+        // run time instead, and the sweep has to be told which golden set it is measuring
+        // against: `--features code` alongside `--goldens <extended tree>`.
+        Options = new XbergOptions { SourceCodeDetection = o.SourceCodeDetection },
+    };
+
+    private static readonly SecurityLimits Unbounded = new()
+    {
+        MaxArchiveSize = long.MaxValue,
+        MaxCompressionRatio = long.MaxValue,
+        MaxFilesInArchive = long.MaxValue,
+        MaxNestingDepth = long.MaxValue,
+        MaxEntityLength = long.MaxValue,
+        MaxContentSize = long.MaxValue,
+        MaxIterations = long.MaxValue,
+        MaxXmlDepth = long.MaxValue,
+        MaxTableCells = long.MaxValue,
+    };
 }
 
 sealed class Options
@@ -515,6 +1008,18 @@ sealed class Options
     public bool ListOk;
     public bool ListFail;
     public string? Dump;
+
+    /// <summary>Root of a mirrored golden tree (`--goldens`), or null to read them next to
+    /// the fixtures.</summary>
+    public string? GoldenRoot;
+
+    /// <summary>Raise every security limit out of reach, so a sweep can be A/B'd against one
+    /// with the limits in force and attribute any difference to them.</summary>
+    public bool NoSecurity;
+
+    /// <summary>Whether a source file resolves to the code extractor (`--features code`).
+    /// Off by default, matching the golden set the default generator build produces.</summary>
+    public bool SourceCodeDetection;
 }
 
 sealed class DimStat { public int Match; public int Mismatch; }

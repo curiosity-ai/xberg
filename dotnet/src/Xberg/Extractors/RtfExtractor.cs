@@ -20,6 +20,10 @@ public sealed class RtfExtractor : IExtractor
 
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
+        // Upstream's one-line growth guard: the input's own size is charged against
+        // `max_content_size` before parsing, so a document too large to render is refused
+        // rather than rendered and then found to be too large.
+        SecurityBudget.FromConfig(config).AccountText(content.Length);
         // Rust uses String::from_utf8_lossy; UTF8.GetString applies replacement fallback.
         string rtfContent = Encoding.UTF8.GetString(content);
         const bool plain = true; // InternalDocument doesn't need markdown formatting

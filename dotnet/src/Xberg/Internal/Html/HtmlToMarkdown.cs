@@ -40,9 +40,17 @@ internal static class HtmlToMarkdown
         return Convert(html, structure, plainText);
     }
 
+    /// <summary>
+    /// The normalization upstream applies to the input before any of it is read
+    /// (`convert_api.rs::normalize_input`): NULs dropped and every line ending reduced to a bare
+    /// newline.
+    /// </summary>
+    internal static string NormalizeInput(string html) =>
+        html.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\0", "");
+
     private static string Convert(string html, HtmlStructureCollector? structure, bool plainText = false)
     {
-        html = html.Replace("\r\n", "\n").Replace("\r", "\n").Replace("\0", "");
+        html = NormalizeInput(html);
         string prepared = StripHiddenElements(StripScriptAndStyleTags(html));
         var root = HtmlDom.Parse(prepared);
         if (HasCustomElementTags(prepared) || HasInlineBlockMisnest(root))
@@ -197,9 +205,36 @@ internal static class HtmlToMarkdown
     /// resolved, then <c>&amp;</c>, <c>&lt;</c>, <c>&gt;</c>, <c>"</c> and a no-break space
     /// written back as named entities.
     /// </summary>
+    /// <summary>
+    /// The spelling text reaches the walk with on the html5ever repair path: references
+    /// resolved by the parse, then the ones its serializer writes back put back. A `"` is not
+    /// among them in text — only in an attribute value — so this is not
+    /// <see cref="CanonicalizeAttrValue"/>.
+    /// </summary>
+    internal static string CanonicalizeText(string value)
+    {
+        string decoded = HtmlWalker.DecodeEntitiesFull(value, true);
+        int i = decoded.AsSpan().IndexOfAny("&<>\u00a0");
+        if (i < 0) return decoded;
+        var sb = new StringBuilder(decoded.Length + 8);
+        sb.Append(decoded, 0, i);
+        for (; i < decoded.Length; i++)
+        {
+            switch (decoded[i])
+            {
+                case '&': sb.Append("&amp;"); break;
+                case '<': sb.Append("&lt;"); break;
+                case '>': sb.Append("&gt;"); break;
+                case '\u00a0': sb.Append("&nbsp;"); break;
+                default: sb.Append(decoded[i]); break;
+            }
+        }
+        return sb.ToString();
+    }
+
     internal static string CanonicalizeAttrValue(string value)
     {
-        string decoded = HtmlWalker.DecodeEntitiesFull(value);
+        string decoded = HtmlWalker.DecodeEntitiesFull(value, true);
         int i = decoded.AsSpan().IndexOfAny("&<>\"\u00a0");
         if (i < 0) return decoded;
         var sb = new StringBuilder(decoded.Length + 8);
@@ -379,7 +414,8 @@ internal static class HtmlToMarkdown
             int tagEnd = FindTagEndQuoted(html, idx + 1);
             if (tagEnd < 0) break;
 
-            if (!TagHasHiddenAttribute(html, idx, tagEnd)) { idx++; continue; }
+            if (!TagHasHiddenAttribute(html, idx, tagEnd) && !TagHasHiddenStyle(html, idx, tagEnd))
+            { idx++; continue; }
 
             int nameEnd = idx + 1;
             while (nameEnd < n && !char.IsWhiteSpace(html[nameEnd]) && html[nameEnd] != '>' && html[nameEnd] != '/')
@@ -445,20 +481,113 @@ internal static class HtmlToMarkdown
     /// the word, whitespace-delimited, anywhere after the tag name. Quoting is not considered, so
     /// <c>data-hidden</c> and <c>aria-hidden</c> are excluded but a value's own words are not.
     /// </summary>
+    /// <summary>
+    /// Whether an opening tag carries the <c>hidden</c> attribute.
+    /// </summary>
+    /// <remarks>
+    /// Walks name=value pairs rather than scanning the tag's raw text for the word: a plain
+    /// substring scan also matches inside a quoted <em>value</em>, so
+    /// <c>&lt;div title="… hidden from search engines"&gt;</c> read as hidden and took the whole
+    /// visible element with it. <c>data-hidden</c> and <c>aria-hidden</c> are different names and
+    /// do not match.
+    /// </remarks>
     private static bool TagHasHiddenAttribute(string html, int start, int end)
     {
-        const string Needle = "hidden";
-        int i = start;
-        while (i < end && html[i] != ' ' && html[i] != '\t' && html[i] != '\n' && html[i] != '>') i++;
-        for (; i + Needle.Length <= end; i++)
-        {
-            if (string.Compare(html, i, Needle, 0, Needle.Length, StringComparison.OrdinalIgnoreCase) != 0) continue;
-            if (i > start && !char.IsWhiteSpace(html[i - 1])) continue;
-            if (i + Needle.Length == end) return true;
-            char after = html[i + Needle.Length];
-            if (after is ' ' or '\t' or '\n' or '\r' or '>' or '=' or '/') return true;
-        }
+        foreach (var (name, _) in TagAttributes(html, start, end))
+            if (name.Equals("hidden", StringComparison.OrdinalIgnoreCase)) return true;
         return false;
+    }
+
+    /// <summary>Walk an opening tag's name=value pairs, skipping the element name.</summary>
+    private static IEnumerable<(string Name, string? Value)> TagAttributes(string html, int start, int end)
+    {
+        int i = start;
+        while (i < end && !char.IsWhiteSpace(html[i]) && html[i] != '>') i++;
+        while (i < end)
+        {
+            while (i < end && (char.IsWhiteSpace(html[i]) || html[i] == '/')) i++;
+            if (i >= end || html[i] == '>') yield break;
+
+            int nameStart = i;
+            while (i < end && !char.IsWhiteSpace(html[i]) && html[i] != '=' && html[i] != '>' && html[i] != '/') i++;
+            string name = html[nameStart..i];
+
+            while (i < end && char.IsWhiteSpace(html[i])) i++;
+            string? value = null;
+            if (i < end && html[i] == '=')
+            {
+                i++;
+                while (i < end && char.IsWhiteSpace(html[i])) i++;
+                if (i < end && (html[i] == '"' || html[i] == '\''))
+                {
+                    char quote = html[i++];
+                    int vs = i;
+                    while (i < end && html[i] != quote) i++;
+                    value = html[vs..i];
+                    if (i < end) i++;
+                }
+                else
+                {
+                    int vs = i;
+                    while (i < end && !char.IsWhiteSpace(html[i]) && html[i] != '>') i++;
+                    value = html[vs..i];
+                }
+            }
+            yield return (name, value);
+        }
+    }
+
+    /// <summary>
+    /// Whether an opening tag's inline <c>style</c> hides the element with
+    /// <c>display: none</c> or <c>visibility: hidden</c>.
+    /// </summary>
+    /// <remarks>
+    /// A targeted declaration scan, not a CSS parser. Within one declaration block the
+    /// <em>last</em> declaration for a property wins, so <c>display:none; display:block</c> is
+    /// visible; <c>!important</c> is a priority flag rather than part of the value; and a
+    /// <c>/* … */</c> comment before the property name would otherwise shift the first
+    /// <c>:</c> and silently defeat the whole check.
+    /// </remarks>
+    private static bool TagHasHiddenStyle(string html, int start, int end)
+    {
+        string? style = null;
+        foreach (var (name, value) in TagAttributes(html, start, end))
+            if (name.Equals("style", StringComparison.OrdinalIgnoreCase)) { style = value; break; }
+        if (style is null) return false;
+
+        bool displayHides = false, visibilityHides = false;
+        foreach (var raw in style.Split(';'))
+        {
+            string cleaned = StripCssComments(raw);
+            int colon = cleaned.IndexOf(':');
+            if (colon < 0) continue;
+            string property = cleaned[..colon].Trim();
+            string value = cleaned[(colon + 1)..].Split('!')[0].Trim();
+            if (property.Equals("display", StringComparison.OrdinalIgnoreCase))
+                displayHides = value.Equals("none", StringComparison.OrdinalIgnoreCase);
+            else if (property.Equals("visibility", StringComparison.OrdinalIgnoreCase))
+                visibilityHides = value.Equals("hidden", StringComparison.OrdinalIgnoreCase);
+        }
+        return displayHides || visibilityHides;
+    }
+
+    /// <summary>Remove <c>/* … */</c> comments from one CSS declaration.</summary>
+    private static string StripCssComments(string declaration)
+    {
+        if (!declaration.Contains("/*", StringComparison.Ordinal)) return declaration;
+        var sb = new StringBuilder(declaration.Length);
+        string rest = declaration;
+        while (true)
+        {
+            int start = rest.IndexOf("/*", StringComparison.Ordinal);
+            if (start < 0) break;
+            sb.Append(rest, 0, start);
+            int end = rest.IndexOf("*/", start + 2, StringComparison.Ordinal);
+            if (end < 0) { rest = ""; break; }
+            rest = rest[(end + 2)..];
+        }
+        sb.Append(rest);
+        return sb.ToString();
     }
 
     // ── context (mirrors converter::Context) ────────────────────────────────
@@ -471,6 +600,14 @@ internal static class HtmlToMarkdown
         public bool InOrderedList { get; init; }
         public int ListCounter { get; init; }
         public int ListDepth { get; init; }
+        /// <summary>
+        /// Cumulative width of every ancestor <c>&lt;li&gt;</c>'s own marker — the column at
+        /// which this item's content starts. An ordered marker is wider than a bullet
+        /// (<c>"10. "</c> is 4 columns), and a nested list has to be indented to its parent
+        /// marker's actual content column or CommonMark reads it as a sibling rather than
+        /// nested content.
+        /// </summary>
+        public int ListIndentColumns { get; init; }
         public int UlDepth { get; init; }
         public bool LooseList { get; init; }
         public bool PrevItemHadBlocks { get; init; }
@@ -542,7 +679,11 @@ internal static class HtmlToMarkdown
     private static string RenderCellForGrid(HNode cell, Ctx ctx)
     {
         var buf = new StringBuilder();
-        var cctx = ctx with { InTableCell = true };
+        // The collectors are detached for this walk. It runs after the table has already been
+        // rendered — and recorded — and exists only to fill the grid returned from the text it
+        // builds; leaving them attached records every link, image and nested table in a cell a
+        // second time, into the very structure this walk is building.
+        var cctx = ctx with { InTableCell = true, Structure = null, ImageEmit = null, TableEmit = null };
         foreach (var c in cell.Children) WalkNode(c, buf, cctx);
         return NormalizeWhitespaceKeepNewlines(buf.ToString()).Trim();
     }
@@ -575,7 +716,10 @@ internal static class HtmlToMarkdown
                     var t = new StringBuilder();
                     foreach (var tc in child.Children)
                         if (tc.Tag is null && !tc.IsComment) t.Append(tc.Text);
-                    string title = t.ToString().Trim();
+                    // Read as written. Only a document that reaches the walk through the
+                    // html5ever repair arrives with its references resolved, and there the
+                    // serializer's own spelling is what the converter sees.
+                    string title = (child.CanonicalAttrs ? CanonicalizeText(t.ToString()) : t.ToString()).Trim();
                     if (title.Length > 0) metadata["title"] = title;
                     break;
                 }
@@ -760,9 +904,14 @@ internal static class HtmlToMarkdown
                 break; // no-op outside table context
             case "head": case "script": case "style":
                 break; // metadata / non-content
-            // `template`, `noscript` and a stray body `title` have no arm of their own upstream:
-            // they reach the unknown handler, which renders their children. A no-JS fallback
-            // `<img>` is the page's only copy of that image, so dropping it loses content.
+            // `<template>` is an inert, unrendered document fragment per the HTML spec, and
+            // `<noscript>` content only renders with scripting disabled — never true for a
+            // Markdown conversion, which mirrors a scripting-enabled browser. Neither may reach
+            // the output, even though a no-JS fallback `<img>` is sometimes the page's only copy
+            // of that image. A stray body `title` still has no arm of its own upstream: it
+            // reaches the unknown handler, which renders its children.
+            case "template": case "noscript":
+                break; // inert / scripting-disabled-only content
             case "meta": case "link": case "base":
                 break; // void metadata elements: no children to render
             case "html": case "body":
@@ -855,7 +1004,7 @@ internal static class HtmlToMarkdown
     // ── text node (converter/text_node.rs, Normalized whitespace mode, no escaping) ─
     private static void ProcessTextNode(HNode node, StringBuilder output, Ctx ctx)
     {
-        string text = HtmlWalker.DecodeEntitiesFull(node.Text);
+        string text = HtmlWalker.DecodeEntitiesFull(node.Text, node.CanonicalAttrs);
         if (text.Length == 0) return;
 
         bool hadNewlines = text.Contains('\n');
@@ -897,7 +1046,9 @@ internal static class HtmlToMarkdown
         }
         else if (ctx.InTableCell)
         {
-            string normalized = NormalizeWhitespaceKeepNewlines(text);
+            // A table cell cannot hold a hard line break, so unlike the block-level
+            // normalizer this folds `\n` and `\r` into the run before collapsing.
+            string normalized = NormalizeCellWhitespace(text);
             processed = EscapeCellText(normalized);
         }
         else
@@ -1049,18 +1200,26 @@ internal static class HtmlToMarkdown
         bool isListContinuation = ctx.InListItem && output.Length > 0
             && !EndsWith(output, "* ") && !EndsWith(output, "- ") && !EndsWith(output, ". ");
         bool afterCodeBlock = EndsWith(output, "```\n");
+        // Inside a blockquote, sibling blocks (heading, list, table, pre) manage their own
+        // trailing spacing and self-terminate without a blank line. The case that still needs
+        // a separator is a paragraph straight after bare inline text, which leaves no trailing
+        // newline at all — without one the "> " prefixing pass merges the two into a single
+        // line. Requiring *no* trailing newline (rather than no blank line) keeps the compact
+        // heading-then-paragraph style intact.
         bool needsLeadingSep = !ctx.InTableCell && !ctx.InListItem && !ctx.ConvertAsInline
-            && ctx.BlockquoteDepth == 0 && output.Length > 0 && !EndsWith(output, "\n\n") && !afterCodeBlock;
+            && output.Length > 0 && !afterCodeBlock
+            && (ctx.BlockquoteDepth > 0 ? !EndsWith(output, "\n") : !EndsWith(output, "\n\n"));
 
         if (isTableContinuation)
         {
-            TrimTrailingWhitespace(output);
-            output.Append("<br>");
+            EmitTableCellBreak(output);
         }
         else if (isListContinuation)
         {
             if (!EndsWith(output, " ") && !EndsWith(output, "\n")) output.Append(' ');
-            output.Append(' ', 4 * ctx.ListDepth);
+            // The column this item's own content starts at, not a uniform per-depth offset
+            // that ignores how wide an ordered marker is.
+            output.Append(' ', ctx.ListIndentColumns);
         }
         else if (needsLeadingSep)
         {
@@ -1107,8 +1266,7 @@ internal static class HtmlToMarkdown
 
         if (isTableContinuation)
         {
-            TrimTrailingWhitespace(output);
-            output.Append("  \n");   // NewlineStyle::Spaces, br_in_tables=false
+            EmitTableCellBreak(output);
         }
         else if (isListContinuation)
         {
@@ -1311,6 +1469,49 @@ internal static class HtmlToMarkdown
         }
     }
 
+    /// <summary>Length of the longest consecutive run of <paramref name="marker"/>.</summary>
+    private static int LongestConsecutiveRun(string content, char marker)
+    {
+        int max = 0, cur = 0;
+        foreach (char c in content)
+        {
+            if (c == marker) { cur++; if (cur > max) max = cur; }
+            else cur = 0;
+        }
+        return max;
+    }
+
+    /// <summary>Minimum length of a Markdown code fence per CommonMark.</summary>
+    private const int MinFenceLength = 3;
+
+    /// <summary>
+    /// The smallest backtick-run length, from 1 up, that does not occur as a run inside
+    /// <paramref name="content"/>.
+    /// </summary>
+    /// <remarks>
+    /// CommonMark closes an inline code span at the next backtick string of the <em>same</em>
+    /// length as the opening delimiter (6.1) — a longer or shorter run never matches — so the
+    /// delimiter only has to avoid a run length that actually appears. Taking the longest run
+    /// plus one over-escapes: content holding one length-2 run and no length-1 run is fine with
+    /// a single backtick. A fenced block is the other rule, and needs the longest run plus one,
+    /// because its close matches on <em>any</em> run at least as long as the fence.
+    /// </remarks>
+    private static int MinSafeCodeSpanDelimiterLength(string content)
+    {
+        var runLengths = new HashSet<int>();
+        int cur = 0;
+        foreach (char c in content)
+        {
+            if (c == '`') cur++;
+            else { if (cur > 0) runLengths.Add(cur); cur = 0; }
+        }
+        if (cur > 0) runLengths.Add(cur);
+
+        int candidate = 1;
+        while (runLengths.Contains(candidate)) candidate++;
+        return candidate;
+    }
+
     private static void RenderCodeWithEscaping(string trimmed, StringBuilder output)
     {
         bool containsBacktick = trimmed.Contains('`');
@@ -1321,17 +1522,7 @@ internal static class HtmlToMarkdown
             || first == '`' || last == '`'
             || (first == ' ' && last == ' ' && containsBacktick);
 
-        int numBackticks = 1;
-        if (containsBacktick)
-        {
-            int max = 0, cur = 0;
-            foreach (char c in trimmed)
-            {
-                if (c == '`') { cur++; if (cur > max) max = cur; }
-                else cur = 0;
-            }
-            numBackticks = max == 1 ? 2 : 1;
-        }
+        int numBackticks = containsBacktick ? MinSafeCodeSpanDelimiterLength(trimmed) : 1;
 
         output.Append('`', numBackticks);
         if (needsDelimiterSpaces) output.Append(' ');
@@ -1356,7 +1547,11 @@ internal static class HtmlToMarkdown
 
         if (ctx.InLink) { WalkChildren(node, output, ctx); return; }
 
-        string rawText = NormalizeWhitespaceKeepNewlines(TextContent(node)).Trim();
+        var (inlineLabel, sawBlock) = CollectLinkLabelText(node);
+        // Without block descendants that sweep visited exactly the nodes the whole-subtree text
+        // would, and decoded them the same way, so its text is reused rather than walking the
+        // `<a>` a second time.
+        string rawText = NormalizeWhitespaceKeepNewlines(sawBlock ? TextContent(node) : inlineLabel).Trim();
 
         bool isAutolink = href.Length > 0 && HasUriScheme(href)
             && (rawText == href || (href.StartsWith("mailto:", StringComparison.Ordinal) && rawText == href[7..]));
@@ -1386,7 +1581,6 @@ internal static class HtmlToMarkdown
             }
         }
 
-        var (inlineLabel, sawBlock) = CollectLinkLabelText(node);
         string label;
         if (sawBlock)
         {
@@ -1414,8 +1608,8 @@ internal static class HtmlToMarkdown
             label = NormalizeLinkLabel(content.ToString());
         }
 
-        if (label.Length == 0 && sawBlock)
-            label = NormalizeLinkLabel(NormalizeWhitespaceKeepNewlines(TextContent(node)));
+        // `rawText` is already the whole-subtree text when `sawBlock`, so this one fallback
+        // covers both the block and the inline case.
         if (label.Length == 0 && rawText.Length > 0)
             label = NormalizeLinkLabel(rawText);
         if (label.Length == 0 && href.Length > 0 && node.Children.Count > 0)
@@ -1429,22 +1623,71 @@ internal static class HtmlToMarkdown
     private static void AppendMarkdownLink(StringBuilder output, string label, string href, string? title)
     {
         output.Append('[').Append(label).Append("](");
-        if (href.Length == 0) output.Append("<>");
-        else if (href.Contains(' ') || href.Contains('\n')) output.Append('<').Append(href).Append('>');
-        else
-        {
-            int open = href.Count(c => c == '(');
-            int close = href.Count(c => c == ')');
-            if (open == close) output.Append(href);
-            else output.Append(href.Replace("(", "\\(").Replace(")", "\\)"));
-        }
+        AppendUrlDestination(output, href);
         if (title is not null)
         {
             output.Append(" \"");
-            output.Append(title.Contains('"') ? title.Replace("\"", "\\\"") : title);
+            AppendEscapedMarkdownTitle(output, title);
             output.Append('"');
         }
         output.Append(')');
+    }
+
+    /// <summary>
+    /// Whether every <c>)</c> in a destination is matched by a preceding <c>(</c>, and every
+    /// <c>(</c> is closed. A raw Markdown destination may hold parentheses only as a properly
+    /// nested balanced pair (CommonMark 6.3) — counting the two separately calls <c>")("</c>
+    /// balanced, which it is not.
+    /// </summary>
+    private static bool ParensAreBalanced(string href)
+    {
+        int depth = 0;
+        foreach (char c in href)
+        {
+            if (c == '(') depth++;
+            else if (c == ')' && --depth < 0) return false;
+        }
+        return depth == 0;
+    }
+
+    /// <summary>
+    /// Append a Markdown destination — the <c>(...)</c> body, without the parens themselves.
+    /// Shared by the link and image handlers so a destination is treated the same whichever
+    /// element produced it.
+    /// </summary>
+    private static void AppendUrlDestination(StringBuilder output, string dest)
+    {
+        if (dest.Length == 0) { output.Append("<>"); return; }
+        if (dest.Contains(' ') || dest.Contains('\n'))
+        {
+            // An angle-bracket destination may hold raw parentheses, but a raw `<`, `>` or an
+            // unescaped `\` — which would otherwise merge with the next escaped character and
+            // un-escape it — closes the wrap early, so all three are escaped inside it.
+            output.Append('<');
+            foreach (char c in dest)
+            {
+                if (c == '\\') output.Append("\\\\");
+                else if (c == '<') output.Append("\\<");
+                else if (c == '>') output.Append("\\>");
+                else output.Append(c);
+            }
+            output.Append('>');
+            return;
+        }
+        if (ParensAreBalanced(dest)) output.Append(dest);
+        else output.Append(dest.Replace("(", "\\(").Replace(")", "\\)"));
+    }
+
+    /// <summary>
+    /// Escape a title for interpolation into a double-quoted <c>"..."</c>. Backslashes go first:
+    /// a title ending in a literal <c>\</c> would otherwise make the closing <c>"</c> read as an
+    /// escaped quote, letting the title — and the destination after it — run into the rest of
+    /// the document.
+    /// </summary>
+    private static void AppendEscapedMarkdownTitle(StringBuilder output, string text)
+    {
+        if (!text.Contains('\\') && !text.Contains('"')) { output.Append(text); return; }
+        output.Append(text.Replace("\\", "\\\\").Replace("\"", "\\\""));
     }
 
     private static (int level, HNode node)? FindSingleHeadingChild(HNode node)
@@ -1487,7 +1730,7 @@ internal static class HtmlToMarkdown
         {
             var n = stack.Pop();
             if (n.IsComment) continue;
-            if (n.Tag is null) { text.Append(HtmlWalker.DecodeEntitiesFull(n.Text)); continue; }
+            if (n.Tag is null) { text.Append(HtmlWalker.DecodeEntitiesFull(n.Text, n.CanonicalAttrs)); continue; }
             if (BlockLevelForLabel.Contains(n.Tag)) { sawBlock = true; continue; }
             for (int i = n.Children.Count - 1; i >= 0; i--) stack.Push(n.Children[i]);
         }
@@ -1598,20 +1841,23 @@ internal static class HtmlToMarkdown
             return;
         }
 
-        string src = node.Attr("src") ?? "";
-        if (tag != "iframe" && src.Length == 0)
+        string rawSrc = node.Attr("src") ?? "";
+        if (tag != "iframe" && rawSrc.Length == 0)
         {
             foreach (var child in node.Children)
             {
                 if (child.Tag != "source") continue;
-                src = child.Attr("src") ?? "";
+                rawSrc = child.Attr("src") ?? "";
                 break;
             }
         }
+        string src = SanitizeMarkdownUrl(rawSrc);
 
         if (src.Length > 0)
         {
-            output.Append('[').Append(src).Append("](").Append(src).Append(')');
+            // The src doubles as the label, so it goes through the same escaping an `<a href>`
+            // gets in both positions rather than being spliced in raw.
+            AppendMarkdownLink(output, EscapeLinkLabel(src), src, null);
             if (!ctx.InParagraph && !ctx.ConvertAsInline) output.Append("\n\n");
         }
 
@@ -1752,7 +1998,7 @@ internal static class HtmlToMarkdown
 
         string svgHtml = SerializeElement(node);
         string base64 = System.Convert.ToBase64String(Encoding.UTF8.GetBytes(svgHtml));
-        output.Append("![").Append(title).Append("](data:image/svg+xml;base64,").Append(base64).Append(')');
+        output.Append("![").Append(EscapeLinkLabel(title)).Append("](data:image/svg+xml;base64,").Append(base64).Append(')');
     }
 
     /// <summary>The concatenated text of a node's descendants, entity references resolved.</summary>
@@ -1764,7 +2010,7 @@ internal static class HtmlToMarkdown
             foreach (var c in n.Children)
             {
                 if (c.IsComment) continue;
-                if (c.Tag is null) sb.Append(HtmlWalker.DecodeEntitiesFull(c.Text));
+                if (c.Tag is null) sb.Append(HtmlWalker.DecodeEntitiesFull(c.Text, c.CanonicalAttrs));
                 else Walk(c);
             }
         }
@@ -1813,7 +2059,7 @@ internal static class HtmlToMarkdown
         // re-escaped: the four characters that would otherwise change the markup's shape go
         // back out as references, so `&#x3E;` and a literal `>` both serialize as `&gt;`.
         if (node.Tag is null)
-            return node.IsComment ? "" : EscapeSerializedText(HtmlWalker.DecodeEntitiesFull(node.Text));
+            return node.IsComment ? "" : EscapeSerializedText(HtmlWalker.DecodeEntitiesFull(node.Text, node.CanonicalAttrs));
 
         var sb = new StringBuilder(256);
         sb.Append('<').Append(node.Tag);
@@ -1824,8 +2070,10 @@ internal static class HtmlToMarkdown
         {
             sb.Append(' ').Append(SvgAttrs.Canonical(key) ?? key);
             // A bare attribute and `attr=""` are HTML5-equivalent; upstream writes both bare.
-            // The value goes out as written — the serializer does not re-escape it.
-            if (!string.IsNullOrEmpty(value)) sb.Append("=\"").Append(value).Append('"');
+            // A `"` in the value is the one character re-escaped on the way out: written raw it
+            // would close the attribute early.
+            if (!string.IsNullOrEmpty(value))
+                sb.Append("=\"").Append(value!.Contains('"') ? value.Replace("\"", "&quot;") : value).Append('"');
         }
 
         if (node.Children.Count == 0) { sb.Append(" />"); return sb.ToString(); }
@@ -1851,18 +2099,32 @@ internal static class HtmlToMarkdown
         bool shouldUseAltText = ctx.ConvertAsInline || ctx.InHeading;
         if (shouldUseAltText) { output.Append(alt); return; }
 
-        output.Append("![").Append(alt).Append("](");
-        if (src.Length == 0) output.Append("<>");
-        else if (src.Contains(' ') || src.Contains('\n')) output.Append('<').Append(src).Append('>');
-        else
+        // The alt text is escaped like a link label: an inert `alt` holding `]` and `(` would
+        // otherwise close the image early and open a second, attacker-controlled link.
+        output.Append("![").Append(EscapeLinkLabel(alt)).Append("](");
+        AppendUrlDestination(output, src);
+        if (title is not null)
         {
-            int open = src.Count(c => c == '(');
-            int close = src.Count(c => c == ')');
-            if (open == close) output.Append(src);
-            else output.Append(src.Replace("(", "\\(").Replace(")", "\\)"));
+            output.Append(" \"");
+            AppendEscapedMarkdownTitle(output, title);
+            output.Append('"');
         }
-        if (title is not null) output.Append(" \"").Append(title).Append('"');
         output.Append(')');
+    }
+
+    /// <summary>
+    /// Emit a line break for a <c>&lt;br&gt;</c>, <c>&lt;div&gt;</c> or <c>&lt;p&gt;</c>
+    /// continuation inside a table cell. A cell cannot contain a hard line break — neither
+    /// newline style is valid there, and a raw newline splits the row's pipe syntax across
+    /// physical lines — so the newline style is never consulted: source whitespace before the
+    /// break is trimmed and the continuation collapses to a single space (this port's options
+    /// leave <c>br_in_tables</c> off). The emptiness guard suppresses a leading space when the
+    /// continuation is the cell's first content.
+    /// </summary>
+    private static void EmitTableCellBreak(StringBuilder output)
+    {
+        TrimTrailingWhitespace(output);
+        if (output.Length > 0) output.Append(' ');
     }
 
     // ── br / hr ──────────────────────────────────────────────────────────────
@@ -1872,6 +2134,11 @@ internal static class HtmlToMarkdown
         {
             TrimTrailingWhitespace(output);
             output.Append("  ");
+        }
+        else if (ctx.InTableCell)
+        {
+            // Shared with div/p continuations inside a cell.
+            EmitTableCellBreak(output);
         }
         else if (output.Length == 0 || EndsWith(output, "\n")) output.Append('\n');
         else output.Append("  \n");
@@ -1955,12 +2222,16 @@ internal static class HtmlToMarkdown
             if (EndsWith(output, "\n")) output.Append('\n');
             else output.Append("\n\n");
         }
-        output.Append("```");
+        // The fence has to be strictly longer than the longest backtick run inside the content,
+        // or it terminates early and the rest of the document is swallowed into the block
+        // (CommonMark 4.5).
+        int fenceLength = Math.Max(LongestConsecutiveRun(processed, '`') + 1, MinFenceLength);
+        output.Append('`', fenceLength);
         if (language is not null) output.Append(language);
         output.Append('\n');
         output.Append(processed.TrimEnd('\n'));
         output.Append('\n');
-        output.Append("```").Append("\n\n");
+        output.Append('`', fenceLength).Append("\n\n");
 
         ctx.Structure?.PushCode(processed, language);
     }
@@ -2030,16 +2301,28 @@ internal static class HtmlToMarkdown
         string trimmedContent = content.ToString().Trim();
         if (trimmedContent.Length == 0) return;
 
-        if (ctx.BlockquoteDepth > 0) output.Append("\n\n\n");
+        if (ctx.BlockquoteDepth > 0)
+        {
+            if (output.Length > 0)
+            {
+                while (output.Length > 0 && output[^1] == '\n') output.Length--;
+                output.Append("\n\n");
+            }
+        }
         else if (output.Length > 0)
         {
             if (EndsWith(output, "\n\n")) output.Remove(output.Length - 1, 1);
             else if (!EndsWith(output, "\n")) output.Append("\n\n");
         }
 
+        // Blank out whitespace-only lines, but keep the leading whitespace on a real content
+        // line — code-block indentation and nested list markers are what makes a quoted block
+        // child still read as that block.
         foreach (var line in trimmedContent.Split('\n'))
         {
-            output.Append("> ").Append(line.Trim()).Append('\n');
+            output.Append("> ");
+            if (line.Trim().Length > 0) output.Append(line);
+            output.Append('\n');
         }
         output.Append('\n');
     }
@@ -2138,7 +2421,7 @@ internal static class HtmlToMarkdown
     private static void HandleLi(HNode node, StringBuilder output, Ctx ctx)
     {
         if (ctx.ListDepth > 0)
-            output.Append(' ', ctx.ListDepth * 2);
+            output.Append(' ', ctx.ListIndentColumns);
 
         bool hasBlockChildren = false;
         foreach (var child in node.Children)
@@ -2150,10 +2433,23 @@ internal static class HtmlToMarkdown
             }
         }
 
-        var liCtx = ctx with { InListItem = true, ListDepth = ctx.ListDepth + 1 };
-
         // task lists: find checkbox
         var checkbox = FindCheckbox(node);
+
+        // This item's own marker width, which is what descendants — nested lists and
+        // continuation content — indent by. A bullet or task marker is always 2 columns
+        // ("- "); an ordered marker's width follows its counter's digit count ("1. " is 3,
+        // "10. " is 4). The configured indent width is a floor, not the literal width.
+        int ownMarkerWidth = checkbox is not null || !ctx.InOrderedList
+            ? 2
+            : Math.Max(2, $"{ctx.ListCounter}. ".Length);
+
+        var liCtx = ctx with
+        {
+            InListItem = true,
+            ListDepth = ctx.ListDepth + 1,
+            ListIndentColumns = ctx.ListIndentColumns + ownMarkerWidth,
+        };
         int itemStart;
         if (checkbox is not null)
         {
@@ -2167,15 +2463,21 @@ internal static class HtmlToMarkdown
         }
         else
         {
-            if (!ctx.InTableCell)
+            if (ctx.InTableCell)
             {
-                if (ctx.InOrderedList) output.Append(ctx.ListCounter).Append(". ");
-                else
-                {
-                    const string bullets = "-*+";
-                    int idx = ctx.UlDepth > 0 ? (ctx.UlDepth - 1) % bullets.Length : 0;
-                    output.Append(bullets[idx]).Append(' ');
-                }
+                // A GFM pipe cell cannot hold block content, so sibling `<li>`s inside one lose
+                // their marker (below) and would otherwise run together with no separator at
+                // all. The same leading-separator helper that runs before the enclosing
+                // `<ul>`/`<ol>` gives each item the `<br>` boundary already established for
+                // `<p>`/`<div>` siblings in a cell.
+                AddListLeadingSeparator(output, ctx);
+            }
+            else if (ctx.InOrderedList) output.Append(ctx.ListCounter).Append(". ");
+            else
+            {
+                const string bullets = "-*+";
+                int idx = ctx.UlDepth > 0 ? (ctx.UlDepth - 1) % bullets.Length : 0;
+                output.Append(bullets[idx]).Append(' ');
             }
 
             itemStart = output.Length;
@@ -2357,19 +2659,77 @@ internal static class HtmlToMarkdown
     }
 
     // ── tables (block/table/*.rs) ────────────────────────────────────────────
-    private sealed class TableScan
+    internal sealed class TableScan
     {
         public readonly List<int> RowCounts = new();
         public bool HasSpan, HasHeader, HasCaption, HasText;
         public int NestedTableCount, LinkCount;
     }
 
-    private static void ScanTableNode(HNode node, bool isRoot, TableScan scan)
+    /// <summary>
+    /// Scan a table for the signals the layout-table heuristic reads.
+    /// </summary>
+    /// <remarks>
+    /// The two groups come from different subtrees. <c>HasText</c>, <c>LinkCount</c>,
+    /// <c>HasHeader</c> and <c>HasCaption</c> answer "is there any semantic content here at
+    /// all", so they are gathered from the whole subtree, nested tables included.
+    /// <c>RowCounts</c>, <c>NestedTableCount</c> and <c>HasSpan</c> feed the layout decision
+    /// and describe only <em>this</em> table's own structure — a straight chain of
+    /// one-nested-table-per-cell tables is not a layout table, and counting the inner
+    /// tables' rows as if they were this one's is what used to make it look like one.
+    /// </remarks>
+    private static TableScan ScanTable(HNode node)
+    {
+        var scan = new TableScan();
+        ScanOwnStructure(node, scan);
+        AccumulateContent(node, scan);
+        return scan;
+    }
+
+    /// <summary>
+    /// Collect the table's own direct row/cell structure: per-row cell counts, whether any
+    /// cell spans, and how many <c>&lt;table&gt;</c> elements are nested directly inside it.
+    /// A nested table's own subtree is never walked — none of these fields count content past
+    /// that boundary anyway.
+    /// </summary>
+    private static void ScanOwnStructure(HNode root, TableScan scan)
+    {
+        var work = new Stack<HNode>();
+        for (int i = root.Children.Count - 1; i >= 0; i--) work.Push(root.Children[i]);
+        while (work.Count > 0)
+        {
+            var n = work.Pop();
+            if (n.IsComment || n.Tag is null) continue;
+            if (n.Tag == "table") { scan.NestedTableCount++; continue; }
+            if (n.Tag == "tr")
+            {
+                int cellCount = 0;
+                foreach (var child in n.Children)
+                {
+                    if (child.Tag is "td" or "th")
+                    {
+                        cellCount += GetColspan(child);
+                        if (child.Attr("colspan") is not null || child.Attr("rowspan") is not null)
+                            scan.HasSpan = true;
+                    }
+                }
+                scan.RowCounts.Add(cellCount);
+                // Still descend into the row's cells — not their counts, already taken above —
+                // so a `<table>` inside a `<td>` is found and counted. Only a nested `<table>`
+                // tag itself stops this walk.
+            }
+            for (int i = n.Children.Count - 1; i >= 0; i--) work.Push(n.Children[i]);
+        }
+    }
+
+    /// <summary>Fold the whole subtree's semantic content — text, links, headers, caption —
+    /// into the scan, crossing nested-table boundaries.</summary>
+    private static void AccumulateContent(HNode node, TableScan scan)
     {
         if (node.IsComment) return;
         if (node.Tag is null)
         {
-            if (!scan.HasText && HtmlWalker.DecodeEntitiesFull(node.Text).Trim().Length > 0)
+            if (!scan.HasText && HtmlWalker.DecodeEntitiesFull(node.Text, node.CanonicalAttrs).Trim().Length > 0)
                 scan.HasText = true;
             return;
         }
@@ -2381,26 +2741,8 @@ internal static class HtmlToMarkdown
             case "img":
                 if (node.Attr("src") is not null || node.Attr("alt") is not null) scan.HasText = true;
                 break;
-            case "table":
-                if (!isRoot) scan.NestedTableCount++;
-                break;
-            case "tr":
-            {
-                int cellCount = 0;
-                foreach (var child in node.Children)
-                {
-                    if (child.Tag is "td" or "th")
-                    {
-                        cellCount += GetColspan(child);
-                        if (child.Attr("colspan") is not null || child.Attr("rowspan") is not null)
-                            scan.HasSpan = true;
-                    }
-                }
-                scan.RowCounts.Add(cellCount);
-                break;
-            }
         }
-        foreach (var c in node.Children) ScanTableNode(c, false, scan);
+        foreach (var c in node.Children) AccumulateContent(c, scan);
     }
 
     private static int GetColspan(HNode cell)
@@ -2491,19 +2833,43 @@ internal static class HtmlToMarkdown
         return sb.ToString();
     }
 
-    private static void HandleTable(HNode node, StringBuilder output, Ctx ctx)
+    /// <summary>
+    /// Whether the handler renders this table as a list of its rows rather than as a Markdown
+    /// table. A layout table's cells are walked inline, which is what makes an image inside one
+    /// degrade to its alt text — so the metadata collector has to reach the same verdict.
+    /// </summary>
+    internal static bool RendersAsLayoutList(HNode node, TableScan scan)
     {
-        var scan = new TableScan();
-        ScanTableNode(node, true, scan);
-
         var distinctCounts = scan.RowCounts.Where(c => c > 0).Distinct().ToList();
         bool hasBorderZero = node.Attr("border") == "0";
         bool looksLikeLayout = scan.NestedTableCount > 1 || distinctCounts.Count > 1 || (scan.HasSpan && hasBorderZero);
         bool isBlankTable = !scan.HasText;
         int rowCount = scan.RowCounts.Count;
+        return !scan.HasHeader && !scan.HasCaption
+            && (looksLikeLayout || isBlankTable || (rowCount <= 2 && scan.LinkCount >= 3));
+    }
 
-        if (!scan.HasHeader && !scan.HasCaption
-            && (looksLikeLayout || isBlankTable || (rowCount <= 2 && scan.LinkCount >= 3)))
+    /// <summary>Whether the `&lt;table&gt;` this markup opens renders as a layout list.</summary>
+    internal static bool TableMarkupRendersAsLayoutList(string tableHtml)
+    {
+        var root = HtmlDom.Parse(tableHtml);
+        var table = FindFirstTable(root);
+        return table is not null && RendersAsLayoutList(table, ScanTable(table));
+    }
+
+    private static HNode? FindFirstTable(HNode node)
+    {
+        foreach (var child in Descendants(node))
+            if (child.Tag == "table") return child;
+        return null;
+    }
+
+    private static void HandleTable(HNode node, StringBuilder output, Ctx ctx)
+    {
+        var scan = ScanTable(node);
+        bool isBlankTable = !scan.HasText;
+
+        if (RendersAsLayoutList(node, scan))
         {
             if (isBlankTable && scan.LinkCount == 0) return;
             foreach (var child in node.Children)
@@ -2526,7 +2892,17 @@ internal static class HtmlToMarkdown
         // width pre-pass
         var colWidths = new List<int>();
         var prepassRowspan = new int?[totalCols];
-        var prepassCtx = ctx with { MeasureWidthOnly = true };
+        // The pre-pass runs with its collectors detached: measuring a column's width is an
+        // internal detail and must not show up in the result. Upstream keeps them here only when
+        // it can reuse this pass's markdown verbatim in the render, which it cannot while a
+        // structure collector is installed — and this port's options always install one.
+        var prepassCtx = ctx with
+        {
+            MeasureWidthOnly = true,
+            Structure = null,
+            ImageEmit = null,
+            TableEmit = null,
+        };
         foreach (var row in TableRows(node))
             CollectRowCellWidths(row, prepassCtx, colWidths, prepassRowspan);
 
@@ -2877,6 +3253,18 @@ internal static class HtmlToMarkdown
         return sb.ToString();
     }
 
+    /// <summary>
+    /// Normalize whitespace inside a Markdown table cell. A cell cannot contain a hard line
+    /// break, so unlike <see cref="NormalizeWhitespaceKeepNewlines"/> — which keeps <c>\n</c>
+    /// for block-level rendering — this folds <c>\n</c> and <c>\r</c> into the run before
+    /// collapsing consecutive whitespace to one ASCII space.
+    /// </summary>
+    internal static string NormalizeCellWhitespace(string text)
+    {
+        if (!text.Contains('\n') && !text.Contains('\r')) return NormalizeWhitespaceKeepNewlines(text);
+        return NormalizeWhitespaceKeepNewlines(text.Replace('\n', ' ').Replace('\r', ' '));
+    }
+
     private static bool IsUnicodeSpace(char ch) => ch is '\u00A0' or '\u1680'
         or (>= '\u2000' and <= '\u200A') or '\u202F' or '\u205F' or '\u3000';
 
@@ -3082,14 +3470,27 @@ internal sealed class HNode
     /// </summary>
     public bool CanonicalAttrs;
 
+    /// <summary>
+    /// Look up an attribute by exact name.
+    /// </summary>
+    /// <remarks>
+    /// Case-sensitive on the ordinary path, because the converter this ports is: the lenient
+    /// parser feeding it keeps attribute names as written and every lookup is an exact match,
+    /// so <c>&lt;A HREF=…&gt;</c> reaches the link handler with no href at all and degrades to
+    /// its label. A repaired document is the exception — html5ever's serializer writes every
+    /// name back lowercase, so there the match ignores case to stand in for that rewrite.
+    /// </remarks>
     public string? Attr(string name)
     {
         if (Tag is null) return null;
-        _attrCache ??= new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        _attrCache ??= new Dictionary<string, string?>(
+            CanonicalAttrs ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal);
         if (_attrCache.TryGetValue(name, out var cached)) return cached;
         // Attribute values are otherwise left as written: the lenient parser hands the handlers
         // the source bytes, and the markdown writer escapes what it emits.
-        string? v = HtmlWalker.ExtractAttr(AttrString, name);
+        string? v = CanonicalAttrs
+            ? HtmlWalker.ExtractAttr(AttrString, name)
+            : HtmlWalker.ExtractAttrExact(AttrString, name);
         if (v is not null && CanonicalAttrs) v = HtmlToMarkdown.CanonicalizeAttrValue(v);
         _attrCache[name] = v;
         return v;
@@ -3142,8 +3543,7 @@ internal static class HtmlDom
             // comment
             if (pos + 3 < n && src[pos + 1] == '!' && src[pos + 2] == '-' && src[pos + 3] == '-')
             {
-                int end = src.IndexOf("-->", pos + 4, StringComparison.Ordinal);
-                pos = end < 0 ? n : end + 3;
+                pos = HtmlWalker.CommentEnd(src, pos);
                 continue;
             }
             // A processing instruction is not markup to the reference parser. `parse_tag`
@@ -3163,8 +3563,19 @@ internal static class HtmlDom
                 continue;
             }
 
-            int gt = FindTagEnd(src, pos);
-            if (gt < 0) { AddChild(new HNode { Tag = null, Text = src[pos..] }); break; }
+            int gt = FindTagEnd(src, pos, out int stop);
+            if (gt < 0)
+            {
+                // `parse_tag` bailed without finding the tag's `>`. astral-tl's `parse_single`
+                // ignores that failure and loops from wherever the stream stopped, so the
+                // malformed tag is dropped and everything after it is still parsed. Treating the
+                // remainder as one text node instead costs the whole document: on
+                // office/regression/000_000061.html an unclosed `<input … value="" </span>` was
+                // hiding every heading and paragraph that followed it.
+                if (stop > pos && stop < n) { pos = stop; continue; }
+                AddChild(new HNode { Tag = null, Text = src[pos..] });
+                break;
+            }
             string tagContent = src[(pos + 1)..gt];
             pos = gt + 1;
 
@@ -3307,9 +3718,17 @@ internal static class HtmlDom
     /// PDF's XML listing — hide the tag's own <c>&gt;</c> and swallow the document up to the next
     /// quote, which is text loss rather than a mis-parse.
     /// </remarks>
-    private static int FindTagEnd(string src, int lt)
+    private static int FindTagEnd(string src, int lt) => FindTagEnd(src, lt, out _);
+
+    /// <param name="stop">
+    /// Where the scan gave up when it found no <c>&gt;</c>. `parse_single` ignores `parse_tag`'s
+    /// failure and carries on from the stream position it left behind, so a malformed tag costs
+    /// the tag and not the rest of the document.
+    /// </param>
+    private static int FindTagEnd(string src, int lt, out int stop)
     {
         int n = src.Length;
+        stop = -1;
 
         // `read_end`: an end tag runs to the next `>`; it parses no attributes and honours no
         // quotes.
@@ -3322,7 +3741,7 @@ internal static class HtmlDom
         while (i < n)
         {
             i = SkipTagSpace(src, i);
-            if (i >= n) return -1;
+            if (i >= n) { stop = i; return -1; }
             if (src[i] is '/' or '>') break;      // `is_closing`
 
             int nameEnd = SkipIdent(src, i);
@@ -3331,7 +3750,7 @@ internal static class HtmlDom
             i = SkipTagSpace(src, nameEnd);
             if (i >= n || src[i] != '=') continue;   // a valueless attribute
             i = SkipTagSpace(src, i + 1);
-            if (i >= n) return -1;
+            if (i >= n) { stop = i; return -1; }
 
             char quote = src[i];
             if (quote is '"' or '\'')
@@ -3351,7 +3770,9 @@ internal static class HtmlDom
         }
 
         if (i < n && src[i] == '/') i++;          // `is_self_closing`
-        return i < n && src[i] == '>' ? i : -1;
+        if (i < n && src[i] == '>') return i;
+        stop = i;
+        return -1;
     }
 
     /// <summary>

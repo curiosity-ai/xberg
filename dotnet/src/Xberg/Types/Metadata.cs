@@ -55,6 +55,7 @@ public sealed class FormatMetadata
     public static FormatMetadata Html(HtmlMetadata m) => new() { FormatType = "html", Payload = m };
     public static FormatMetadata Xml(XmlMetadata m) => new() { FormatType = "xml", Payload = m };
     public static FormatMetadata Image(ImageMetadata m) => new() { FormatType = "image", Payload = m };
+    public static FormatMetadata Code(CodeMetadata m) => new() { FormatType = "code", Payload = m };
 
     private static readonly Dictionary<string, Type> PayloadTypes = new()
     {
@@ -148,6 +149,32 @@ public sealed class XmlMetadata
 {
     public uint ElementCount { get; set; }
     public List<string> UniqueElements { get; set; } = new();
+}
+
+/// <summary>
+/// Source-code metadata. <c>chunks</c> is always serialized, even when empty, because upstream's
+/// <c>Vec</c> is.
+/// </summary>
+public sealed class CodeMetadata
+{
+    /// <summary>Structural chunks — function, class and module boundaries.</summary>
+    [JsonPropertyName("chunks")]
+    public List<CodeChunkInfo> Chunks { get; set; } = new();
+
+    /// <summary>The key/value tree recovered from data-format source, when that was asked for.</summary>
+    [JsonPropertyName("data")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public object? Data { get; set; }
+}
+
+/// <summary>One structurally-meaningful chunk of source.</summary>
+public sealed class CodeChunkInfo
+{
+    [JsonPropertyName("text")] public string Text { get; set; } = "";
+    [JsonPropertyName("context_path")] public List<string> ContextPath { get; set; } = new();
+    [JsonPropertyName("node_types")] public List<string> NodeTypes { get; set; } = new();
+    [JsonPropertyName("byte_start")] public uint ByteStart { get; set; }
+    [JsonPropertyName("byte_end")] public uint ByteEnd { get; set; }
 }
 
 public sealed class ImageMetadata

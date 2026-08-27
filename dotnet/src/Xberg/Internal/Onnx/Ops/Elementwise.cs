@@ -17,9 +17,13 @@ internal enum BinaryKind { Add, Sub, Mul, Div, Pow, Min, Max }
 /// running CPU offers.
 /// </para>
 /// </summary>
+internal enum CompareKind { Greater, GreaterOrEqual, Less, LessOrEqual, Equal }
+
+internal enum LogicalKind { And, Or, Xor }
+
 internal static class Elementwise
 {
-    public static Tensor Binary(Tensor a, Tensor b, BinaryKind kind)
+    public static Tensor Binary(Tensor a, Tensor b, BinaryKind kind, Tensor? into = null)
     {
         // Integral operands stay integral: Shape arithmetic (Mul/Div on dimension vectors)
         // must not round-trip through float, where large dimensions would lose exactness.
@@ -28,19 +32,31 @@ internal static class Elementwise
         var fa = a.AsFloat();
         var fb = b.AsFloat();
         var plan = Broadcast.MakePlan(fa.Shape, fb.Shape);
-        var result = Tensor.AllocateFloat(plan.Shape);
+
+        // Writing over an operand is only safe where each output element is produced from the
+        // matching element of that operand and no other — that is, where the operand's offsets
+        // coincide with the output's. That holds for an operand of the output's own shape, and
+        // for it alone: a broadcast operand is re-read across blocks, so overwriting it would
+        // feed later blocks the results of earlier ones.
+        bool elementwise = plan.IsFlat && fa.Count == plan.Total && fb.Count == plan.Total;
+        bool scalarRight = fb.Count == 1 && fa.Count == plan.Total;
+        bool scalarLeft = fa.Count == 1 && fb.Count == plan.Total;
+        var result = elementwise || scalarRight || scalarLeft || CoversOutput(into, fa, fb, plan)
+            ? DestinationFor(plan.Shape, into)
+            : Tensor.AllocateFloat(plan.Shape);
+
         var dataA = fa.Floats;
         var dataB = fb.Floats;
         var dataOut = result.Floats;
 
-        if (plan.IsFlat && fa.Count == plan.Total && fb.Count == plan.Total)
+        if (elementwise)
         {
             Apply(kind, dataA, dataB, dataOut);
             return result;
         }
 
         // A scalar operand has a dedicated primitive overload that avoids walking the plan.
-        if (fb.Count == 1 && fa.Count == plan.Total)
+        if (scalarRight)
         {
             // A constant small-integer exponent is worth recognising rather than calling a
             // general power: exported graphs spell the squaring inside a variance as
@@ -50,7 +66,7 @@ internal static class Elementwise
             ApplyScalarRight(kind, dataA, dataB[0], dataOut);
             return result;
         }
-        if (fa.Count == 1 && fb.Count == plan.Total)
+        if (scalarLeft)
         {
             ApplyScalarLeft(kind, dataA[0], dataB, dataOut);
             return result;
@@ -210,18 +226,63 @@ internal static class Elementwise
         _ => throw new NotSupportedException($"binary kind {kind}"),
     };
 
-    public static Tensor Relu(Tensor x)
+    /// <summary>
+    /// Whether <paramref name="into"/> is the operand that already has the output's shape.
+    /// </summary>
+    /// <remarks>
+    /// Same shape means the broadcast walk visits it at exactly the output's offsets, so each
+    /// element is written back over the one it was read from. An operand of any other shape is
+    /// read more than once and must not be written at all.
+    /// </remarks>
+    private static bool CoversOutput(Tensor? into, Tensor a, Tensor b, Broadcast.Plan plan)
+    {
+        if (into?.Buffer is null) return false;
+        foreach (var operand in (ReadOnlySpan<Tensor>)[a, b])
+        {
+            if (!ReferenceEquals(operand.Buffer, into.Buffer)) continue;
+            if (operand.Shape.AsSpan().SequenceEqual(plan.Shape)) return true;
+        }
+        return false;
+    }
+
+    /// <summary>
+    /// A destination of the given shape: <paramref name="into"/> reshaped when it fits,
+    /// otherwise a fresh allocation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <paramref name="into"/> is an operand the session has established is dead after this
+    /// node and held by nothing else, so the result may be written over it. That turns a
+    /// streaming pass over two buffers into a pass over one: the destination lines are already
+    /// in cache because the producing node just wrote them, where a freshly rented buffer has
+    /// to be pulled in first only to be overwritten.
+    /// </para>
+    /// <para>
+    /// The count has to match exactly, not merely fit — a shorter destination would leave the
+    /// tail of a longer result unwritten, and a longer one would keep a larger array alive
+    /// under a smaller shape.
+    /// </para>
+    /// </remarks>
+    private static Tensor DestinationFor(int[] shape, Tensor? into)
+    {
+        if (into is null || !into.IsFloat) return Tensor.AllocateFloat(shape);
+        return into.Count == Tensor.ElementCount(shape)
+            ? into.Reshaped(shape)
+            : Tensor.AllocateFloat(shape);
+    }
+
+    public static Tensor Relu(Tensor x, Tensor? into = null)
     {
         var f = x.AsFloat();
-        var result = Tensor.AllocateFloat(f.Shape);
+        var result = DestinationFor(f.Shape, into);
         TensorPrimitives.Max(f.Floats, 0f, result.Floats);
         return result;
     }
 
-    public static Tensor Sigmoid(Tensor x)
+    public static Tensor Sigmoid(Tensor x, Tensor? into = null)
     {
         var f = x.AsFloat();
-        var result = Tensor.AllocateFloat(f.Shape);
+        var result = DestinationFor(f.Shape, into);
         TensorPrimitives.Sigmoid(f.Floats, result.Floats);
         return result;
     }
@@ -426,5 +487,257 @@ internal static class Elementwise
                 longs[i] = to == ElementType.Bool ? (x.Longs[i] != 0 ? 1 : 0) : x.Longs[i];
         }
         return Tensor.FromLongs(longs, to, x.Shape);
+    }
+
+    /// <summary>
+    /// ONNX <c>Where</c>: elementwise select between <paramref name="x"/> and
+    /// <paramref name="y"/> by a boolean <paramref name="condition"/>, broadcasting all three.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Three-operand rather than two, so it cannot reuse the pairwise broadcast plan: the result
+    /// shape is the broadcast of all three, and each operand is read through its own strides,
+    /// where a broadcast dimension has stride 0 and re-reads the same element.
+    /// </para>
+    /// <para>
+    /// The branches keep their own storage class. Integral <c>x</c> and <c>y</c> stay integral,
+    /// because <c>Where</c> appears in exported graphs selecting between shape vectors, and a
+    /// round trip through float would lose exactness on a large dimension.
+    /// </para>
+    /// </remarks>
+    public static Tensor Where(Tensor condition, Tensor x, Tensor y)
+    {
+        var shape = Broadcast.ResultShape(Broadcast.ResultShape(condition.Shape, x.Shape), y.Shape);
+        int rank = shape.Length;
+        int total = Tensor.ElementCount(shape);
+
+        var strideCondition = Broadcast.StridesFor(condition.Shape, rank);
+        var strideX = Broadcast.StridesFor(x.Shape, rank);
+        var strideY = Broadcast.StridesFor(y.Shape, rank);
+
+        bool integral = !x.IsFloat && !y.IsFloat;
+        var result = integral
+            ? Tensor.AllocateLong(x.Type, shape)
+            : Tensor.AllocateFloat(shape);
+
+        var index = new int[rank];
+        int offsetCondition = 0, offsetX = 0, offsetY = 0;
+
+        for (int flat = 0; flat < total; flat++)
+        {
+            bool take = condition.GetLong(offsetCondition) != 0;
+            if (integral) result.Longs[flat] = take ? x.GetLong(offsetX) : y.GetLong(offsetY);
+            else result.Floats[flat] = take ? x.GetFloat(offsetX) : y.GetFloat(offsetY);
+
+            // Odometer step, carrying from the innermost dimension outwards.
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                index[d]++;
+                offsetCondition += strideCondition[d];
+                offsetX += strideX[d];
+                offsetY += strideY[d];
+                if (index[d] < shape[d]) break;
+                offsetCondition -= strideCondition[d] * index[d];
+                offsetX -= strideX[d] * index[d];
+                offsetY -= strideY[d] * index[d];
+                index[d] = 0;
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>ONNX <c>Floor</c>: round each element toward negative infinity.</summary>
+    public static Tensor Floor(Tensor x)
+    {
+        // An integral tensor is already floored, and round-tripping a large int64 through float
+        // would lose exactness, so it passes through unchanged.
+        if (!x.IsFloat) return x;
+        var f = x.AsFloat();
+        var result = Tensor.AllocateFloat(f.Shape);
+        TensorPrimitives.Floor(f.Floats, result.Floats);
+        return result;
+    }
+
+    /// <summary>
+    /// ONNX <c>Greater</c>, <c>GreaterOrEqual</c>, <c>Less</c>, <c>LessOrEqual</c> and
+    /// <c>Equal</c>: elementwise comparison producing a boolean tensor.
+    /// </summary>
+    /// <remarks>
+    /// Integral operands compare as integers rather than through float, so two int64 values that
+    /// differ only beyond float's 24-bit mantissa still compare as unequal.
+    /// </remarks>
+    public static Tensor Compare(Tensor a, Tensor b, CompareKind kind)
+    {
+        var shape = Broadcast.ResultShape(a.Shape, b.Shape);
+        int rank = shape.Length;
+        int total = Tensor.ElementCount(shape);
+        var strideA = Broadcast.StridesFor(a.Shape, rank);
+        var strideB = Broadcast.StridesFor(b.Shape, rank);
+        var result = Tensor.AllocateLong(ElementType.Bool, shape);
+
+        bool integral = !a.IsFloat && !b.IsFloat;
+        var index = new int[rank];
+        int offsetA = 0, offsetB = 0;
+
+        for (int flat = 0; flat < total; flat++)
+        {
+            bool value;
+            if (integral)
+            {
+                long left = a.GetLong(offsetA), right = b.GetLong(offsetB);
+                value = kind switch
+                {
+                    CompareKind.Greater => left > right,
+                    CompareKind.GreaterOrEqual => left >= right,
+                    CompareKind.Less => left < right,
+                    CompareKind.LessOrEqual => left <= right,
+                    _ => left == right,
+                };
+            }
+            else
+            {
+                float left = a.GetFloat(offsetA), right = b.GetFloat(offsetB);
+                value = kind switch
+                {
+                    CompareKind.Greater => left > right,
+                    CompareKind.GreaterOrEqual => left >= right,
+                    CompareKind.Less => left < right,
+                    CompareKind.LessOrEqual => left <= right,
+                    _ => left == right,
+                };
+            }
+            result.Longs[flat] = value ? 1 : 0;
+
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                index[d]++;
+                offsetA += strideA[d];
+                offsetB += strideB[d];
+                if (index[d] < shape[d]) break;
+                offsetA -= strideA[d] * index[d];
+                offsetB -= strideB[d] * index[d];
+                index[d] = 0;
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// ONNX <c>Mod</c>: remainder, either C-style (<c>fmod</c>) or Python-style.
+    /// </summary>
+    /// <remarks>
+    /// The two differ in sign for a negative operand: <c>fmod</c> takes the sign of the dividend
+    /// and the default integer form takes the sign of the divisor, so the attribute is not
+    /// cosmetic.
+    /// </remarks>
+    public static Tensor Mod(Tensor a, Tensor b, bool fmod)
+    {
+        var shape = Broadcast.ResultShape(a.Shape, b.Shape);
+        int rank = shape.Length;
+        int total = Tensor.ElementCount(shape);
+        var strideA = Broadcast.StridesFor(a.Shape, rank);
+        var strideB = Broadcast.StridesFor(b.Shape, rank);
+
+        bool integral = !a.IsFloat && !b.IsFloat;
+        var result = integral ? Tensor.AllocateLong(a.Type, shape) : Tensor.AllocateFloat(shape);
+
+        var index = new int[rank];
+        int offsetA = 0, offsetB = 0;
+
+        for (int flat = 0; flat < total; flat++)
+        {
+            if (integral)
+            {
+                long left = a.GetLong(offsetA), right = b.GetLong(offsetB);
+                long remainder = right == 0 ? 0 : left % right;
+                if (!fmod && remainder != 0 && (remainder < 0) != (right < 0)) remainder += right;
+                result.Longs[flat] = remainder;
+            }
+            else
+            {
+                float left = a.GetFloat(offsetA), right = b.GetFloat(offsetB);
+                float remainder = left - right * MathF.Truncate(left / right);
+                if (!fmod && remainder != 0f && (remainder < 0f) != (right < 0f)) remainder += right;
+                result.Floats[flat] = remainder;
+            }
+
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                index[d]++;
+                offsetA += strideA[d];
+                offsetB += strideB[d];
+                if (index[d] < shape[d]) break;
+                offsetA -= strideA[d] * index[d];
+                offsetB -= strideB[d] * index[d];
+                index[d] = 0;
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>ONNX <c>Sin</c>.</summary>
+    public static Tensor Sin(Tensor x)
+    {
+        var f = x.AsFloat();
+        var result = Tensor.AllocateFloat(f.Shape);
+        for (int i = 0; i < f.Count; i++) result.Floats[i] = MathF.Sin(f.Floats[i]);
+        return result;
+    }
+
+    /// <summary>ONNX <c>Cos</c>.</summary>
+    public static Tensor Cos(Tensor x)
+    {
+        var f = x.AsFloat();
+        var result = Tensor.AllocateFloat(f.Shape);
+        for (int i = 0; i < f.Count; i++) result.Floats[i] = MathF.Cos(f.Floats[i]);
+        return result;
+    }
+
+    /// <summary>ONNX <c>Not</c>: elementwise boolean negation.</summary>
+    public static Tensor Not(Tensor x)
+    {
+        var result = Tensor.AllocateLong(ElementType.Bool, x.Shape);
+        for (int i = 0; i < x.Count; i++) result.Longs[i] = x.GetLong(i) != 0 ? 0 : 1;
+        return result;
+    }
+
+    /// <summary>ONNX <c>And</c>, <c>Or</c> and <c>Xor</c>: elementwise boolean logic, broadcast.</summary>
+    public static Tensor Logical(Tensor a, Tensor b, LogicalKind kind)
+    {
+        var shape = Broadcast.ResultShape(a.Shape, b.Shape);
+        int rank = shape.Length;
+        int total = Tensor.ElementCount(shape);
+        var strideA = Broadcast.StridesFor(a.Shape, rank);
+        var strideB = Broadcast.StridesFor(b.Shape, rank);
+        var result = Tensor.AllocateLong(ElementType.Bool, shape);
+
+        var index = new int[rank];
+        int offsetA = 0, offsetB = 0;
+        for (int flat = 0; flat < total; flat++)
+        {
+            bool left = a.GetLong(offsetA) != 0, right = b.GetLong(offsetB) != 0;
+            bool value = kind switch
+            {
+                LogicalKind.And => left && right,
+                LogicalKind.Or => left || right,
+                _ => left ^ right,
+            };
+            result.Longs[flat] = value ? 1 : 0;
+
+            for (int d = rank - 1; d >= 0; d--)
+            {
+                index[d]++;
+                offsetA += strideA[d];
+                offsetB += strideB[d];
+                if (index[d] < shape[d]) break;
+                offsetA -= strideA[d] * index[d];
+                offsetB -= strideB[d] * index[d];
+                index[d] = 0;
+            }
+        }
+        return result;
     }
 }

@@ -218,4 +218,40 @@ public class MarkdownInlineRuleTests
         Assert.Equal("This is test 1 0:08", paragraph.Text);
         Assert.Contains(paragraph.Annotations, a => a.Kind.Which == AnnotationKind.Tag.Bold);
     }
+
+    /// <summary>
+    /// A display equation's body is read straight out of the joined source, so a line inside it
+    /// that ends in a space keeps that space. Trailing whitespace is not content in prose, but
+    /// dropping it where the lines are joined took it from the equation too; it is dropped by the
+    /// inline scanner, at the line ending, the way pulldown-cmark drops it.
+    /// </summary>
+    [Fact]
+    public void ADisplayEquationKeepsALinesTrailingSpace()
+    {
+        var doc = Extract("$$\na = \nb\n$$\n");
+        var formula = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.Formula);
+        Assert.Equal("a = \nb", formula.Text);
+    }
+
+    [Fact]
+    public void ProseDropsALinesTrailingSpace()
+    {
+        // The other half of the same rule: a soft break still reads as one space, no matter how
+        // much whitespace sat on either side of it.
+        Assert.Equal("one two", PlainText("one \ntwo\n"));
+    }
+
+    /// <summary>
+    /// Block-level raw HTML is one event per line, and each carries its line ending. Standing on
+    /// its own the run becomes one raw block per line and the endings are trimmed back off, but
+    /// inside a list item the lines are appended to the item's text — where the ending is the
+    /// only thing keeping a multi-line tag from collapsing onto one line.
+    /// </summary>
+    [Fact]
+    public void BlockHtmlInsideAListItemKeepsItsLineBreaks()
+    {
+        var doc = Extract("1. Intro:\n\n    <summary>\n      Line one\n    </summary>\n");
+        var item = doc.Elements.Single(e => e.Kind.Tag == ElementKindTag.ListItem);
+        Assert.Equal("Intro: <summary>\n   Line one\n </summary>", item.Text);
+    }
 }

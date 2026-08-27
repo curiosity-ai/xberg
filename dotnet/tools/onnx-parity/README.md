@@ -126,6 +126,16 @@ For the same reason `--gemm` can run in the same process as `--benchmark`, so an
 and a standalone rate for the same shape are comparable at all, and `compare_speed.py` runs
 ONNX Runtime and this runtime back to back rather than against a figure recorded earlier.
 
+`--benchmark` needs no reference dump. A timing run measures time, and the time a convolution
+takes does not depend on the numbers going through it, so the harness synthesises inputs from
+the shapes the graph declares — a symbolic batch dimension becomes 1. Requiring the reference
+meant regenerating hundreds of megabytes of promoted intermediates before anyone could measure
+a kernel change, which is enough friction to stop the measurement happening at all:
+
+```bash
+dotnet run --project tools/Xberg.OnnxParity -c Release -- --model rtdetr.onnx --benchmark 3
+```
+
 **Cold code measures the compiler.** .NET starts methods in a quick-JIT tier and promotes
 them only after roughly thirty calls, and this graph also has to fault in 169 MB of weights
 and spin up the thread pool. Every benchmark discards three full inference passes first.
@@ -268,12 +278,93 @@ At ~1.8x, the arithmetic-bound nodes run at 185-190 GFLOP/s and the best single 
 270-300, so the spread across shapes is now the largest remaining term rather than the peak.
 Convolution is still ~60% of runtime.
 
-The known routes from here, in rough order of expected value:
+### Two wrong turns, and what they cost to find
 
-- **A direct convolution for small-channel layers.** For a 3x3 layer with 32 or 64 output
-  channels the packed panel holds each input pixel nine times, and each packed float is used
-  for only `2m` flops, so the expansion stops paying for itself. A kernel that reads a shifted
-  window of the image directly, the way oneDNN's do, would not write the expansion at all.
+This section named a next step twice and was wrong twice. Both are recorded because the way
+each was disproved is the useful part.
+
+**"A direct convolution for small-channel layers."** A per-node profile says the small-channel
+3x3 layers run at 195-277 GFLOP/s, mid-pack, while the slowest shapes in the graph are 1x1
+convolutions with a large channel count at 113-128. A kernel avoiding the nine-fold `im2col`
+expansion would have been attacking shapes that are not the problem.
+
+**"So it must be the shallow reduction."** The reasoning was that a 1x1 reduces over 256 or 512
+elements where a 3x3 over the same channels reduces over nine times as many, so each output
+tile's prologue and accumulator store are amortised nine times worse. It is a good story and it
+is not what is happening: `--gemm` runs those exact products at 365-379 GFLOP/s, near the best
+shapes in the set. The multiply was never slow.
+
+What was actually missing was a measurement. `--gemm` measures the product a convolution lowers
+to; nothing measured the convolution, which is 61% of the graph. `--conv` does, and on every hot
+shape — 1x1 included — a whole convolution runs at 71-113% of the calibrated ceiling. Only the
+shortcut convolutions are genuinely slower in the graph than in isolation, and they are worth
+about 2% of inference between them.
+
+The first version of `--conv` read **21 GFLOP/s on a shape whose multiply runs at 365**, because
+it allocated a fresh multi-megabyte output on every call instead of going through the pool the
+session installs: it was measuring the garbage collector. Its second version still disagreed with
+itself by 3x between adjacent columns, on three warm-up passes and five samples. The numbers only
+became stable at thirty of each. Both are the same lesson the top of this section already
+records, learned again.
+
+### Where the time actually goes, and what was taken
+
+`Conv` is 61% and `MatMul` 14%; 1,649 of the 2,315 nodes take under 10 us each, 0.2% between
+them. The remaining quarter is element-wise and data movement, and that is where the one win
+in this pass came from.
+
+**Writing an element-wise result over a dying operand.** Four hundred nodes read a buffer and
+write another the same size; when the operand they read is dead the moment they are done with
+it, the second buffer is waste. `OnnxSession.FindReusableOperand` decides, and the conditions
+are the whole of the risk — reusing one buffer too eagerly corrupts a value some later node
+reads, and that surfaces as a plausible detection rather than a crash.
+
+| | before | after |
+| --- | --- | --- |
+| `Relu` | 35.7 ms | 27.5 ms |
+| `Add` | 50.3 ms | 42.3 ms |
+| `Mul` | 10.6 ms | 8.4 ms |
+| buffer rentals per inference | 734 | 473 |
+| pool memory retained | 214 MiB | 168 MiB |
+
+Whole-model, timed by `--check-reuse`, which runs both configurations alternately in one process
+because across processes this host moves more than the difference: **1.00x, 1.02x, 1.04x** over
+three runs. Two percent, and honestly at the edge of what can be resolved here — the per-operator
+figures are the solid part, and they are consistent with it, since the operators involved are 12%
+of runtime. The memory figures are counts rather than timings and do not vary.
+
+`--check-reuse` also compares every graph output bitwise between the two configurations, which is
+the only check that means anything for a change of this kind. RT-DETR's three outputs are
+identical to the bit.
+
+### The one unexplained thing, and three answers it is not
+
+The shortcut convolutions — `res_layers.N/blocks.0/short`, a 1x1 after an average pool — run
+about twice as slow in the graph as in isolation. Measured on one host sample in one process,
+so it is not drift: `1x1 512->1024 @40x40` reads 7.0 ms under `--conv` and 15.1 ms as node #61.
+The 3x3 shapes show no such gap, matching to within a millisecond. Between them the shortcuts
+are worth roughly 2% of inference.
+
+Three explanations were tested and none of them is it:
+
+- **Cold weights.** A is re-read once per column panel, and in a hot loop it stays in L3 while
+  the graph evicts it. But the traffic per flop works out the same for the fast 3x3 shape —
+  151 MFLOP per column panel against ~2 MB of A either way — and flushing 24 MB before each
+  isolated run does not slow it down.
+- **Pool misses on the large activations.** `ResetCounters` plus the per-run histogram says the
+  warm run misses 14 times for 4 MiB, and the other 55 misses are all under the 16 KB floor
+  where pooling is deliberately off. Four megabytes per 800 ms is not two percent of anything.
+- **Values nothing consumes.** `ComputeLastUse` builds from names used as *inputs*, so a value
+  the graph produces and never reads is never unbound and its buffer never returns to the pool.
+  True, and RT-DETR has none: releasing the leftover bindings at the end of a run moved the
+  counters not at all. The change was backed out — it also lets a graph output fed straight back
+  in as the next run's input be recycled underneath the caller, which is a real hazard bought
+  for no measured gain.
+
+What is left to try: the shortcut's input is an `AveragePool` output rather than another
+convolution's, which is the one structural difference from every fast shape. Whether that
+matters is unmeasured.
+
 - Beyond that: software prefetch hints and hand-scheduled instruction order, which C# cannot
   express, and MLAS's per-CPU kernel variants selected at run time, where this has one AVX-512
   path and one portable path.

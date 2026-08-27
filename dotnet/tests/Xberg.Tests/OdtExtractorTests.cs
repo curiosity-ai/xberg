@@ -86,4 +86,22 @@ public class OdtExtractorTests
         var para = Assert.Single(doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph));
         Assert.Equal("Page  of .", para.Text);
     }
+
+    /// <summary>
+    /// A captioned figure nests a frame inside a text box inside an outer frame, and the inner
+    /// frame owns the image. Walking every `draw:frame` in the paragraph reaches that image twice
+    /// — once as a descendant of the outer frame and once of the inner one — so the image whose
+    /// nearest enclosing frame is not the one being processed is left to that frame.
+    /// </summary>
+    [Fact]
+    public void ACaptionedFiguresImageIsEmittedOnce()
+    {
+        var doc = Extract(
+            "<text:p><draw:frame draw:name=\"Rahmen1\"><draw:text-box>" +
+            "<text:p><draw:frame draw:name=\"Grafik1\">" +
+            "<draw:image xlink:href=\"Pictures/one.jpg\"/></draw:frame>Abbildung 1: Image caption</text:p>" +
+            "</draw:text-box></draw:frame></text:p>");
+
+        Assert.Single(doc.Elements, e => e.Kind.Tag == ElementKindTag.Image);
+    }
 }

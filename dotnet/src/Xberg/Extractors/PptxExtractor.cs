@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json;
 using Xberg.Core;
 using Xberg.Internal.Ooxml;
@@ -32,12 +33,12 @@ public sealed class PptxExtractor : IExtractor
     {
         bool plain = config.OutputFormat.Equals(OutputFormat.Plain);
         var result = PptxReader.Extract(content, plain, injectPlaceholders: true);
-        return BuildDocumentFromResult(result, mimeType);
+        return BuildDocumentFromResult(result, mimeType, config.SecurityLimits);
     }
 
-    private static InternalDocument BuildDocumentFromResult(PptxResult result, string mimeType)
+    private static InternalDocument BuildDocumentFromResult(PptxResult result, string mimeType, SecurityLimits? limits)
     {
-        var doc = BuildInternalDocument(result.Content, result.SlideCount);
+        var doc = BuildInternalDocument(result.Content, result.SlideCount, limits);
         doc.MimeType = mimeType;
 
         var office = result.OfficeMetadata;
@@ -84,14 +85,16 @@ public sealed class PptxExtractor : IExtractor
 
     /// <summary>Ports Rust <c>PptxExtractor::build_internal_document</c> — splits <paramref name="content"/>
     /// into "\n\n" blocks and interprets headings/lists/tables/paragraphs.</summary>
-    private static InternalDocument BuildInternalDocument(string content, int slideCount)
+    private static InternalDocument BuildInternalDocument(string content, int slideCount, SecurityLimits? limits)
     {
+        var budget = new SecurityBudget(limits ?? new SecurityLimits());
         var builder = new InternalDocumentBuilder("pptx");
         uint slideNum = 0;
         bool inNotes = false;
 
         foreach (var block in content.Split("\n\n"))
         {
+            budget.Step();
             string trimmed = block.Trim();
             if (trimmed.Length == 0) continue;
 
@@ -106,7 +109,11 @@ public sealed class PptxExtractor : IExtractor
                 inNotes = false;
                 slideNum++;
                 string title = trimmed[2..].Trim();
-                if (title.Length > 0) builder.PushHeading(2, title, null, null);
+                if (title.Length > 0)
+                {
+                    budget.AccountText(Encoding.UTF8.GetByteCount(title));
+                    builder.PushHeading(2, title, null, null);
+                }
                 continue;
             }
 
@@ -139,11 +146,13 @@ public sealed class PptxExtractor : IExtractor
                 {
                     if (inList is { } prev && prev != lm.Ordered) { builder.EndList(); builder.PushList(lm.Ordered); inList = lm.Ordered; }
                     else if (inList is null) { builder.PushList(lm.Ordered); inList = lm.Ordered; }
+                    budget.AccountText(Encoding.UTF8.GetByteCount(lm.Text));
                     builder.PushListItem(lm.Text, lm.Ordered, new(), slideNum, null);
                 }
                 else
                 {
                     if (inList is not null) { builder.EndList(); inList = null; }
+                    budget.AccountText(Encoding.UTF8.GetByteCount(lt));
                     builder.PushParagraph(lt, new(), null, null);
                 }
             }

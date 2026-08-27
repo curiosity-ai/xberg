@@ -7,8 +7,10 @@
 
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Formats;
+using SixLabors.ImageSharp.Metadata.Profiles.Exif;
 using Xberg.Core;
 using Xberg.Internal.Exif;
+using Xberg.Internal.Heif;
 using Xberg.Types;
 
 namespace Xberg.Extractors;
@@ -29,6 +31,15 @@ public sealed class ImageExtractor : IExtractor
         "image/tiff",
         "image/x-tiff",
         "image/gif",
+
+        // HEIF-family containers. ImageSharp cannot read these, so their metadata comes from
+        // the container description instead; see HeifContainer for what that does and does not
+        // cover.
+        "image/heic",
+        "image/heic-sequence",
+        "image/heif",
+        "image/heif-sequence",
+        "image/avif",
     };
 
     public int Priority => 50;
@@ -36,18 +47,9 @@ public sealed class ImageExtractor : IExtractor
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
         byte[] bytes = content.ToArray();
-
-        ImageInfo info = Image.Identify(bytes);
-        string format = FormatName(info.Metadata.DecodedImageFormat);
-        var exif = ExifReader.Extract(info.Metadata.ExifProfile);
-
-        var imageMeta = new ImageMetadata
-        {
-            Width = (uint)info.Width,
-            Height = (uint)info.Height,
-            Format = format,
-            Exif = exif,
-        };
+        var imageMeta = HeifContainer.IsHeifContainer(bytes)
+            ? HeifMetadata(bytes)
+            : RasterMetadata(bytes);
 
         // build_image_internal_document(None, None): a single Image element referencing
         // image index 0 (no bytes stored in doc.images by default).
@@ -66,6 +68,55 @@ public sealed class ImageExtractor : IExtractor
         doc.Metadata = new Metadata { Format = FormatMetadata.Image(imageMeta) };
         doc.MimeType = mimeType;
         return doc;
+    }
+
+    private static ImageMetadata RasterMetadata(byte[] bytes)
+    {
+        ImageInfo info = Image.Identify(bytes);
+        return new ImageMetadata
+        {
+            Width = (uint)info.Width,
+            Height = (uint)info.Height,
+            Format = FormatName(info.Metadata.DecodedImageFormat),
+            Exif = ExifReader.Extract(info.Metadata.ExifProfile),
+        };
+    }
+
+    /// <summary>
+    /// Metadata for a HEIF-family container, read from its description rather than its pixels.
+    /// </summary>
+    /// <remarks>
+    /// Upstream reports the dimensions libheif hands back after decoding; those are the coded
+    /// extent with the clean aperture and rotation applied, which is exactly what the container
+    /// itself states, so no picture has to be decoded to agree with it.
+    /// </remarks>
+    private static ImageMetadata HeifMetadata(byte[] bytes)
+    {
+        var info = HeifContainer.TryRead(bytes)
+            ?? throw new InvalidDataException("Failed to read HEIF container metadata");
+
+        return new ImageMetadata
+        {
+            Width = info.Width,
+            Height = info.Height,
+            Format = "HEIF",
+            // A file with no EXIF item yields an empty map, the same as a raster image
+            // whose profile is absent.
+            Exif = ExifReader.Extract(info.Exif is { Length: > 0 } exif ? ReadExifProfile(exif) : null),
+        };
+    }
+
+    /// <summary>Read a bare TIFF block as an EXIF profile, or nothing if it will not parse.</summary>
+    private static ExifProfile? ReadExifProfile(byte[] exif)
+    {
+        try
+        {
+            return new ExifProfile(exif);
+        }
+        catch (Exception e) when (e is ArgumentException or IndexOutOfRangeException)
+        {
+            return null;
+        }
     }
 
     // Rust uses `format!("{:?}", image::ImageFormat).to_uppercase()`; ImageSharp's format

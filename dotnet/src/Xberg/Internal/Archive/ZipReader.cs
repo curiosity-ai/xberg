@@ -3,16 +3,32 @@
 
 using System.IO.Compression;
 using System.Text;
+using Xberg.Core;
 
 namespace Xberg.Internal.Archive;
 
 internal static class ZipReader
 {
     /// <summary>Read metadata, text contents and raw bytes from a ZIP archive in one pass.</summary>
-    public static ArchiveReadResult Read(byte[] bytes)
+    /// <remarks>
+    /// The central directory is checked against <paramref name="limits"/> before a single entry is
+    /// decompressed, so a bomb is refused on its declared sizes rather than on the memory it has
+    /// already taken. Upstream reports that refusal as a validation failure rather than a security
+    /// one; the wrapping here is that distinction, not a swallowed error.
+    /// </remarks>
+    public static ArchiveReadResult Read(byte[] bytes, SecurityLimits? limits)
     {
         using var stream = new MemoryStream(bytes, writable: false);
-        using var archive = new ZipArchive(stream, ZipArchiveMode.Read);
+        ZipArchive archive;
+        try
+        {
+            archive = ZipBombValidator.OpenValidated(stream, limits);
+        }
+        catch (Xberg.Core.SecurityException e)
+        {
+            throw new ValidationException(e.Message);
+        }
+        using var _archive = archive;
 
         var result = new ArchiveReadResult { Info = { Format = "ZIP" } };
         ulong totalSize = 0;

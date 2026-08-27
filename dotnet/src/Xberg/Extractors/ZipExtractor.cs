@@ -20,7 +20,7 @@ public sealed class ZipExtractor : IExtractor
 
     public InternalDocument Extract(ReadOnlySpan<byte> content, string mimeType, ExtractionConfig config)
     {
-        var read = ZipReader.Read(content.ToArray());
+        var read = ZipReader.Read(content.ToArray(), config.SecurityLimits);
         return ArchiveDocument.Build(read, mimeType, config);
     }
 }

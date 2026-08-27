@@ -1,0 +1,32 @@
+# Probe crate for the C# port: renders a set of fixtures through the real
+# `StyledHtmlRenderer` (via the public `extract` API with `html_output` set) so the port's
+# output can be diffed against it byte for byte. Not part of the xberg workspace.
+[workspace]
+
+[package]
+name = "htmlstyled-probe"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "htmlstyled-probe"
+path = "src/main.rs"
+
+[dependencies]
+xberg = { path = "../../../crates/xberg", default-features = false, features = [
+    "tokio-runtime",
+    "office",
+    "excel",
+    "pdf",
+    "html",
+    "xml",
+    "email",
+    "archives",
+    "hwp",
+    "hwpx",
+    "iwork",
+    "mdx",
+] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "time"] }
+serde_json = "1"

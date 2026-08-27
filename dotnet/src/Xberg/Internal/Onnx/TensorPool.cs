@@ -41,6 +41,18 @@ internal sealed class TensorPool
     /// </summary>
     public Dictionary<int, int> AllocationsByLength { get; } = [];
 
+    /// <summary>Forget the counters, so a later run's misses can be read on their own.</summary>
+    /// <remarks>
+    /// The cumulative histogram is dominated by the first pass, when every shape misses by
+    /// definition. What names a real problem is what still misses once the pool is warm.
+    /// </remarks>
+    public void ResetCounters()
+    {
+        Reused = 0;
+        Allocated = 0;
+        AllocationsByLength.Clear();
+    }
+
     /// <summary>The ambient pool for the execution on this thread, if any.</summary>
     /// <remarks>
     /// Thread-static rather than threaded through every kernel signature: graph execution is
@@ -135,6 +147,20 @@ internal sealed class TensorBuffer
             ? new TensorBuffer(GC.AllocateUninitializedArray<float>(length), null)
             : new TensorBuffer(pool.Rent(length), pool);
     }
+
+    /// <summary>How many graph values currently hold this storage.</summary>
+    /// <remarks>
+    /// One means a single name owns it, which is the condition under which a node may write
+    /// its output over its input: nothing else can observe the change.
+    /// </remarks>
+    public int References => _references;
+
+    /// <summary>Whether the pool owns this array, rather than a caller or an initializer.</summary>
+    /// <remarks>
+    /// An initializer is a constant shared by every run and a feed belongs to the caller;
+    /// neither may be overwritten, and both arrive wrapped rather than rented.
+    /// </remarks>
+    public bool IsPooled => _pool is not null;
 
     public void AddReference() => _references++;
 

@@ -121,4 +121,25 @@ public class DataXmlTests
         Assert.Contains("var a = 1;", paras);
         Assert.Contains("Visible", paras);
     }
+
+    /// <summary>
+    /// Upstream computes an element's heading level as `((depth as u8) + 1).min(6)` over a u16
+    /// depth: the cast keeps only the low byte and the add wraps. A document that never closes its
+    /// tags walks past depth 255 and its levels start over from 0 instead of staying pinned at 6.
+    /// Reproduced rather than fixed — the level lands in the rendered section tree, and the
+    /// docling `.doctags.txt` groundtruth files nest deeply enough to reach it.
+    /// </summary>
+    [Fact]
+    public void PastDepth255TheHeadingLevelWrapsRatherThanPinningAtSix()
+    {
+        // 258 tags, none closed: the element opened at depth 255 is the one that wraps.
+        var doc = Extract("<r>" + string.Concat(Enumerable.Range(0, 257).Select(i => $"<t{i}>")));
+        var levels = doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Heading)
+                        .Select(e => e.Kind.Level).ToList();
+
+        Assert.Equal(258, levels.Count);
+        Assert.Equal(new byte[] { 1, 2, 3, 4, 5, 6, 6 }, levels.Take(7).ToArray());
+        // Depth 255 -> (255 + 1) wraps to 0; the two after it climb again.
+        Assert.Equal(new byte[] { 6, 0, 1, 2 }, levels.Skip(254).Take(4).ToArray());
+    }
 }

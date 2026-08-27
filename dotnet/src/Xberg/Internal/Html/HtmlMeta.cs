@@ -85,6 +85,9 @@ public static class HtmlMeta
         }
 
         bool inAnchor = false;
+        // Where each open inline marker was written, so its whitespace can be moved outside the
+        // delimiters when it closes.
+        var openMarkers = new List<(StringBuilder Buffer, string Marker, int At)>();
         var anchorText = new StringBuilder();
         // Open `<abbr>` expansions, appended when each one closes.
         var abbrTitles = new List<string>();
@@ -121,8 +124,7 @@ public static class HtmlMeta
             {
                 if (string.CompareOrdinal(html, pos, "<!--", 0, 4) == 0)
                 {
-                    int e = html.IndexOf("-->", pos + 4, StringComparison.Ordinal);
-                    pos = e < 0 ? n : e + 3;
+                    pos = HtmlWalker.CommentEnd(html, pos);
                     continue;
                 }
                 int tagStart = pos;
@@ -201,9 +203,11 @@ public static class HtmlMeta
                             HeaderSink().Add(new Header
                             {
                                 Level = captureHeading, Text = text, Id = headingId,
-                                // A heading inside a table is recorded at depth 0 — the passes
-                                // that re-walk it have no enclosing tree to count.
-                                Depth = tables.Count > 0 ? 0 : headingDepthAtOpen,
+                                // A heading inside a table carries its real DOM depth. It read 0
+                                // while the re-walks that recorded it started from a fresh tree;
+                                // since 3.11.0 the render is the only pass that records, and it
+                                // walks the cell at the table's own depth.
+                                Depth = headingDepthAtOpen,
                                 HtmlOffset = 0,
                             });
                         captureHeading = 0;
@@ -240,7 +244,8 @@ public static class HtmlMeta
                     }
                     else if (InlineMarker(tag) is { } closeMarker && (captureHeading != 0 || inAnchor))
                     {
-                        (captureHeading != 0 ? headingText : anchorText).Append(closeMarker);
+                        var target = captureHeading != 0 ? headingText : anchorText;
+                        CloseInlineMarker(openMarkers, target, closeMarker);
                     }
                     else if (tag == "abbr" && abbrTitles.Count > 0 && (captureHeading != 0 || inAnchor))
                     {
@@ -280,6 +285,10 @@ public static class HtmlMeta
                             // Trimmed but not collapsed: a title written with two spaces between
                             // its halves keeps them.
                             string t = titleText.ToString().Trim();
+                            // A repaired document reaches the walk with its references already
+                            // resolved, so `&deg;` in a title is the degree sign by the time the
+                            // collector reads it.
+                            if (canonicalAttrs) t = HtmlToMarkdown.CanonicalizeText(t).Trim();
                             if (t.Length > 0) headMetadata["title"] = t;
                         }
                         inTitle = false;
@@ -317,7 +326,9 @@ public static class HtmlMeta
                 // Emphasis inside a heading or a link is part of the markdown those record.
                 if (InlineMarker(tag) is { } openMarker && (captureHeading != 0 || inAnchor) && !selfClose)
                 {
-                    (captureHeading != 0 ? headingText : anchorText).Append(openMarker);
+                    var target = captureHeading != 0 ? headingText : anchorText;
+                    openMarkers.Add((target, openMarker, target.Length));
+                    target.Append(openMarker);
                     domDepth++;
                     continue;
                 }
@@ -366,7 +377,9 @@ public static class HtmlMeta
                     }
                     case "meta" when inHead:
                     {
-                        string? metaContent = HtmlWalker.ExtractAttr(attrsStr, "content");
+                        // `Raw` so a repaired document's `content` reads as html5ever's
+                        // serializer wrote it, the same as every other attribute here.
+                        string? metaContent = Raw(attrsStr, "content");
                         if (metaContent is null) break;
                         if (HtmlWalker.ExtractAttr(attrsStr, "name") is { } metaName)
                             headMetadata["meta-" + metaName] = metaContent;
@@ -395,10 +408,19 @@ public static class HtmlMeta
                         break;
                     case "table":
                         if (!selfClose)
+                        {
+                            // A layout table's rows are walked inline, which is what makes an
+                            // image inside one degrade to its alt text. The verdict comes from
+                            // the handler's own predicate over this table's markup, so the two
+                            // sides cannot drift apart.
+                            int tableEnd = FindElementEnd(html, tagStart, "table");
+                            string tableHtml = html[tagStart..(tableEnd < 0 ? n : tableEnd)];
                             tables.Add(new TableFrame
                             {
                                 BorderZero = HtmlWalker.ExtractAttr(attrsStr, "border") == "0",
+                                Layout = HtmlToMarkdown.TableMarkupRendersAsLayoutList(tableHtml),
                             });
+                        }
                         break;
                     case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
                         captureHeading = tag[1] - '0';
@@ -461,8 +483,22 @@ public static class HtmlMeta
                             Attributes = attrs,
                         };
                         ImageSink().Add(image);
-                        // A link wrapping an image carries the image markdown as its label text.
-                        if (inAnchor) anchorText.Append("![").Append(alt ?? "").Append("](").Append(src ?? "").Append(')');
+                        // A link wrapping an image carries the image markdown as its label text —
+                        // except inside a heading, where the image degrades to its alt text and
+                        // the label carries that instead. A heading holding an image directly
+                        // carries the alt text the same way.
+                        // Inline context — a heading, or a cell of a table the handler renders
+                        // as a list — degrades the image to its alt text.
+                        bool inlineImage = captureHeading != 0 || tables.Exists(t => t.Layout);
+                        // The title rides along in the markdown, exactly as the image handler
+                        // writes it: `![alt](src "title")`.
+                        string? imgTitle = Raw(attrsStr, "title");
+                        string rendered = inlineImage
+                            ? alt ?? ""
+                            : "![" + (alt ?? "") + "](" + (src ?? "")
+                              + (imgTitle is { Length: > 0 } ? " \"" + imgTitle + "\"" : "") + ")";
+                        if (inAnchor) anchorText.Append(rendered);
+                        else if (captureHeading != 0) headingText.Append(rendered);
                         break;
                     }
                     // An `<svg>` converts to an image whose source is the serialized subtree, so
@@ -507,6 +543,19 @@ public static class HtmlMeta
                         pos = close < 0 ? n : after;
                         continue;
                     }
+                    // `<template>` content is an inert, unrendered document fragment per the HTML
+                    // spec, and `<noscript>` content only renders with scripting disabled, which a
+                    // Markdown conversion never is. The converter skips both subtrees outright, so
+                    // nothing inside them is part of the document — including the images and links
+                    // this pass collects. Skipping them here is what keeps a tracking pixel in
+                    // `<noscript>` out of the image list.
+                    case "template":
+                    case "noscript":
+                    {
+                        int end = FindElementEnd(html, tagStart, tag);
+                        pos = end < 0 ? n : end;
+                        continue;
+                    }
                 }
 
                 if (!Void.Contains(tag) && !selfClose) domDepth++;
@@ -525,7 +574,10 @@ public static class HtmlMeta
                     anchorText.Append(cellDepth > 0 ? HtmlToMarkdown.EscapeCellText(decoded) : decoded);
                     anchorRawText.Append(decoded);
                 }
-                else if (inTitle) titleText.Append(HtmlWalker.DecodeEntities(text));
+                // Read as written. Only a document that reaches the walk through the html5ever
+                // repair arrives with its references resolved, and there the serializer's own
+                // spelling is what the collector sees — `&deg;` becomes `°`, `&nbsp;` stays.
+                else if (inTitle) titleText.Append(canonicalAttrs ? HtmlToMarkdown.CanonicalizeText(text) : text);
                 pos = lt;
             }
         }
@@ -557,6 +609,40 @@ public static class HtmlMeta
             if (k < html.Length && html[k] == '>') return (close, k + 1);
             search = close + 1;
         }
+    }
+
+    /// <summary>
+    /// Close an emphasis span, leaving its whitespace outside the delimiters.
+    /// </summary>
+    /// <remarks>
+    /// <c>&lt;b&gt;label &lt;/b&gt;</c> is <c>**label** </c>, not <c>**label **</c> — a delimiter
+    /// with a space against its inner edge is not emphasis at all in CommonMark, so the
+    /// converter chomps the span and re-emits the whitespace outside. The recorded markdown has
+    /// to match what the converter wrote.
+    /// </remarks>
+    private static void CloseInlineMarker(
+        List<(StringBuilder Buffer, string Marker, int At)> open, StringBuilder target, string marker)
+    {
+        int idx = open.FindLastIndex(o => ReferenceEquals(o.Buffer, target) && o.Marker == marker);
+        if (idx < 0) { target.Append(marker); return; }
+        var (_, openMarker, at) = open[idx];
+        open.RemoveAt(idx);
+
+        int contentStart = at + openMarker.Length;
+        if (contentStart > target.Length) { target.Append(marker); return; }
+        string content = target.ToString(contentStart, target.Length - contentStart);
+        string trimmed = content.Trim();
+        if (trimmed.Length == 0)
+        {
+            // Nothing but whitespace between the delimiters: neither delimiter survives.
+            target.Length = at;
+            target.Append(content);
+            return;
+        }
+        string lead = content[..(content.Length - content.TrimStart().Length)];
+        string trail = content[content.TrimEnd().Length..];
+        target.Length = at;
+        target.Append(lead).Append(openMarker).Append(trimmed).Append(marker).Append(trail);
     }
 
     /// <summary>The markdown delimiter an inline element is written with, or null.</summary>
@@ -658,6 +744,9 @@ public static class HtmlMeta
         /// <summary>Where a run of records came from, which decides the passes it is replayed for.</summary>
         public enum Origin { Cell, Caption, Child }
 
+        /// <summary>Set when the handler renders this table as a list of its rows.</summary>
+        public bool Layout;
+
         public readonly List<(Origin From, List<object> Items)> Headers = new(), Links = new(), Images = new();
 
         /// <summary>Set while the scan is inside this table's <c>&lt;caption&gt;</c>.</summary>
@@ -708,24 +797,20 @@ public static class HtmlMeta
         }
 
         /// <summary>
-        /// How many times the handler walks this table's cells: three for a markdown table (the
-        /// column-width pre-pass, the render and the grid), two for one rendered as a layout
-        /// list, and one for a blank linkless table, whose render returns before walking
-        /// anything (`block/table/builder.rs`).
+        /// How many times a walk that records reaches this table's cells.
         /// </summary>
-        public int Passes
-        {
-            get
-            {
-                var distinct = new HashSet<int>();
-                foreach (int c in _rowCounts) if (c > 0) distinct.Add(c);
-                bool looksLikeLayout = NestedTables > 1 || distinct.Count > 1 || (HasSpan && BorderZero);
-                bool isBlank = !HasText;
-                if (HasHeader || HasCaption) return 3;
-                if (!looksLikeLayout && !isBlank && !(_rowCounts.Count <= 2 && LinkCount >= 3)) return 3;
-                return isBlank && LinkCount == 0 ? 1 : 2;
-            }
-        }
+        /// <remarks>
+        /// The handler still walks a table up to three times — a column-width pre-pass, the
+        /// render, and the grid the structure collector wants — but since 3.11.0 only one of
+        /// those walks carries the collectors. The pre-pass detaches them (its measurement is an
+        /// internal detail and must not be visible in the result) and so does the grid walk
+        /// (which runs after the render has already recorded the same cells), leaving the render
+        /// as the single recording pass. Upstream keeps the pre-pass's handles instead when it
+        /// can reuse the pre-pass's markdown verbatim, but that requires no structure collector,
+        /// and this port's options always install one — so it is the render either way, and one
+        /// walk either way.
+        /// </remarks>
+        public int Passes => 1;
 
         /// <summary>
         /// This table's records, once per pass, in table order. The width pre-pass — which only
@@ -734,18 +819,12 @@ public static class HtmlMeta
         /// </summary>
         public List<object> Replay(List<(Origin From, List<object> Items)> segments, int passes)
         {
-            // Only the render pass walks the caption: the width pre-pass and the grid both
-            // iterate rows alone. A table blank enough that the render returns before walking
-            // anything has no render pass at all.
-            int renderPass = passes == 1 ? -1 : passes - 2;
+            // The render is the only pass that records, and it walks the caption as well as the
+            // rows, so every segment is replayed exactly `passes` times in table order.
             var result = new List<object>();
             for (int pass = 0; pass < passes; pass++)
-                foreach (var (from, items) in segments)
-                {
-                    if (from == Origin.Child && pass == 0 && passes == 3) continue;
-                    if (from == Origin.Caption && pass != renderPass) continue;
+                foreach (var (_, items) in segments)
                     result.AddRange(items);
-                }
             return result;
         }
     }
@@ -848,8 +927,12 @@ public static class HtmlMeta
             if (i >= n) break;
             int ks = i;
             while (i < n && attrs[i] != '=' && !char.IsWhiteSpace(attrs[i]) && attrs[i] != '>') i++;
-            string key = attrs[ks..i];
+            string key = HtmlWalker.TrimAttributeNameStart(attrs[ks..i]);
             if (key.Length == 0) { i++; continue; }
+            // Recorded lower-case: the parser upstream collects from stores names folded, so
+            // `<IMG ALIGN=…>` records `align`. That is only the record — the converter's own
+            // attribute lookups stay case-sensitive, which is why `<A HREF=…>` still has no href.
+            key = key.ToLowerInvariant();
             while (i < n && char.IsWhiteSpace(attrs[i])) i++;
             string value = "";
             if (i < n && attrs[i] == '=')
@@ -874,7 +957,7 @@ public static class HtmlMeta
             // Attribute values are recorded as written. The collector reads the attribute; it
             // does not resolve it, so `alt="\lambda&gt;0"` keeps its reference.
             if (canonical) value = HtmlToMarkdown.CanonicalizeAttrValue(value);
-            if (key.Equals("rel", StringComparison.OrdinalIgnoreCase))
+            if (key == "rel")
                 rel.AddRange(value.Split(' ', StringSplitOptions.RemoveEmptyEntries));
             if (!key.Equals(exclude, StringComparison.OrdinalIgnoreCase))
                 result.Add(new[] { key, value });

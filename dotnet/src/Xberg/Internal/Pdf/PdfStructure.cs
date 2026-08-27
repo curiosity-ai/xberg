@@ -28,6 +28,12 @@ public sealed class SegmentData
     public float BaselineY;
 
     /// <summary>
+    /// Heading level (1-6) the PDF structure tree assigned, or <c>null</c> when it is unknown and
+    /// must be inferred from font-size clustering.
+    /// </summary>
+    public byte? AssignedRole;
+
+    /// <summary>
     /// Text-matrix rotation the span producer reported, in degrees.
     /// </summary>
     /// <remarks>

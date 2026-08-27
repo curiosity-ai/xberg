@@ -105,4 +105,50 @@ public class RstExtractorTests
         Assert.Equal("Section", headings[1].Text);
         Assert.True(headings[0].Kind.Level < headings[1].Kind.Level);
     }
+
+    /// <summary>
+    /// A `.. figure::` is an image plus a caption. Its option block (`:target:`, `:align:`,
+    /// `:scale:`) is directive syntax, not text — without a handler it fell through to the
+    /// generic directive path and every option line was emitted as a paragraph.
+    /// </summary>
+    [Fact]
+    public void AFigureEmitsItsImageAndCaptionAndNotItsOptions()
+    {
+        var doc = Parse("Intro\n\n.. figure:: images/plot.png\n   :target: plot.html\n   :align: center\n"
+                        + "   :scale: 50%\n\n   The caption.\n\nAfter\n");
+        var paras = Paragraphs(doc);
+        Assert.Contains("[image: images/plot.png]", paras);
+        Assert.Contains("The caption.", paras);
+        Assert.DoesNotContain(paras, p => p.Contains(":target:") || p.Contains(":scale:"));
+        Assert.Contains("images/plot.png", doc.Uris.Select(u => u.Url));
+    }
+
+    /// <summary>
+    /// A `.. list-table::` is a table: each `* -` opens a row and each nested `-` adds a cell.
+    /// With no handler its rows read as a bullet list carrying the option block with them.
+    /// </summary>
+    [Fact]
+    public void AListTableBecomesATable()
+    {
+        var doc = Parse("Intro\n\n.. list-table::\n   :class: borderless\n   :width: 100%\n\n"
+                        + "   * - Name\n     - Age\n   * - Alice\n     - 30\n\nAfter\n");
+        var table = Assert.Single(doc.Tables);
+        Assert.Equal(new[] { "Name", "Age" }, table.Cells[0]);
+        Assert.Equal(new[] { "Alice", "30" }, table.Cells[1]);
+        Assert.DoesNotContain(Paragraphs(doc), p => p.Contains(":class:"));
+    }
+
+    /// <summary>
+    /// A `.. csv-table::` reads its `:header:` option as the first row, and quotes protect a
+    /// comma inside a field.
+    /// </summary>
+    [Fact]
+    public void ACsvTableReadsItsHeaderOptionAndQuotedFields()
+    {
+        var doc = Parse("Intro\n\n.. csv-table::\n   :header: \"Name\", \"Note\"\n\n"
+                        + "   \"Alice\", \"one, two\"\n\nAfter\n");
+        var table = Assert.Single(doc.Tables);
+        Assert.Equal(new[] { "Name", "Note" }, table.Cells[0]);
+        Assert.Equal(new[] { "Alice", "one, two" }, table.Cells[1]);
+    }
 }

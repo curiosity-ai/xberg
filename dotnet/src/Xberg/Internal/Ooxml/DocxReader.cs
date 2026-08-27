@@ -161,10 +161,16 @@ public static class DocxReader
         switch (el.Name.LocalName)
         {
             case "p":
+            {
                 // Drawings + page breaks open (and are recorded) before the enclosing paragraph closes.
-                EmitPreElements(el, doc, rels, pb, inTable: false);
+                uint deferred = EmitPreElements(el, doc, rels, pb, inTable: false);
                 doc.Elements.Add(new DocElement { Kind = DocElementKind.Paragraph, Paragraph = ParseParagraph(el, rels) });
+                // A break that fell after content already collected in this paragraph belongs
+                // behind the paragraph's own element, not in front of it (Rust GH#1416).
+                for (; deferred > 0; deferred--)
+                    doc.Elements.Add(new DocElement { Kind = DocElementKind.PageBreak });
                 break;
+            }
             case "tbl":
                 // Drawings inside cells open before the table closes → emitted before the Table.
                 // A page break inside a table is deferred rather than dropped: a form feed cannot
@@ -178,17 +184,51 @@ public static class DocxReader
         }
     }
 
-    private static void EmitPreElements(
+    /// <summary>
+    /// Walks a body child's subtree in document order, emitting the drawings and page breaks that
+    /// have to be recorded before the enclosing element closes. Returns the number of page breaks
+    /// that must instead be emitted straight <em>after</em> it — see <c>RecordBreak</c>.
+    /// </summary>
+    private static uint EmitPreElements(
         XElement container, DocxDocument doc, Dictionary<string, string> rels, PageBreakState pb, bool inTable)
     {
+        // Mirrors Rust's `current_run.text` / `current_paragraph.runs`: whether the paragraph has
+        // collected anything yet at the point a break is reached. A run is pushed into the
+        // paragraph when its `</w:r>` closes, whether or not it carried text, so a drawing's run
+        // counts once it has closed.
+        uint closedRuns = 0;
+        bool runHasText = false;
+        uint deferredParagraph = 0;
+
         void RecordBreak()
         {
+            // Inside a table the break is deferred to after the table element: a form feed cannot
+            // be written into the middle of a table that renders as one markdown block (GH#1419).
+            //
+            // Outside one, the paragraph currently being walked has not been pushed yet, so a
+            // break reached before any of its content correctly precedes it and can go out now.
+            // A break reached *after* content in that same paragraph must not jump ahead of the
+            // paragraph's own element, so it is deferred the same way (GH#1416).
             if (inTable) pb.PendingTableBreaks++;
+            else if (runHasText || closedRuns > 0) deferredParagraph++;
             else doc.Elements.Add(new DocElement { Kind = DocElementKind.PageBreak });
             pb.TextSinceBreak = false;
         }
 
-        foreach (var e in container.Descendants())
+        // A plain `Descendants()` sweep cannot see where a run ends, and "the paragraph has a
+        // closed run" is half of the test above; this walk is the same document order with the
+        // end tags kept.
+        void Walk(XElement node)
+        {
+            foreach (var e in node.Elements())
+            {
+                Visit(e);
+                Walk(e);
+                if (e.Name.LocalName == "r") { closedRuns++; runHasText = false; }
+            }
+        }
+
+        void Visit(XElement e)
         {
             switch (e.Name.LocalName)
             {
@@ -201,6 +241,9 @@ public static class DocxReader
 
                 // Rendered content: anything that puts glyphs on the page counts as text emitted
                 // since the last break, which is what makes a following render hint non-redundant.
+                // It is also what fills the current run, which is the other half of the
+                // has-this-paragraph-collected-anything test in `RecordBreak` — a formula is its
+                // own run rather than run text, but it leaves the paragraph non-empty just the same.
                 case "t" when e.Value.Length > 0:
                 case "tab":
                 case "noBreakHyphen":
@@ -210,6 +253,7 @@ public static class DocxReader
                 case "footnoteReference":
                 case "endnoteReference":
                     pb.TextSinceBreak = true;
+                    runHasText = true;
                     break;
                 // Legacy VML text box. `<mc:AlternateContent>` carries the same shape twice
                 // (Choice=DrawingML, Fallback=VML), so the fallback copy is dropped — the
@@ -243,8 +287,17 @@ public static class DocxReader
                 case "br" when e.Attributes().FirstOrDefault(a => a.Name.LocalName == "type")?.Value == "page":
                     RecordBreak();
                     break;
+
+                // Any other break type is a newline in the run's text, so it leaves the run
+                // non-empty even though nothing was rendered.
+                case "br":
+                    runHasText = true;
+                    break;
             }
         }
+
+        Walk(container);
+        return deferredParagraph;
     }
 
     private static DocxParagraph ParseParagraph(XElement p, Dictionary<string, string> rels)
