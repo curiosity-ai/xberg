@@ -9,6 +9,7 @@
 
 using System.Text;
 using Xberg.Internal.MathMarkup;
+using Xberg.Internal.Tables;
 using Xberg.Types;
 
 namespace Xberg.Internal.Epub;
@@ -143,6 +144,24 @@ internal static class EpubHtmlStructure
         private PreBlock? _preBlock;
         private TableAccumulator? _table;
         private bool _inListItem;
+
+        /// <summary>
+        /// Whether an <c>&lt;li&gt;</c> is open at each nesting level, innermost last.
+        /// </summary>
+        /// <remarks>
+        /// Distinct from <see cref="_inListItem"/>, which only says whether text is being buffered
+        /// right now: descending into a sublist flushes and clears that flag while the enclosing
+        /// item is still open. These survive the descent, so closing the sublist can resume
+        /// buffering into the enclosing item. This walker emits a flat node sequence, so unlike the
+        /// tree-building walker there is no node index to record alongside them.
+        /// </remarks>
+        private readonly List<bool> _listItemOpen = new();
+
+        /// <summary>
+        /// Number of <c>&lt;table&gt;</c> elements open inside the accumulated table. A nested
+        /// table is flattened into the enclosing cell instead of replacing the enclosing table.
+        /// </summary>
+        private int _nestedTableDepth;
         private readonly StringBuilder _listItemText = new();
         private DefListContext? _defList;
         private bool _inDt;
@@ -283,32 +302,55 @@ internal static class EpubHtmlStructure
                     PushNode(NodeContent.Quote());
                     break;
                 case "ul":
-                    FlushParagraph();
-                    PushNode(NodeContent.List(false));
-                    break;
                 case "ol":
+                    // Flush any pending parent <li> text before descending, so it is emitted ahead
+                    // of the sublist's own List node rather than after it. The item is flushed
+                    // before the paragraph: while an <li> is open HandleText buffers into
+                    // _listItemText, so the item is the live context and owns the pending
+                    // annotations, which FlushParagraph would otherwise discard on its way past an
+                    // empty paragraph buffer.
+                    FlushListItem();
                     FlushParagraph();
-                    PushNode(NodeContent.List(true));
+                    PushNode(NodeContent.List(tag == "ol"));
+                    _listItemOpen.Add(false);
                     break;
                 case "li":
                     FlushListItem();
                     _inListItem = true;
                     _listItemText.Clear();
+                    if (_listItemOpen.Count > 0) _listItemOpen[^1] = true;
                     break;
                 case "table":
-                    FlushParagraph();
-                    _table = new TableAccumulator();
+                    if (_table is not null)
+                    {
+                        _nestedTableDepth++;
+                        _table.PushText(" ");
+                    }
+                    else
+                    {
+                        FlushParagraph();
+                        _table = new TableAccumulator();
+                    }
                     break;
                 case "tr":
-                    _table?.OpenRow();
+                    if (_nestedTableDepth == 0) _table?.OpenRow();
                     break;
                 case "thead": case "tbody": case "tfoot":
                     break;
                 case "th": case "td":
-                    if (_table is not null)
+                    if (_nestedTableDepth > 0)
                     {
-                        uint colSpan = ParseU32(ExtractAttr(attrsStr, "colspan")) ?? 1;
-                        uint rowSpan = ParseU32(ExtractAttr(attrsStr, "rowspan")) ?? 1;
+                        _table?.PushText(" ");
+                    }
+                    else if (_table is not null)
+                    {
+                        // Clamped at parse time so an out-of-range attribute never enters the cell
+                        // metadata at all, on top of the same clamp GridFlatten applies when it
+                        // consumes these values. The bounds are the HTML Living Standard's own caps.
+                        uint colSpan = Math.Clamp(ParseU32(ExtractAttr(attrsStr, "colspan")) ?? 1,
+                                                  1u, (uint)GridFlatten.MaxColSpan);
+                        uint rowSpan = Math.Clamp(ParseU32(ExtractAttr(attrsStr, "rowspan")) ?? 1,
+                                                  1u, (uint)GridFlatten.MaxRowSpan);
                         _table.OpenCell(colSpan, rowSpan, tag == "th");
                     }
                     break;
@@ -431,7 +473,7 @@ internal static class EpubHtmlStructure
                 {
                     byte level = (byte)(tag[1] - '0');
                     if (level == 0) level = 1;
-                    string text = _textBuf.ToString().Trim();
+                    string text = NormalizeWhitespace(_textBuf.ToString()).Trim();
                     if (text.Length > 0)
                         PushHeading(level, text);
                     _textBuf.Clear();
@@ -468,9 +510,16 @@ internal static class EpubHtmlStructure
                     break;
                 case "ul": case "ol":
                     FlushListItem();
+                    if (_listItemOpen.Count > 0) _listItemOpen.RemoveAt(_listItemOpen.Count - 1);
+                    // Content can resume in the enclosing <li> after a sublist closes
+                    // (<li>before<ul>…</ul>after</li>). Without restoring the flag that text falls
+                    // through to the paragraph buffer and is emitted as a bare paragraph instead of
+                    // staying list content.
+                    _inListItem = _listItemOpen.Count > 0 && _listItemOpen[^1];
                     break;
                 case "li":
                     FlushListItem();
+                    if (_listItemOpen.Count > 0) _listItemOpen[^1] = false;
                     break;
                 case "table":
                     if (_table is not null)
@@ -647,6 +696,18 @@ internal static class EpubHtmlStructure
             _inlineStack.Clear();
         }
 
+        /// <summary>
+        /// Emit the buffered <c>&lt;li&gt;</c> text as a <c>ListItem</c> and reset the inline state
+        /// that belonged to it.
+        /// </summary>
+        /// <remarks>
+        /// The annotation buffer is cleared and the inline stack with it, for the same reason
+        /// <c>FlushParagraph</c> does both: <c>PopInline</c> measures spans against
+        /// <c>_listItemText</c>, which this method empties. Anything still referring to it after the
+        /// flush would resolve against whatever text is buffered next and annotate an unrelated node
+        /// at meaningless offsets. (This walker emits annotations for paragraphs only, so the item's
+        /// own spans are dropped rather than carried onto the node.)
+        /// </remarks>
         private void FlushListItem()
         {
             if (!_inListItem) return;
@@ -655,6 +716,8 @@ internal static class EpubHtmlStructure
             if (text.Length > 0)
                 PushNode(NodeContent.ListItem(text));
             _listItemText.Clear();
+            _annotations.Clear();
+            _inlineStack.Clear();
         }
 
         private void FlushDefinitionItem()

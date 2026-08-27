@@ -83,4 +83,25 @@ public class FictionBookExtractorTests
         Assert.Equal("n2", reference.Anchor);
         Assert.Equal("n2", definition.Anchor);
     }
+
+    /// <summary>
+    /// Upstream #859: whitespace normalization trims the trailing space off a text run, so the
+    /// joining space re-inserted between two runs lands exactly where a still-open inline element
+    /// recorded its annotation start. Left unbumped, the span swallows that space.
+    /// </summary>
+    [Fact]
+    public void AJoiningSpaceStaysOutsideAnInlineAnnotationSpan()
+    {
+        var doc = Parse("""
+            <body><section><p>Some <code>code</code></p></section></body>
+            """);
+
+        var paragraph = Assert.Single(doc.Elements.Where(e => e.Kind.Tag == ElementKindTag.Paragraph));
+        Assert.Equal("Some code", paragraph.Text);
+
+        // The <code> element opened at offset 4, where "Some" ends; the joining space then took
+        // that offset, so the annotation has to start one byte later or it covers " code".
+        var annotation = Assert.Single(paragraph.Annotations);
+        Assert.Equal("code", paragraph.Text[(int)annotation.Start..(int)annotation.End]);
+    }
 }
