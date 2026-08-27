@@ -274,6 +274,50 @@ public class PdfRotationRepairTests
         var spans = ScrambledRotatedSentence();
         Assert.Equal("Engine oil need only meet the", PdfRotationRepair.RepairRotatedPageText(spans));
     }
+
+    [Fact]
+    public void UprightRunsInARepairedPage_KeepTheirLineBreaks()
+    {
+        // The repair replaces the whole page, so an upright run inside it must still come out
+        // with the separators the page assembler would have given it — concatenating verbatim
+        // welds every line of a narrow column to the next.
+        var spans = new List<TextSpan>
+        {
+            UprightWord("Trained as an", 522, 766, 47),
+            UprightWord("illustrator but", 522, 755, 49),
+            UprightWord("working as an art", 522, 744, 61),
+            RotatedWord("Usage is obtained by payment of licensing fees.", 100, 200),
+        };
+        Assert.Equal(
+            "Trained as an\nillustrator but\nworking as an art Usage is obtained by payment of licensing fees.",
+            PdfRotationRepair.RepairRotatedPageText(spans));
+    }
+
+    [Fact]
+    public void UprightSpansSharingABaseline_AreSpacedByTheirGapNotGlued()
+    {
+        // Same row, a real word gap between them: a space, not a line break and not a weld.
+        var spans = new List<TextSpan>
+        {
+            UprightWord("MICHAEL", 380, 763, 60),
+            UprightWord("TRINSEY", 445, 763, 60),
+            RotatedWord("Usage is obtained by payment of licensing fees.", 100, 200),
+        };
+        Assert.StartsWith("MICHAEL TRINSEY", PdfRotationRepair.RepairRotatedPageText(spans));
+    }
+
+    [Fact]
+    public void UprightSpansAcrossAParagraphGap_AreSeparatedByABlankLine()
+    {
+        var spans = new List<TextSpan>
+        {
+            UprightWord("Heading of the section", 40, 700, 100),
+            UprightWord("Body text well below it", 40, 640, 100),
+            RotatedWord("Usage is obtained by payment of licensing fees.", 100, 200),
+        };
+        Assert.StartsWith("Heading of the section\n\nBody text well below it",
+            PdfRotationRepair.RepairRotatedPageText(spans));
+    }
 }
 
 /// <summary>

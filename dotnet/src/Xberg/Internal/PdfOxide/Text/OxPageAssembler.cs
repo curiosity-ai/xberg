@@ -246,11 +246,28 @@ internal static class OxPageAssembler
     /// row, is still recognised as one line. Only meaningful for spans of equal rotation;
     /// callers check that.
     /// </summary>
+    /// <remarks>
+    /// Upstream asks only for a positive box overlap, and that also holds between two
+    /// <em>consecutive</em> rows of display type: a 20.5pt glyph box on a 19.8pt line pitch
+    /// overhangs the row below by 0.7pt. On a title page the producer kerns per glyph, so every
+    /// span is a short fragment, and that hairline lets a glyph opening one row anchor to a
+    /// glyph closing the row above whenever their advance extents happen to abut — which is how
+    /// "Part 10: Transport layer and network" comes out as "Pr / art 10p / : / T ans
+    /// ortlayerandnetwo". So the boxes must overlap <em>and</em> the pair must pass the same
+    /// baseline test <see cref="SpanSeparator"/> uses to tell a continuation from a new row,
+    /// which separates the two cases with room to spare: the stacked display rows sit 19.8pt
+    /// apart against a 10.25pt bound, while a subscript that genuinely belongs to the word
+    /// before it — the "3" of "HCO3" — sits 3.3pt below a 5.0pt bound.
+    /// </remarks>
     private static bool SpansOverlapOnCrossAxis(OxTextSpan first, OxTextSpan second)
     {
         var (firstLow, firstHigh) = UprightCrossExtent(first);
         var (secondLow, secondHigh) = UprightCrossExtent(second);
-        return MathF.Min(firstHigh, secondHigh) > MathF.Max(firstLow, secondLow);
+        if (MathF.Min(firstHigh, secondHigh) <= MathF.Max(firstLow, secondLow)) return false;
+
+        float effectiveHeight = MathF.Max(
+            MathF.Max(second.Bbox.Height, first.Bbox.Height), second.FontSize * 0.5f);
+        return MathF.Abs(firstLow - secondLow) < effectiveHeight * 0.5f;
     }
 
     private static bool IsShortInlineFragment(OxTextSpan span)

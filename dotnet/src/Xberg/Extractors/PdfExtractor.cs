@@ -194,6 +194,12 @@ public sealed class PdfExtractor : IExtractor
                 Message = "PDF is encrypted and could not be decrypted with the empty password; text unavailable.",
             });
 
+        // A font whose /ToUnicode CMap is broken or missing still draws correctly, so the page
+        // yields well-formed Latin words that mean nothing. Nothing upstream can fail on that —
+        // the codes are letters — so the only place it can be caught is the finished text.
+        if (Internal.Text.UndecodedTextDetection.Diagnose(nativeText) is { } undecoded)
+            doc.ProcessingWarnings.Add(new ProcessingWarning { Source = "pdf", Message = undecoded });
+
         // The growth guard runs over the finished elements rather than the input: a PDF's own
         // byte count says nothing about how much text it decompresses to, so the total is only
         // knowable once the pages are read.
