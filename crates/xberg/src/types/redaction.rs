@@ -138,22 +138,74 @@ impl std::str::FromStr for PiiCategory {
     }
 }
 
-impl From<String> for RedactionStrategy {
-    fn from(s: String) -> Self {
-        match s.as_str() {
-            "mask" => Self::Mask,
-            "hash" => Self::Hash,
-            "token_replace" => Self::TokenReplace,
-            "drop" => Self::Drop,
-            _ => Self::Mask,
+impl TryFrom<&str> for RedactionStrategy {
+    type Error = crate::XbergError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "mask" => Ok(Self::Mask),
+            "hash" => Ok(Self::Hash),
+            "token_replace" => Ok(Self::TokenReplace),
+            "drop" => Ok(Self::Drop),
+            _ => Err(crate::XbergError::validation(format!(
+                "invalid RedactionStrategy value `{value}`; expected one of: mask, hash, token_replace, drop"
+            ))),
         }
     }
 }
 
+#[doc = "Compatibility-only infallible conversion retained through Xberg 1.x."]
+#[doc = "Unknown values default to `Mask`; input boundaries must use `TryFrom<&str>`. This conversion is scheduled for removal in 2.0."]
+impl From<String> for RedactionStrategy {
+    fn from(s: String) -> Self {
+        Self::try_from(s.as_str()).unwrap_or_default()
+    }
+}
+
+#[doc = "Compatibility-only infallible parser retained through Xberg 1.x."]
+#[doc = "Unknown values default to `Mask`; input boundaries must use `TryFrom<&str>`. This parser is scheduled for removal in 2.0."]
 impl std::str::FromStr for RedactionStrategy {
     type Err = std::convert::Infallible;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(Self::from(s.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_redaction_strategy_parsing_accepts_every_wire_value() {
+        for (value, expected) in [
+            ("mask", RedactionStrategy::Mask),
+            ("hash", RedactionStrategy::Hash),
+            ("token_replace", RedactionStrategy::TokenReplace),
+            ("drop", RedactionStrategy::Drop),
+        ] {
+            assert_eq!(
+                RedactionStrategy::try_from(value).expect("known strategies must parse"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn strict_redaction_strategy_parsing_rejects_unknown_values() {
+        let error = RedactionStrategy::try_from("erase").expect_err("unknown strategies must be rejected");
+
+        assert_eq!(
+            error.to_string(),
+            "Validation error: invalid RedactionStrategy value `erase`; expected one of: mask, hash, token_replace, drop"
+        );
+    }
+
+    #[test]
+    fn redaction_config_deserialization_rejects_unknown_strategy() {
+        let error = serde_json::from_str::<crate::RedactionConfig>(r#"{"strategy":"erase"}"#)
+            .expect_err("unknown strategies must not cross the JSON configuration boundary");
+
+        assert!(error.to_string().contains("unknown variant `erase`"));
     }
 }

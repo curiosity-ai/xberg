@@ -1,13 +1,13 @@
 <!--
 AI-RULEZ :: GENERATED FILE — DO NOT EDIT
-Content-Hash: blake3:c540cf03f9754e263644f9876f7921d8744f7e901d8eae41111c5792460f2b20
-Source-Hash: blake3:ac8bab9ae4a76e61f437af29b4a45a38326056a50769a177038927c69353edaf
+Content-Hash: blake3:99ab411a7fc9e14c081bf954bb1699cfde1fe7a0c6f1356323628c09936a5103
+Source-Hash: blake3:45cb11995592f052d075d6a24353eb8b647075dcb25f77187fcb4c161b574d49
 Schema-Version: v1
 -->
 
 # Configuration Reference
 
-Xberg uses a hierarchical configuration system supporting multiple formats and auto-discovery mechanisms. This reference covers the `ExtractionConfig` schema (xberg 1.0.0-rc.1), the config-file keys, defaults, and loading strategies.
+Xberg uses a hierarchical configuration system supporting multiple formats and auto-discovery mechanisms. This reference covers the Xberg 1.1.0 `ExtractionConfig` schema, config-file keys, defaults, and loading strategies.
 
 Every key and default below is backed by the Rust config structs in `crates/xberg/src/core/config/` (the serde field name, after any `#[serde(rename)]`, is the authoritative config-file key) and mirrored by the generated binding option dataclasses in `packages/python/xberg/options.py`.
 
@@ -94,10 +94,10 @@ max_archive_depth = 3
 | `force_ocr`                  | boolean          | `false`       | Force OCR even for searchable PDFs                                                            |
 | `force_ocr_pages`            | array of int     | unset         | Force OCR only on these 1-indexed pages (PDF only). Ignored when `force_ocr = true`          |
 | `disable_ocr`                | boolean          | `false`       | Disable OCR entirely, even for images (cannot be `true` together with `force_ocr`)           |
-| `output_format`              | string           | `"plain"`     | Content render format: `plain`, `markdown`, `djot`, `html`, `json`, `structured`             |
+| `output_format`              | string           | `"plain"`     | Content render format: `plain`, `markdown`, `djot`, `html`, `json`, `doctags`, or a registered custom renderer |
 | `result_format`              | string           | `"unified"`   | Result shape: `unified` or `element_based`                                                   |
 | `extraction_timeout_secs`    | int \| null      | `600`         | Per-file timeout in seconds for batch extraction (10 minutes). `null` disables the timeout   |
-| `max_concurrent_extractions` | int \| null      | `null`        | Max concurrent extractions (a ceiling within the thread budget). `null` = resolved thread budget = `min(num_cpus, 8)` (or the configured `concurrency.max_threads`) |
+| `max_concurrent_extractions` | int \| null      | `null`        | Optional batch ceiling. When unset, the scheduler derives document concurrency from `concurrency.max_threads`. |
 | `max_embedded_file_bytes`    | int \| null      | `52428800`    | Max uncompressed size (bytes) of a single embedded file before recursive extraction (50 MiB) |
 | `max_archive_depth`          | int              | `3`           | Max recursion depth for archive extraction. `0` disables recursive extraction               |
 | `use_layout_for_markdown`    | boolean          | `false`       | Use layout detection on the non-OCR PDF markdown path (requires `layout` set)               |
@@ -284,7 +284,6 @@ name = "balanced"
 | `chunker_type`                     | string          | `"text"`    | Chunker: `text`, `markdown`, `yaml`, `semantic`                         |
 | `preset`                           | string \| null  | `null`      | Use a preset config (overrides individual settings when set)           |
 | `sizing`                           | table \| null   | `null`      | How to measure chunk size; default `characters`. `tokenizer` requires the `chunking-tokenizers` feature |
-| `prepend_heading_context`          | boolean         | `false`     | For `markdown` chunker, prepend the heading hierarchy path to each chunk |
 | `topic_threshold`                  | float \| null   | `null`      | Cosine similarity threshold for `semantic` chunker (effective default 0.75) |
 | `table_chunking`                   | string          | `"split"`   | Oversized markdown tables: `split` or `repeat_header`                   |
 | `embedding`                        | table \| null   | `null`      | Embedding configuration (see below)                                    |

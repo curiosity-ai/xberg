@@ -359,9 +359,18 @@ async fn test_corrupted_archive() {
     corrupted_tar[0..5].copy_from_slice(b"file\0");
 
     let result = extract_bytes_document(&corrupted_tar, "application/x-tar", &config).await;
+    // The `tar` crate's checksum field (header bytes 148..156) is all `0xFF`, which is not
+    // valid UTF-8, so `Header::cksum` fails to parse it before the sum comparison ever runs;
+    // `extract_tar_metadata` (crates/xberg/src/extraction/archive/tar.rs) maps that into a
+    // `XbergError::Parsing` naming the failed TAR entry read.
+    let error = result.expect_err("a checksum field that is not valid UTF-8 cannot be parsed");
     assert!(
-        result.is_ok() || result.is_err(),
-        "Should handle corrupted TAR gracefully"
+        matches!(error, xberg::XbergError::Parsing { .. }),
+        "expected a Parsing error, got: {error:?}"
+    );
+    assert!(
+        error.to_string().contains("TAR"),
+        "error must name the TAR parse failure, got: {error}"
     );
 }
 

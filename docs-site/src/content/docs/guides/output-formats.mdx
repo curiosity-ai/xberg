@@ -3,19 +3,7 @@ title: "Output Formats"
 ---
 
 import { Tabs, TabItem } from "@astrojs/starlight/components";
-import { Content as Snip_python_config_element_based_output } from "../../../snippets/python/config/element_based_output.md";
-import { Content as Snip_typescript_config_element_based_output } from "../../../snippets/typescript/config/element_based_output.md";
-import { Content as Snip_rust_config_element_based_output } from "../../../snippets/rust/config/element_based_output.md";
-import { Content as Snip_go_config_element_based_output } from "../../../snippets/go/config/element_based_output.md";
-import { Content as Snip_ruby_config_element_based_output } from "../../../snippets/ruby/config/element_based_output.md";
-import { Content as Snip_php_config_element_based_output } from "../../../snippets/php/config/element_based_output.md";
-import { Content as Snip_python_config_document_structure_config } from "../../../snippets/python/config/document_structure_config.md";
-import { Content as Snip_typescript_config_document_structure_config } from "../../../snippets/typescript/config/document_structure_config.md";
-import { Content as Snip_rust_config_document_structure_config } from "../../../snippets/rust/config/document_structure_config.md";
-import { Content as Snip_go_config_document_structure_config } from "../../../snippets/go/config/document_structure_config.md";
-import { Content as Snip_java_config_document_structure_config } from "../../../snippets/java/config/document_structure_config.md";
-import { Content as Snip_csharp_config_document_structure_config } from "../../../snippets/csharp/config/document_structure_config.md";
-import { Content as Snip_ruby_config_document_structure_config } from "../../../snippets/ruby/config/document_structure_config.md";
+import ApiSnippetGroup from "../../../components/ApiSnippetGroup.astro";
 import { Content as Snip_python_config_pdf_hierarchy_config } from "../../../snippets/python/config/pdf_hierarchy_config.md";
 import { Content as Snip_typescript_config_pdf_hierarchy_config } from "../../../snippets/typescript/config/pdf_hierarchy_config.md";
 import { Content as Snip_rust_config_pdf_hierarchy_config } from "../../../snippets/rust/config/pdf_hierarchy_config.md";
@@ -28,7 +16,7 @@ Choose the format that matches your downstream processing. See the [Configuratio
 
 ## Available Formats
 
-- **Content Format** — `output_format` controls the `content` field: Plain, Markdown, Djot, HTML, JSON, Structured, [DocTags](/guides/doctags-output/), [DOT](/guides/diagram-dot-output/), or a custom renderer
+- **Content Format** — `output_format` controls the `content` field: Plain, Markdown, Djot, HTML, JSON, [DocTags](/guides/doctags-output/), or a registered custom renderer such as [DOT](/guides/diagram-dot-output/)
 - **Unified (default)** — Plain text/Markdown, for LLM prompts and full-text search
 - **Element-Based** — Flat array of typed elements with metadata, for RAG chunking and semantic search
 - **Document Structure** — Hierarchical tree with explicit parent-child references, for knowledge graphs and structured apps
@@ -102,7 +90,14 @@ table_anchors = true
 
 ## Content Output Format
 
-`output_format` sets the format of the `content` field. It is independent of `result_format` (element-based / document structure) and applies to every extraction.
+`output_format` sets the format of the `content` field. It is independent of `result_format` (element-based / document structure). For OCR-backed scanned PDFs, non-`Plain` formats invoke the same geometry-derived structure heuristic (headings, lists) as native PDF extraction — but invoking it is not the same as it succeeding, and how much it recovers depends on the OCR backend. Measured on a 16-page scanned reference fixture with no layout detection, Tesseract promoted both headings and list items, Sceptre promoted few, and PaddleOCR promoted no headings at all. Enabling optional ML layout detection raises heading counts on every backend, but lowers list-item accuracy against ground truth. `output_format != Plain` is necessary but not always sufficient for structured OCR output.
+
+**Structure contract.** `output_format = Plain` skips the structure heuristic entirely and returns raw
+text. Any other `output_format` always runs the heuristic; when layout detection is also enabled, its
+detections are layered on top. Layout detection is off by default, and `Plain` is the default
+`output_format`. The two are not currently linked: enabling layout detection while `output_format`
+stays `Plain` still runs the layout model, but its result is computed and then discarded rather than
+forcing a non-`Plain` output.
 
 | `OutputFormat`    | Description                                                              |
 | ----------------- | ----------------------------------------------------------------------- |
@@ -111,7 +106,6 @@ table_anchors = true
 | `Djot`            | Djot markup                                                            |
 | `Html`            | HTML-formatted content                                                  |
 | `Json`            | JSON tree with heading-driven sections                                  |
-| `Structured`      | Currently identical to `Plain` text (no OCR element data, bounding boxes, or confidence scores); only the `metadata.output_format` label differs. HTML sources are routed through Markdown conversion first, so they come out as Markdown-flavored text |
 | `DocTags`         | Docling DocTags tag-stream format (tables as OTSL). See [DocTags Output](/guides/doctags-output/) |
 | `dot`             | Graphviz DOT for a diagram recovered from a vector SVG or PDF source; empty string when no diagram was recovered. See [Diagram DOT Output](/guides/diagram-dot-output/) |
 | `Custom(name)`    | Output from a renderer registered in the `RendererRegistry` (e.g. `docx`, `latex`) |
@@ -139,9 +133,9 @@ By default, images are returned in their native format (JPEG from PDFs, PNG from
 | `Jpeg` | `1`–`100` | Web/cloud storage | Default quality `85`. Lossy; good balance of size and quality. |
 | `Webp` | `1`–`100` | Modern web use | Default quality `80`. Better compression than JPEG; requires browser support. |
 | `Heif` | `1`–`100` | Apple ecosystem | Default quality `80`. Requires `heic` feature. Superior compression ratio vs JPEG/WebP. |
-| `Svg` | — | Archival of vector images | (v5+) Lossless vector output. Raster sources return a warning; not auto-vectorized. Requires `svg` feature. |
+| `Svg` | — | Archival of vector images | Lossless vector output. Raster sources return a warning; not auto-vectorized. Requires `svg` feature. |
 
-### SVG Support (v5+)
+### SVG Support
 
 When the `svg` feature is active and `output_format` is set to `Svg`:
 
@@ -197,7 +191,7 @@ let config = ExtractionConfig {
 </TabItem>
 </Tabs>
 
-### SVG Sanitization (v5+)
+### SVG Sanitization
 
 Enable or disable SVG security filtering:
 
@@ -245,38 +239,7 @@ Use for RAG chunking, semantic search, or Unstructured.io-compatible pipelines.
 
 ### Enable
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
-
-<Snip_python_config_element_based_output />
-
-</TabItem>
-<TabItem label="TypeScript">
-
-<Snip_typescript_config_element_based_output />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_config_element_based_output />
-
-</TabItem>
-<TabItem label="Go">
-
-<Snip_go_config_element_based_output />
-
-</TabItem>
-<TabItem label="Ruby">
-
-<Snip_ruby_config_element_based_output />
-
-</TabItem>
-<TabItem label="PHP">
-
-<Snip_php_config_element_based_output />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="contract/config_element_types" />
 
 Elements are in `result.elements`. Each element has `element_id`, `element_type`, `text`, and `metadata`.
 
@@ -372,43 +335,7 @@ Use when you need hierarchical relationships between sections.
 
 ### Enable
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
-
-<Snip_python_config_document_structure_config />
-
-</TabItem>
-<TabItem label="TypeScript">
-
-<Snip_typescript_config_document_structure_config />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_config_document_structure_config />
-
-</TabItem>
-<TabItem label="Go">
-
-<Snip_go_config_document_structure_config />
-
-</TabItem>
-<TabItem label="Java">
-
-<Snip_java_config_document_structure_config />
-
-</TabItem>
-<TabItem label="C#">
-
-<Snip_csharp_config_document_structure_config />
-
-</TabItem>
-<TabItem label="Ruby">
-
-<Snip_ruby_config_document_structure_config />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="contract/config_document_structure_with_headings" />
 
 ### Node Shape
 
@@ -631,7 +558,11 @@ Requires an OCR backend to be configured separately.
 
 ### Troubleshooting
 
-- **`hierarchy` is `None`** — Check `hierarchy.enabled` is `True`. If the PDF is image-only, enable OCR. If fewer text blocks than `k_clusters`, reduce `k_clusters`.
+- **`hierarchy` is `None`** — Check `hierarchy.enabled` is `True`. This field is only populated by the
+  native PDF text-tree pipeline; it stays `None` for OCR-backed (image-only) pages regardless of
+  whether OCR is enabled — enabling OCR does not populate `hierarchy`. If fewer text blocks than
+  `k_clusters`, reduce `k_clusters`. For structured output from a scanned PDF, use `output_format`
+  (e.g. `markdown`) instead of relying on `hierarchy`.
 - **Most blocks classified as `body`** — Document may use uniform font sizes. Reduce `k_clusters` (try 3–4).
 - **Heading levels don't match visual inspection** — Levels are assigned by font size rank, not absolute size. Filter on `block.font_size` directly for absolute thresholds.
 

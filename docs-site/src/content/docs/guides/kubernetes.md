@@ -3,14 +3,14 @@ title: "Kubernetes Deployment"
 description: "Deploy the Xberg extraction server on Kubernetes with the official Helm chart."
 ---
 
-Deploy the Xberg REST API server (`xberg serve`) on Kubernetes with the official Helm chart. The chart is a single-service deployment — one stateless workload plus an optional cache, ingress, and autoscaler. For a managed, multi-tenant platform with a work queue, observability, and billing, see [Xberg Enterprise](https://github.com/xberg-io/xberg-enterprise).
+Deploy the Xberg REST API server (`xberg serve`) on Kubernetes with the official Helm chart. The chart is a single-service deployment — one stateless workload plus an optional cache, ingress, and autoscaler. For a distributed, governed platform with team support, see [Xberg Enterprise](https://xberg.io).
 
 ## Install
 
 The chart is published as an OCI artifact to GitHub Container Registry:
 
 ```bash title="Terminal"
-helm install xberg oci://ghcr.io/xberg-io/charts/xberg --version 1.0.0-rc.25
+helm install xberg oci://ghcr.io/xberg-io/charts/xberg --version 1.0.14
 ```
 
 This runs the full image (`ghcr.io/xberg-io/xberg`) in API-server mode on port 8000, exposed through a ClusterIP `Service` on port 80.
@@ -23,7 +23,7 @@ Every published chart is signed with [cosign](https://docs.sigstore.dev/) using 
 
 ```bash title="Terminal"
 cosign verify \
-  ghcr.io/xberg-io/charts/xberg:1.0.0-rc.25 \
+  ghcr.io/xberg-io/charts/xberg:1.0.14 \
   --certificate-identity-regexp '^https://github.com/xberg-io/xberg/.github/workflows/publish-helm.yaml@.*$' \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -74,7 +74,7 @@ autoscaling:
 
 ```bash title="Terminal"
 helm install xberg oci://ghcr.io/xberg-io/charts/xberg \
-  --version 1.0.0-rc.25 \
+  --version 1.0.14 \
   -f values.yaml
 ```
 
@@ -89,7 +89,7 @@ A `ReadWriteOnce` volume can only attach to one node, so the chart defaults to `
 ## Upgrade and uninstall
 
 ```bash title="Terminal"
-helm upgrade xberg oci://ghcr.io/xberg-io/charts/xberg --version 1.0.0-rc.25 -f values.yaml
+helm upgrade xberg oci://ghcr.io/xberg-io/charts/xberg --version 1.0.14 -f values.yaml
 helm uninstall xberg
 ```
 

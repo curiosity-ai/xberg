@@ -4,7 +4,7 @@
 //! Run after each substantial change to measure improvement or regression.
 //!
 //! Usage:
-//!   # Non-OCR tests (fast, oxide path):
+//!   # Non-OCR tests (fast, native path):
 //!   cargo test -p xberg --features "pdf" --test pdf_table_ground_truth -- --nocapture
 //!
 //!   # Full tests including table detection (needs ocr feature for HocrWord):
@@ -40,7 +40,7 @@ fn word_similarity(a: &str, b: &str) -> f64 {
     intersection as f64 / union as f64
 }
 
-/// Extract markdown from a PDF file (oxide path, no OCR).
+/// Extract markdown from a PDF file (native path, no OCR).
 fn extract_markdown(relative_path: &str) -> Option<xberg::types::ExtractedDocument> {
     let path = get_test_file_path(relative_path);
     if !path.exists() {

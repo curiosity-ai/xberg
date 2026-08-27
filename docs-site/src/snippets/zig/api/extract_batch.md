@@ -3,14 +3,16 @@ const std = @import("std");
 const xberg = @import("xberg");
 
 pub fn main() !void {
-    const inputs_json =
-        "["
-        ++ "{\"kind\":\"uri\",\"uri\":\"document.pdf\"},"
-        ++ "{\"kind\":\"bytes\",\"bytes\":[72,101,108,108,111],"
-        ++ "\"mime_type\":\"text/plain\",\"filename\":\"note.txt\"}"
-        ++ "]";
-
-    const output_json = try xberg.extract_batch(inputs_json, "{}");
+    const inputs =
+        \\[{
+        \\  "kind": "uri",
+        \\  "uri": "report.pdf"
+        \\}, {
+        \\  "kind": "uri",
+        \\  "uri": "notes.txt"
+        \\}]
+    ;
+    const output_json = try xberg.extract_batch(inputs, "{}");
     defer std.heap.c_allocator.free(output_json);
 
     std.debug.print("{s}\n", .{output_json});

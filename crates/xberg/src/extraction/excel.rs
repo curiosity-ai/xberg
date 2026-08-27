@@ -20,7 +20,7 @@
 //! use xberg::extraction::excel::read_excel_file;
 //!
 //! # fn example() -> xberg::Result<()> {
-//! let (workbook, _warnings) = read_excel_file("data.xlsx")?;
+//! let (workbook, _warnings) = read_excel_file("data.xlsx", &Default::default())?;
 //!
 //! println!("Sheet count: {}", workbook.sheets.len());
 //! for sheet in &workbook.sheets {
@@ -38,6 +38,7 @@ use std::path::Path;
 use crate::core::diagnostics::push_warning;
 use crate::error::{Result, XbergError};
 use crate::extraction::capacity;
+use crate::extractors::security::SecurityLimits;
 use crate::types::revisions::{DocumentRevision, RevisionDelta, RevisionKind};
 use crate::types::{ExcelSheet, ExcelWorkbook, ProcessingWarning};
 
@@ -55,6 +56,21 @@ const MAX_BOUNDING_BOX_CELLS: u64 = 100_000_000;
 /// user-configurable limit.
 const MAX_METADATA_ENTRIES_PER_SHEET: usize = 200;
 
+/// Maximum bytes read from a single auxiliary ZIP member inside an XLSX/XLSM/XLTM
+/// archive (`xl/revisions/revisionHeaders.xml`, `xl/comments*.xml`).
+///
+/// The pinned `zip` crate (`zip-2.4.2/src/read.rs:444`) wraps a decompressed entry as
+/// `Crc32Reader::new(Decompressor::new(..), crc32, ..)` with no `Take` on the
+/// decompressed side -- only the *compressed* stream is bounded, and the CRC is
+/// verified at EOF, i.e. after the whole entry is already in memory. `validate_zip_container`
+/// (above) only inspects the central directory's *declared* entry count, aggregate size, and
+/// compression ratio, so nothing there bounds what a single crafted member actually expands to
+/// when read.
+/// Bounding every `read_to_end` call with `Read::take` (the same pattern as
+/// `docx::MAX_UNCOMPRESSED_FILE_SIZE` and `hwpx::MAX_HWPX_MEMBER_SIZE`) is what actually
+/// caps memory here.
+const MAX_EXCEL_ZIP_MEMBER_SIZE: u64 = 100 * 1024 * 1024;
+
 #[cfg(feature = "office")]
 use crate::extraction::office_metadata::{
     app_properties::{DOC_SECURITY_KEY, decode_doc_security_flags},
@@ -70,9 +86,64 @@ use serde_json::Value;
 /// `core::diagnostics` for the warning convention this follows.
 pub(crate) type ExcelReadResult = (ExcelWorkbook, Vec<ProcessingWarning>);
 
-pub(crate) fn read_excel_file(file_path: &str) -> Result<ExcelReadResult> {
+/// Reject a ZIP-backed spreadsheet (XLSX/XLSM/XLTM/XLAM/XLSB/ODS) whose ZIP central
+/// directory declares more entries than the caller's configured
+/// `SecurityLimits::max_files_in_archive`, or whose declared aggregate uncompressed
+/// size or compression ratio exceeds `SecurityLimits::max_archive_size` /
+/// `max_compression_ratio` (`ZipBombValidator`).
+///
+/// `calamine::Xlsx`/`Xlsb`/`Ods` own the `zip::ZipArchive` internally end-to-end
+/// (`Reader::new` opens it and immediately reads workbook/style/shared-string parts
+/// before returning) and never expose the archive, an entry count, or per-entry
+/// sizes, so none of these limits can be enforced from inside calamine's read path.
+/// This reads the archive's central directory once, ahead of the calamine open,
+/// purely to enforce them — parsing the central directory does not decompress any
+/// entry, so this is not "after the bomb has already been expanded." Errors out
+/// rather than truncating, matching the DOCX/PPTX top-level containers
+/// (`extraction::docx::parser::validate_archive_security`,
+/// `extraction::pptx::container::check_entry_count` +
+/// `extractors::security::ZipBombValidator`): a workbook depends on specific named
+/// parts (`xl/workbook.xml`, `xl/_rels/workbook.xml.rels`, per-sheet XML) that cannot
+/// survive an arbitrary truncation of the ZIP's central directory.
+///
+/// The entry-count check runs first and keeps its own specific error message
+/// (existing tests assert on it); `ZipBombValidator::validate` also re-checks entry
+/// count using the same `limits.max_files_in_archive`, which is a no-op here since
+/// the explicit check above already returned on that condition, but keeps this
+/// function equivalent to calling the validator directly.
+///
+/// Silently returns `Ok(())` when `reader` is not a readable ZIP at all (e.g. a legacy
+/// `.xls`/`.xla` OLE2 file misrouted here) — the subsequent calamine open then reports a
+/// format error with clearer context than this pre-check could.
+#[cfg(feature = "excel")]
+fn validate_zip_container<R: Read + Seek>(reader: R, limits: &SecurityLimits) -> Result<()> {
+    let mut archive = match zip::ZipArchive::new(reader) {
+        Ok(archive) => archive,
+        Err(_) => return Ok(()),
+    };
+    if archive.len() > limits.max_files_in_archive {
+        return Err(XbergError::validation(format!(
+            "Spreadsheet ZIP archive declares {} entries, which exceeds the configured limit of {} \
+             (SecurityLimits::max_files_in_archive); reduce the archive's entry count or raise the limit",
+            archive.len(),
+            limits.max_files_in_archive
+        )));
+    }
+    crate::extractors::security::ZipBombValidator::new(limits.clone()).validate(&mut archive)?;
+    Ok(())
+}
+
+pub(crate) fn read_excel_file(file_path: &str, limits: &SecurityLimits) -> Result<ExcelReadResult> {
     let lower_path = file_path.to_lowercase();
     let mut warnings: Vec<ProcessingWarning> = Vec::new();
+
+    #[cfg(feature = "excel")]
+    {
+        let check_file = std::fs::File::open(file_path)?;
+        validate_zip_container(std::io::BufReader::new(check_file), limits)?;
+    }
+    #[cfg(not(feature = "excel"))]
+    let _ = limits;
 
     #[cfg(feature = "office")]
     let office_metadata = if lower_path.ends_with(".xlsx")
@@ -179,8 +250,13 @@ pub(crate) fn read_excel_file(file_path: &str) -> Result<ExcelReadResult> {
     Ok((result, warnings))
 }
 
-pub(crate) fn read_excel_bytes(data: &[u8], file_extension: &str) -> Result<ExcelReadResult> {
+pub(crate) fn read_excel_bytes(data: &[u8], file_extension: &str, limits: &SecurityLimits) -> Result<ExcelReadResult> {
     let mut warnings: Vec<ProcessingWarning> = Vec::new();
+
+    #[cfg(feature = "excel")]
+    validate_zip_container(Cursor::new(data), limits)?;
+    #[cfg(not(feature = "excel"))]
+    let _ = limits;
 
     #[cfg(feature = "office")]
     let office_metadata = match file_extension.to_lowercase().as_str() {
@@ -1268,7 +1344,7 @@ fn extract_xlsx_revisions_from_archive<R: Read + Seek>(
     const HEADERS_PATH: &str = "xl/revisions/revisionHeaders.xml";
 
     let xml_bytes = {
-        let mut entry = match archive.by_name(HEADERS_PATH) {
+        let entry = match archive.by_name(HEADERS_PATH) {
             Ok(e) => e,
             Err(zip::result::ZipError::FileNotFound) => return None,
             Err(e) => {
@@ -1281,7 +1357,7 @@ fn extract_xlsx_revisions_from_archive<R: Read + Seek>(
             }
         };
         let mut buf = Vec::new();
-        if entry.read_to_end(&mut buf).is_err() {
+        if entry.take(MAX_EXCEL_ZIP_MEMBER_SIZE).read_to_end(&mut buf).is_err() {
             return None;
         }
         buf
@@ -1388,12 +1464,12 @@ fn extract_xlsx_comments_from_archive<R: Read + Seek>(archive: &mut zip::ZipArch
     let mut entries = Vec::new();
     for part in comment_parts {
         let xml_bytes = {
-            let mut entry = match archive.by_name(&part) {
+            let entry = match archive.by_name(&part) {
                 Ok(e) => e,
                 Err(_) => continue,
             };
             let mut buf = Vec::new();
-            if entry.read_to_end(&mut buf).is_err() {
+            if entry.take(MAX_EXCEL_ZIP_MEMBER_SIZE).read_to_end(&mut buf).is_err() {
                 continue;
             }
             buf
@@ -1449,6 +1525,16 @@ fn parse_comments_xml(xml_bytes: &[u8]) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
+    /// Permissive `SecurityLimits` for tests that only care about the entry-count
+    /// ceiling and want the default ratio/size limits (which any small test fixture
+    /// passes comfortably).
+    fn test_limits(max_files_in_archive: usize) -> SecurityLimits {
+        SecurityLimits {
+            max_files_in_archive,
+            ..Default::default()
+        }
+    }
+
     /// Regression test for #102: office metadata was computed only for the OOXML
     /// spreadsheet extensions, so an `.ods` reached `ExcelWorkbook` with an empty
     /// metadata map — no title, no author, no dates — even though ODT and ODP read
@@ -1466,7 +1552,8 @@ mod tests {
         }
         let bytes = std::fs::read(&path).expect("read fixture");
 
-        let (workbook, _warnings) = read_excel_bytes(&bytes, ".ods").expect("ODS extraction should succeed");
+        let (workbook, _warnings) =
+            read_excel_bytes(&bytes, ".ods", &test_limits(10_000)).expect("ODS extraction should succeed");
 
         assert_eq!(
             workbook.metadata.get("creator").map(String::as_str),
@@ -2081,13 +2168,55 @@ mod tests {
             "2024-03-01T12:00:00Z",
         )]);
 
-        let (workbook, _warnings) = read_excel_bytes(&xlsx, ".xlsx").expect("should parse workbook");
+        let (workbook, _warnings) =
+            read_excel_bytes(&xlsx, ".xlsx", &test_limits(10_000)).expect("should parse workbook");
         let revisions = workbook
             .revisions
             .as_ref()
             .expect("revisions should be Some after full extraction");
         assert_eq!(revisions.len(), 1);
         assert_eq!(revisions[0].author.as_deref(), Some("Carol"));
+    }
+
+    /// `validate_zip_container` only inspects *declared* entry count/size/ratio from the
+    /// central directory; it never inspects a member's actual decompressed bytes, so
+    /// nothing before `extract_xlsx_revisions_from_archive` bounds a single member's
+    /// *actual* decompressed length. This pads `xl/revisions/revisionHeaders.xml` with
+    /// an XML comment past `MAX_EXCEL_ZIP_MEMBER_SIZE`, followed by a real `<header>`
+    /// element. Without `Read::take(MAX_EXCEL_ZIP_MEMBER_SIZE)` on the entry read, the
+    /// whole member is read, the comment closes, and the trailing `<header>` parses
+    /// into `Some(vec![..])`. With the cap, the read is truncated mid-comment, the XML
+    /// is no longer well-formed, and `roxmltree::Document::parse` fails, so the
+    /// function returns `None`.
+    #[test]
+    fn test_revisions_read_is_bounded_for_oversized_member() {
+        let padding_len = MAX_EXCEL_ZIP_MEMBER_SIZE as usize + 4096;
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <headers xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\n<!--",
+        );
+        xml.push_str(&"x".repeat(padding_len));
+        xml.push_str(
+            "-->\n<header guid=\"{DEADBEEF-0000-0000-0000-000000000099}\" \
+             dateTime=\"2024-01-01T00:00:00Z\" userName=\"Late\" maxSheetId=\"1\"/>\n</headers>",
+        );
+
+        let mut buffer = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buffer));
+            let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("xl/revisions/revisionHeaders.xml", opts).unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let result = extract_xlsx_revisions_from_bytes(&buffer);
+        assert!(
+            result.is_none(),
+            "a header sitting after MAX_EXCEL_ZIP_MEMBER_SIZE must never be reached; an \
+             unbounded read would find it and return Some(..) instead of None, got {result:?}"
+        );
     }
 
     /// Build a minimal in-memory `.xlsx` zip from a caller-supplied `<workbook>`
@@ -2183,8 +2312,8 @@ mod tests {
             &[("xl/worksheets/sheet1.xml", sheet1_xml.to_vec())],
         );
 
-        let (workbook, warnings) =
-            read_excel_bytes(&bytes, ".xlsx").expect("a workbook with one missing sheet part must still parse");
+        let (workbook, warnings) = read_excel_bytes(&bytes, ".xlsx", &test_limits(10_000))
+            .expect("a workbook with one missing sheet part must still parse");
 
         assert_eq!(workbook.sheets.len(), 1, "only the readable sheet must be kept");
         assert_eq!(workbook.sheets[0].name, "Good");
@@ -2223,7 +2352,8 @@ mod tests {
             &[("xl/worksheets/sheet1.xml", sheet1_xml.to_vec())],
         );
 
-        let (workbook, warnings) = read_excel_bytes(&bytes, ".xlsx").expect("workbook must parse");
+        let (workbook, warnings) =
+            read_excel_bytes(&bytes, ".xlsx", &test_limits(10_000)).expect("workbook must parse");
 
         assert_eq!(workbook.sheets.len(), 1);
         assert!(
@@ -2305,7 +2435,8 @@ mod tests {
             ],
         );
 
-        let (workbook, _warnings) = read_excel_bytes(&bytes, ".xlsx").expect("workbook must parse");
+        let (workbook, _warnings) =
+            read_excel_bytes(&bytes, ".xlsx", &test_limits(10_000)).expect("workbook must parse");
 
         assert_eq!(workbook.sheets.len(), 2, "hidden sheet content must still be extracted");
         assert_eq!(
@@ -2338,7 +2469,8 @@ mod tests {
             &[("xl/worksheets/sheet1.xml", sheet1_xml.to_vec())],
         );
 
-        let (workbook, _warnings) = read_excel_bytes(&bytes, ".xlsx").expect("workbook must parse");
+        let (workbook, _warnings) =
+            read_excel_bytes(&bytes, ".xlsx", &test_limits(10_000)).expect("workbook must parse");
 
         assert_eq!(
             workbook.metadata.get("formulas_Calc").map(String::as_str),
@@ -2374,7 +2506,8 @@ mod tests {
             ],
         );
 
-        let (workbook, _warnings) = read_excel_bytes(&bytes, ".xlsx").expect("workbook must parse");
+        let (workbook, _warnings) =
+            read_excel_bytes(&bytes, ".xlsx", &test_limits(10_000)).expect("workbook must parse");
 
         assert_eq!(
             workbook.metadata.get("hyperlinks_Links").map(String::as_str),
@@ -2397,7 +2530,8 @@ mod tests {
             &[("xl/worksheets/sheet1.xml", sheet1_xml.to_vec())],
         );
 
-        let (workbook, _warnings) = read_excel_bytes(&bytes, ".xlsx").expect("workbook must parse");
+        let (workbook, _warnings) =
+            read_excel_bytes(&bytes, ".xlsx", &test_limits(10_000)).expect("workbook must parse");
 
         assert_eq!(
             workbook.metadata.get("defined_names").map(String::as_str),
@@ -2447,11 +2581,52 @@ mod tests {
             ],
         );
 
-        let (workbook, _warnings) = read_excel_bytes(&bytes, ".xlsx").expect("workbook must parse");
+        let (workbook, _warnings) =
+            read_excel_bytes(&bytes, ".xlsx", &test_limits(10_000)).expect("workbook must parse");
 
         assert_eq!(
             workbook.metadata.get("comments").map(String::as_str),
             Some("A1: Check this")
+        );
+    }
+
+    /// Sibling of `test_revisions_read_is_bounded_for_oversized_member` for the
+    /// `xl/comments*.xml` read path. `extract_xlsx_comments_from_archive` only lists
+    /// entry names before reading -- it never looks at declared sizes -- so a single
+    /// `xl/comments1.xml` member is the only thing that can bound its own decompressed
+    /// length. The comment element sits after a `MAX_EXCEL_ZIP_MEMBER_SIZE`-sized XML
+    /// comment: without `Read::take` on the entry, the whole member is read and the
+    /// comment text is found; with the cap, the read truncates mid-comment, parsing
+    /// fails, and the part contributes nothing.
+    #[test]
+    fn test_comments_read_is_bounded_for_oversized_member() {
+        let padding_len = MAX_EXCEL_ZIP_MEMBER_SIZE as usize + 4096;
+        let mut xml = String::from(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <comments xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">\n\
+             <authors><author>Alice</author></authors>\n<commentList>\n<!--",
+        );
+        xml.push_str(&"x".repeat(padding_len));
+        xml.push_str(
+            "-->\n<comment ref=\"Z99\" authorId=\"0\"><text><r><t>Late comment</t></r></text></comment>\n\
+             </commentList>\n</comments>",
+        );
+
+        let mut buffer = Vec::new();
+        {
+            use std::io::Write as _;
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buffer));
+            let opts = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("xl/comments1.xml", opts).unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+
+        let result = extract_xlsx_comments_from_bytes(&buffer);
+        assert!(
+            result.is_none(),
+            "a comment sitting after MAX_EXCEL_ZIP_MEMBER_SIZE must never be reached; an \
+             unbounded read would find 'Late comment' and return Some(..) instead of None, got {result:?}"
         );
     }
 

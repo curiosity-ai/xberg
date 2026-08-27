@@ -4,7 +4,6 @@
 //! Cohere `rerank-english-v3.0`, Jina, Voyage) and returns scored documents
 //! via the liter-llm client.
 //!
-//! Since v5.0.0.
 
 #[cfg(feature = "reranker")]
 use liter_llm::{LlmClient, RerankDocument, RerankRequest};
@@ -36,7 +35,6 @@ use crate::reranking::RerankedDocument;
 /// - `XbergError::Reranking` if the API call fails or returns unexpected data.
 /// - `XbergError::MissingDependency` if the liter-llm client cannot be created.
 ///
-/// Since v5.0.0.
 #[cfg(feature = "reranker")]
 pub(crate) async fn rerank_via_llm(
     query: &str,

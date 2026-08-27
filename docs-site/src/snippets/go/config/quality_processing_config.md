@@ -8,10 +8,11 @@ import (
 )
 
 func main() {
+	enableQualityProcessing := true // Default
 	config := &xberg.ExtractionConfig{
-		EnableQualityProcessing: true,  // Default
+		EnableQualityProcessing: &enableQualityProcessing,
 	}
 
-	fmt.Printf("Quality processing enabled: %v\n", config.EnableQualityProcessing)
+	fmt.Printf("Quality processing enabled: %v\n", *config.EnableQualityProcessing)
 }
 ```

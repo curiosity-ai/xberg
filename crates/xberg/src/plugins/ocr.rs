@@ -27,6 +27,107 @@ pub enum OcrBackendType {
     Custom,
 }
 
+/// How a backend's reported page-level confidence must be interpreted.
+///
+/// Backend confidence scores are not interchangeable. Tesseract's mean word confidence is a
+/// classifier score validated to track legibility on a 0-100 scale. Sceptre (EasyOCR-based)
+/// reports a length-penalised `custom_mean` that is rescaled into the same 0-100 range but is
+/// *not* comparable — its ordering can be inverted relative to legibility (a dense prose page
+/// can score lower than a nearly-blank one). A page-rejection gate calibrated on Tesseract's
+/// scale was once applied unconditionally to sceptre's output and rejected every page of a
+/// 16-page document, emptying it. This descriptor exists so gating code can ask a backend what
+/// its number means instead of assuming.
+// `Default` is `Uncalibrated`, matching `OcrBackend::confidence_semantics`'s trait default
+// exactly. It reinforces that invariant rather than competing with it: the one value it is
+// never safe to fall back to is `Legibility`, which would let an undeclared backend inherit
+// Tesseract's gate threshold. `serde` and `Default` are required because the `Legibility`
+// variant carries a payload. The payload is NOT what forces the JSON marshalling, though: the
+// generated bridge marshals every trait method's return value that way, which is why the
+// unit-only `PageOrientationHandling` below needs exactly the same derives. ~keep
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Deserialize, serde::Serialize)]
+pub enum ConfidenceSemantics {
+    /// Validated to track legibility on a known scale — usable as an absolute quality gate.
+    Legibility {
+        /// The upper bound of the reported confidence scale (e.g. `100.0` for Tesseract).
+        scale_max: f64,
+    },
+    /// A number is reported, but it is not validated to correlate with legibility.
+    /// Never gate on it.
+    #[default]
+    Uncalibrated,
+    /// No page-level confidence is reported at all.
+    None,
+}
+
+/// How a backend copes with a page raster whose text is not upright.
+///
+/// Rotated-page handling is a backend capability, not a universal guarantee. An A/B run this
+/// session against `/Rotate 270` scanned pages showed the three handled cases genuinely differ:
+/// Tesseract reconstructs correct reading order on a sideways raster outright; PaddleOCR
+/// recognises the rotated text correctly (it warps each detected quad upright before running
+/// recognition) but leaves its block list in raw raster `(y, x)` order, so the caller must
+/// reorder; sceptre produces character garbage on the same sideways raster and only reads
+/// correctly once the page is rendered upright first. A caller that skips an upright-render step
+/// for a backend that actually needs one gets silent garbage, not an error.
+///
+/// # Only one variant is discriminated (#657)
+///
+/// Read this before "simplifying" the type. There is exactly one decision point in the
+/// codebase that inspects this value: `upright_raster_for_backend`
+/// (`crate::extractors::pdf::ocr`), which tests `orientation_handling != RequiresUpright` and
+/// otherwise does nothing. Every other mention forwards the value to that test. So, *to that
+/// codepath*, `SelfCorrecting` and `RecognisesRotatedText` are behaviourally identical — the
+/// enum is a boolean at the point of use, and the three variants describe measured backend
+/// behaviour rather than three dispatch paths.
+///
+/// `RecognisesRotatedText`'s actual remedy is not this enum. The block-order fix is the
+/// `backend_options["page_rotation_degrees"]` hint injected by
+/// `ocr_config_with_page_rotation_hint` (`crate::extractors::pdf::ocr`) **unconditionally, for
+/// every backend**, which `PaddleOcrBackend::process_image` reads back
+/// (`page_rotation_degrees_from_backend_options` -> `residual_rotation_for_reorder` ->
+/// `reorder_blocks_for_page_rotation`, `crate::paddle_ocr::backend`) and applies internally.
+/// Declaring `RecognisesRotatedText` therefore changes nothing on its own; a backend in that
+/// class must also read the hint. Conversely, gating that hint on this enum would remove a
+/// field from Tesseract's `OcrConfig` and hence from the OCR cache key
+/// (`hash(image + language + config)`), invalidating every cached page — do not do it without
+/// its own A/B.
+///
+/// # PDF-route-only
+///
+/// Only the PDF OCR routes call `OcrBackend::page_orientation_handling` (the `--force-ocr`
+/// route via `extract_with_ocr` and the scanned-pages route via `extract_mixed_ocr_native`).
+/// The raw-image route (`crate::extractors::image`) never calls it: there is no `/Rotate` to
+/// consult, and orientation there is handled by the PP-LCNet document-orientation classifier
+/// (`crate::doc_orientation`) gated on `OcrConfig::auto_rotate`.
+///
+/// # Cost of the default
+///
+/// The trait default is `RequiresUpright` (deliberately the least capable option, see
+/// [`OcrBackend::page_orientation_handling`]). A backend that does not declare therefore pays,
+/// on every page with `/Rotate != 0`, a re-encode plus rotation of the raster in
+/// `upright_raster_for_backend` and a bounding-box round-trip back through
+/// `undo_upright_raster_correction`. That is the safe direction to be wrong in, but it is not
+/// free, and for a backend that never got measured it is not known to be necessary either.
+// `Default` and `serde` are required by the generated FFI bridge, which marshals the return value
+// of EVERY `OcrBackend` trait method through JSON -- see `XbergOcrBackendBridge` in
+// `crates/xberg-ffi/src/lib.rs`, where `page_orientation_handling` does
+// `serde_json::from_str::<PageOrientationHandling>(&json)` and falls back to `Default::default()`
+// on an uninitialised vtable slot, a failing host callback, or a null result. Whether a variant
+// carries a payload makes no difference to that. `RequiresUpright` is the default so it matches
+// `OcrBackend::page_orientation_handling`'s trait default exactly. ~keep
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize, serde::Serialize)]
+pub enum PageOrientationHandling {
+    /// Reconstructs reading order regardless of page rotation — safe to hand a
+    /// raster in any orientation.
+    SelfCorrecting,
+    /// Recognises rotated text correctly but emits blocks in raw raster order,
+    /// so the caller must reorder.
+    RecognisesRotatedText,
+    /// Requires an upright raster; rotated text produces garbage.
+    #[default]
+    RequiresUpright,
+}
+
 /// Trait for OCR backend plugins.
 ///
 /// Implement this trait to add custom OCR capabilities. OCR backends can be:
@@ -300,6 +401,9 @@ pub trait OcrBackend: Plugin {
     /// Check if the backend supports direct document-level processing (e.g. for PDFs).
     ///
     /// Defaults to `false`. Override if the backend has optimized document processing.
+    /// PDF extraction uses this optimized path only when both effective page margins
+    /// are zero; nonzero margins require per-page image processing so geometry can be
+    /// filtered correctly.
     fn supports_document_processing(&self) -> bool {
         false
     }
@@ -312,6 +416,31 @@ pub trait OcrBackend: Plugin {
     /// emit markdown in one forward pass and should override this to `true`.
     fn emits_structured_markdown(&self) -> bool {
         false
+    }
+
+    /// Declare how this backend's reported page-level confidence must be interpreted.
+    ///
+    /// Defaults to [`ConfidenceSemantics::Uncalibrated`]. This default is deliberately the
+    /// least trusting option, not [`ConfidenceSemantics::Legibility`]: a new backend that
+    /// reports *some* confidence number is not thereby safe to gate on, and defaulting to
+    /// `Legibility` would let the next backend silently inherit a threshold calibrated for a
+    /// different backend's scale — exactly the failure this type exists to prevent (see the
+    /// type's doc comment). Override this only after validating that the reported number
+    /// tracks legibility on a known scale.
+    fn confidence_semantics(&self) -> ConfidenceSemantics {
+        ConfidenceSemantics::Uncalibrated
+    }
+
+    /// Declare how this backend copes with a page raster whose text is not upright.
+    ///
+    /// Defaults to [`PageOrientationHandling::RequiresUpright`]. This default is deliberately
+    /// the least capable option, not [`PageOrientationHandling::SelfCorrecting`]: a new backend
+    /// must not silently inherit Tesseract's ability to reconstruct reading order on a rotated
+    /// raster and then quietly emit garbage the first time it faces one (see the type's doc
+    /// comment for the measured A/B behind this). Override this only after validating the
+    /// backend's actual behaviour on a rotated page.
+    fn page_orientation_handling(&self) -> PageOrientationHandling {
+        PageOrientationHandling::RequiresUpright
     }
 
     /// Process a document file directly via OCR.
@@ -678,6 +807,98 @@ mod tests {
         assert!(!backend.supports_table_detection());
     }
 
+    /// Regression test for the sceptre confidence-gating failure: a backend that reports a
+    /// page-level confidence number without declaring `confidence_semantics` must default to
+    /// `Uncalibrated`, never to `Legibility`. Defaulting to `Legibility` would let the next
+    /// backend added to this codebase silently inherit Tesseract's gate threshold and repeat
+    /// the sceptre failure, which rejected all 16 pages of a document and emptied it.
+    #[test]
+    fn should_default_to_uncalibrated_for_a_backend_that_does_not_declare_semantics() {
+        let backend = MockOcrBackend {
+            languages: vec!["eng".to_string()],
+        };
+
+        assert_eq!(backend.confidence_semantics(), ConfidenceSemantics::Uncalibrated);
+    }
+
+    /// Gating code reaches a backend as `&dyn OcrBackend` out of the registry, never as a
+    /// concrete type, so the declared semantics must survive dynamic dispatch — including the
+    /// `scale_max` payload, which is what a caller divides by instead of a hardcoded 100.
+    #[test]
+    fn should_report_declared_semantics_through_a_trait_object() {
+        struct CalibratedBackend;
+
+        impl Plugin for CalibratedBackend {
+            fn name(&self) -> &str {
+                "calibrated"
+            }
+
+            fn version(&self) -> String {
+                "1.0.0".to_string()
+            }
+
+            fn initialize(&self) -> Result<()> {
+                Ok(())
+            }
+
+            fn shutdown(&self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        #[async_trait]
+        impl OcrBackend for CalibratedBackend {
+            async fn process_image(&self, _image_bytes: &[u8], _config: &OcrConfig) -> Result<ExtractedDocument> {
+                unreachable!("this backend exists only to declare confidence semantics")
+            }
+
+            fn backend_type(&self) -> OcrBackendType {
+                OcrBackendType::Custom
+            }
+
+            fn supports_language(&self, lang: &str) -> bool {
+                lang == "eng"
+            }
+
+            fn supported_languages(&self) -> Vec<String> {
+                vec!["eng".to_string()]
+            }
+
+            fn confidence_semantics(&self) -> ConfidenceSemantics {
+                ConfidenceSemantics::Legibility { scale_max: 255.0 }
+            }
+        }
+
+        let backend: &dyn OcrBackend = &CalibratedBackend;
+
+        match backend.confidence_semantics() {
+            ConfidenceSemantics::Legibility { scale_max } => assert_eq!(scale_max, 255.0),
+            other => panic!("expected the declared Legibility semantics, got {other:?}"),
+        }
+    }
+
+    /// Regression guard for the rotation-handling capability: a backend that does not declare
+    /// `page_orientation_handling` must default to `RequiresUpright`, never to `SelfCorrecting`.
+    /// Defaulting to `SelfCorrecting` would let a new backend that cannot self-correct silently
+    /// inherit Tesseract's guarantee and emit garbage the first time it is handed a rotated
+    /// raster, mirroring the sceptre confidence-gating failure above.
+    #[test]
+    fn should_default_to_requires_upright_for_a_backend_that_does_not_declare_orientation_handling() {
+        let backend = MockOcrBackend {
+            languages: vec!["eng".to_string()],
+        };
+
+        let dynamic: &dyn OcrBackend = &backend;
+        assert_eq!(
+            dynamic.page_orientation_handling(),
+            PageOrientationHandling::RequiresUpright
+        );
+    }
+
+    /// `process_image_file`'s default impl returns `Other("File-based OCR processing
+    /// requires the tokio-runtime feature")` without that feature, so this test can only
+    /// assert the real behaviour in a build that has it.
+    #[cfg(feature = "tokio-runtime")]
     #[tokio::test]
     async fn test_ocr_backend_process_image_file_default_impl() {
         use std::io::Write;

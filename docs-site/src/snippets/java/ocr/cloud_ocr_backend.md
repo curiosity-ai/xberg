@@ -77,6 +77,18 @@ public class CloudOcrExample implements IOcrBackend {
         return false;
     }
 
+    // The cloud service reports no calibrated page confidence and needs an upright
+    // raster, so declare the least-capable option for both descriptors.
+    @Override
+    public ConfidenceSemantics confidence_semantics() throws Exception {
+        return ConfidenceSemantics.Uncalibrated;
+    }
+
+    @Override
+    public PageOrientationHandling page_orientation_handling() throws Exception {
+        return PageOrientationHandling.RequiresUpright;
+    }
+
     @Override
     public ExtractedDocument process_document(Path _path, OcrConfig _config) throws Exception {
         throw new UnsupportedOperationException("cloud-ocr does not support whole-document processing");

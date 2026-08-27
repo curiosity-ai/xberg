@@ -9,7 +9,7 @@
 			"files": [
 				{
 					"field": "/inputs/0/bytes",
-					"path": "test_documents/pdf/fake_memo.pdf"
+					"path": "pdf/fake_memo.pdf"
 				}
 			]
 		},

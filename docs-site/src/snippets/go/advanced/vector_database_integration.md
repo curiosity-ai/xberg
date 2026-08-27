@@ -15,15 +15,15 @@ type VectorRecord struct {
 }
 
 func extractAndVectorize(documentPath string, documentID string) ([]VectorRecord, error) {
-	maxChars := 512
-	maxOverlap := 50
+	maxChars := uint(512)
+	overlap := uint(50)
 	normalize := true
-	batchSize := int32(32)
+	batchSize := uint(32)
 
 	cfg := xberg.ExtractionConfig{
 		Chunking: &xberg.ChunkingConfig{
-			MaxChars:   &maxChars,
-			MaxOverlap: &maxOverlap,
+			MaxCharacters: &maxChars,
+			Overlap:       &overlap,
 			Embedding: &xberg.EmbeddingConfig{
 				Model:     xberg.EmbeddingModelTypePreset{Name: "balanced"},
 				Normalize: &normalize,

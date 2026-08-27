@@ -5,7 +5,6 @@
 //! calls back into it during standalone rerank requests instead of running a local
 //! ONNX cross-encoder or calling a provider API.
 //!
-//! Since v5.0.0.
 
 use crate::plugins::RerankerBackend;
 use crate::{Result, XbergError};
@@ -21,7 +20,6 @@ use std::sync::Arc;
 /// cross-encoders return a single scalar per `(query, document)` pair, not a
 /// vector of fixed length.
 ///
-/// Since v5.0.0.
 #[cfg_attr(alef, alef(skip))]
 pub struct RerankerBackendRegistry {
     pub(super) backends: AHashMap<String, Arc<dyn RerankerBackend>>,

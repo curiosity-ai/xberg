@@ -2,7 +2,6 @@
 
 use crate::Result;
 use crate::core::config::ExtractionConfig;
-use crate::extractors::SyncExtractor;
 use crate::extractors::security::SecurityBudget;
 use crate::plugins::{InternalDocumentExtractor, Plugin};
 use crate::types::internal::InternalDocument;
@@ -126,48 +125,6 @@ fn is_ooxml_zip_mime(mime_type: &str) -> bool {
     )
 }
 
-/// Name the embedded objects under `xl/embeddings/` in an OOXML zip package,
-/// for the [`SyncExtractor`] path (WASM), which cannot recurse into them the way
-/// `extract_content`/`extract_path` do via `ooxml_embedded` (that helper calls
-/// back into the async extraction pipeline). Naming them in a warning at least
-/// makes their presence and identity visible (xberg-io/xberg#78) rather than
-/// silently dropping them.
-///
-/// Returns `None` when `mime_type` is not an OOXML zip format, the content is
-/// not a readable zip, or the archive has no `xl/embeddings/` entries.
-#[cfg(feature = "office")]
-fn scan_for_embedded_objects(content: &[u8], mime_type: &str) -> Option<ProcessingWarning> {
-    if !is_ooxml_zip_mime(mime_type) {
-        return None;
-    }
-
-    let cursor = std::io::Cursor::new(content);
-    let mut archive = zip::ZipArchive::new(cursor).ok()?;
-
-    let mut names = Vec::new();
-    for i in 0..archive.len() {
-        let entry = archive.by_index(i).ok()?;
-        let name = entry.name().to_string();
-        if name.starts_with("xl/embeddings/") && !name.ends_with('/') {
-            names.push(name);
-        }
-    }
-    if names.is_empty() {
-        return None;
-    }
-    names.sort();
-
-    Some(ProcessingWarning {
-        source: Cow::Borrowed("excel"),
-        message: Cow::Owned(format!(
-            "Workbook contains {} embedded object{} that were not extracted ({})",
-            names.len(),
-            if names.len() == 1 { "" } else { "s" },
-            crate::core::diagnostics::format_entry_list(&names)
-        )),
-    })
-}
-
 /// Excel spreadsheet extractor using calamine.
 ///
 /// Supports: .xlsx, .xlsm, .xlam, .xltm, .xls, .xla, .xlsb, .ods
@@ -284,6 +241,7 @@ impl ExcelExtractor {
                     content: page_content,
                     tables: vec![arc_table],
                     image_indices: Vec::new(),
+                    image_preprocessing: None,
                     hierarchy: None,
                     is_blank: Some(false),
                     layout_regions: None,
@@ -302,6 +260,7 @@ impl ExcelExtractor {
                     content,
                     tables: Vec::new(),
                     image_indices: Vec::new(),
+                    image_preprocessing: None,
                     hierarchy: None,
                     is_blank: Some(true),
                     layout_regions: None,
@@ -401,44 +360,6 @@ impl ExcelExtractor {
     }
 }
 
-impl SyncExtractor for ExcelExtractor {
-    fn extract_sync(&self, content: &[u8], mime_type: &str, config: &ExtractionConfig) -> Result<InternalDocument> {
-        let _span = tracing::debug_span!("extract_excel", element_count = tracing::field::Empty,).entered();
-
-        let extension = match mime_type {
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => ".xlsx",
-            "application/vnd.ms-excel.sheet.macroEnabled.12" => ".xlsm",
-            "application/vnd.ms-excel.addin.macroEnabled.12" => ".xlam",
-            "application/vnd.ms-excel.template.macroEnabled.12" => ".xltm",
-            "application/vnd.ms-excel" => ".xls",
-            "application/vnd.ms-excel.addin.macroEnabled" => ".xla",
-            "application/vnd.ms-excel.sheet.binary.macroEnabled.12" => ".xlsb",
-            "application/vnd.oasis.opendocument.spreadsheet" => ".ods",
-            _ => ".xlsx",
-        };
-
-        let (workbook, read_warnings) = crate::extraction::excel::read_excel_bytes(content, extension)?;
-        let mut budget = SecurityBudget::from_config(config);
-        validate_workbook_budget(&workbook, &mut budget)?;
-        let mut doc = Self::workbook_to_internal_document(&workbook);
-        doc.processing_warnings.extend(read_warnings);
-        doc.mime_type = mime_type.to_string();
-
-        // The sync path (WASM) cannot recurse into embedded objects the way
-        // `extract_content`/`extract_path` do via `ooxml_embedded`, which requires
-        // async pipeline extraction. Name them in a warning instead so a workbook
-        // with embedded files doesn't look fully extracted (xberg-io/xberg#78). ~keep
-        #[cfg(feature = "office")]
-        if config.max_archive_depth > 0
-            && let Some(warning) = scan_for_embedded_objects(content, mime_type)
-        {
-            doc.processing_warnings.push(warning);
-        }
-
-        Ok(doc)
-    }
-}
-
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl InternalDocumentExtractor for ExcelExtractor {
@@ -467,6 +388,8 @@ impl InternalDocumentExtractor for ExcelExtractor {
             _ => ".xlsx",
         };
 
+        let security_limits = config.security_limits.clone().unwrap_or_default();
+
         let (workbook, read_warnings) = {
             #[cfg(feature = "tokio-runtime")]
             {
@@ -476,15 +399,16 @@ impl InternalDocumentExtractor for ExcelExtractor {
                     }
                     let content_owned = content.to_vec();
                     let extension_owned = extension.to_string();
+                    let limits_owned = security_limits.clone();
                     let span = tracing::Span::current();
                     tokio::task::spawn_blocking(move || {
                         let _guard = span.entered();
-                        crate::extraction::excel::read_excel_bytes(&content_owned, &extension_owned)
+                        crate::extraction::excel::read_excel_bytes(&content_owned, &extension_owned, &limits_owned)
                     })
                     .await
                     .map_err(|e| crate::error::XbergError::parsing(format!("Excel extraction task failed: {}", e)))??
                 } else {
-                    crate::extraction::excel::read_excel_bytes(content, extension)?
+                    crate::extraction::excel::read_excel_bytes(content, extension, &security_limits)?
                 }
             }
             #[cfg(not(feature = "tokio-runtime"))]
@@ -492,7 +416,7 @@ impl InternalDocumentExtractor for ExcelExtractor {
                 if config.cancel_token.as_ref().map(|t| t.is_cancelled()).unwrap_or(false) {
                     return Err(crate::error::XbergError::Cancelled);
                 }
-                crate::extraction::excel::read_excel_bytes(content, extension)?
+                crate::extraction::excel::read_excel_bytes(content, extension, &security_limits)?
             }
         };
 
@@ -531,13 +455,11 @@ impl InternalDocumentExtractor for ExcelExtractor {
             .to_str()
             .ok_or_else(|| crate::XbergError::validation("Invalid file path".to_string()))?;
 
-        let (workbook, read_warnings) = crate::extraction::excel::read_excel_file(path_str)?;
+        let security_limits = config.security_limits.clone().unwrap_or_default();
+        let (workbook, read_warnings) = crate::extraction::excel::read_excel_file(path_str, &security_limits)?;
         let mut doc = Self::workbook_to_internal_document(&workbook);
         doc.processing_warnings.extend(read_warnings);
         doc.mime_type = mime_type.to_string();
-
-        #[cfg(not(feature = "office"))]
-        let _ = config;
 
         #[cfg(feature = "office")]
         if config.max_archive_depth > 0 && is_ooxml_zip_mime(mime_type) {
@@ -994,53 +916,328 @@ mod tests {
         assert!(pages[0].content.starts_with("## Sheet1\n"), "{:?}", pages[0].content);
     }
 
-    #[cfg(feature = "office")]
-    fn make_zip_with_entry(entry_path: &str, entry_data: &[u8]) -> Vec<u8> {
+    /// Build a minimal in-memory `.xlsx` zip with one working sheet, plus `extra_entries`
+    /// padding parts, so the total ZIP entry count is `5 + extra_entries` (the five base
+    /// parts: `[Content_Types].xml`, `_rels/.rels`, `xl/workbook.xml`,
+    /// `xl/_rels/workbook.xml.rels`, `xl/worksheets/sheet1.xml`).
+    #[cfg(feature = "excel")]
+    fn build_test_xlsx(extra_parts: &[(&str, &[u8])]) -> Vec<u8> {
         use std::io::{Cursor, Write};
-        let buf = Cursor::new(Vec::new());
-        let mut zip = zip::ZipWriter::new(buf);
-        let options = zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
-        zip.start_file(entry_path, options).unwrap();
-        zip.write_all(entry_data).unwrap();
-        zip.finish().unwrap().into_inner()
-    }
+        use zip::write::SimpleFileOptions;
 
-    /// xberg-io/xberg#78: an OOXML zip carrying files under `xl/embeddings/`
-    /// must be flagged, naming the embedded file, on the sync (WASM) path that
-    /// cannot recurse into them.
-    #[cfg(feature = "office")]
-    #[test]
-    fn should_warn_about_embedded_objects_on_sync_path() {
-        let bytes = make_zip_with_entry("xl/embeddings/Workbook1.xlsx", b"fake embedded workbook bytes");
-        let warning = scan_for_embedded_objects(
-            &bytes,
-            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-        .expect("embedded object under xl/embeddings/ must produce a warning");
-        assert_eq!(warning.source, "excel");
-        assert_eq!(
-            warning.message,
-            "Workbook contains 1 embedded object that were not extracted (xl/embeddings/Workbook1.xlsx)"
-        );
-    }
+        let mut buffer = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(Cursor::new(&mut buffer));
+            let options = SimpleFileOptions::default();
 
-    #[cfg(feature = "office")]
-    #[test]
-    fn should_not_warn_when_no_embedded_objects_present() {
-        let bytes = make_zip_with_entry("xl/worksheets/sheet1.xml", b"<worksheet/>");
-        assert!(
-            scan_for_embedded_objects(
-                &bytes,
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            zip.start_file("[Content_Types].xml", options).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Override PartName="/xl/workbook.xml"
+    ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml"
+    ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+</Types>"#,
             )
-            .is_none()
+            .unwrap();
+
+            zip.start_file("_rels/.rels", options).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
+    Target="xl/workbook.xml"/>
+</Relationships>"#,
+            )
+            .unwrap();
+
+            zip.start_file("xl/workbook.xml", options).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+  xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="Sheet1" sheetId="1" r:id="rId1"/></sheets>
+</workbook>"#,
+            )
+            .unwrap();
+
+            zip.start_file("xl/_rels/workbook.xml.rels", options).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1"
+    Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet"
+    Target="worksheets/sheet1.xml"/>
+</Relationships>"#,
+            )
+            .unwrap();
+
+            zip.start_file("xl/worksheets/sheet1.xml", options).unwrap();
+            zip.write_all(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>
+    <row r="1"><c r="A1" t="inlineStr"><is><t>Hello</t></is></c></row>
+  </sheetData>
+</worksheet>"#,
+            )
+            .unwrap();
+
+            for (name, data) in extra_parts {
+                zip.start_file(*name, options).unwrap();
+                zip.write_all(data).unwrap();
+            }
+
+            zip.finish().unwrap();
+        }
+        buffer
+    }
+
+    /// GH#642: the archive entry-count ceiling for XLSX must come from
+    /// `config.security_limits.max_files_in_archive`, the same as the DOCX/PPTX top-level
+    /// containers, not be silently unenforced. This uses a limit (3) well below the base
+    /// 5-entry archive, so the unfixed code (no entry-count check at all in
+    /// `read_excel_bytes`) always extracts successfully here, while the fixed code rejects it.
+    #[cfg(feature = "excel")]
+    #[tokio::test]
+    async fn test_xlsx_extract_content_honours_configured_archive_entry_limit() {
+        let data = build_test_xlsx(&[]);
+        let extractor = ExcelExtractor::new();
+        let config = ExtractionConfig {
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_files_in_archive: 3,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &config,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an XLSX archive with more entries than the configured max_files_in_archive must be rejected"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains('3'),
+            "error should mention the configured limit (3), got: {}",
+            err_msg
         );
     }
 
-    #[cfg(feature = "office")]
-    #[test]
-    fn should_not_scan_non_ooxml_zip_mime_types_for_embedded_objects() {
-        let bytes = make_zip_with_entry("xl/embeddings/Object1.bin", b"data");
-        assert!(scan_for_embedded_objects(&bytes, "application/vnd.ms-excel").is_none());
+    /// Sibling of the rejection test above: the same archive shape, but under a configured
+    /// limit that comfortably fits it, must still extract successfully.
+    #[cfg(feature = "excel")]
+    #[tokio::test]
+    async fn test_xlsx_extract_content_succeeds_under_configured_archive_entry_limit() {
+        let data = build_test_xlsx(&[]);
+        let extractor = ExcelExtractor::new();
+        let config = ExtractionConfig {
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_files_in_archive: 50,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &config,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "an XLSX archive within the configured max_files_in_archive must extract successfully: {:?}",
+            result.err()
+        );
+    }
+
+    /// A normal workbook with no `security_limits` override (the common case) must still
+    /// extract successfully under the default `SecurityLimits::max_files_in_archive`.
+    #[cfg(feature = "excel")]
+    #[tokio::test]
+    async fn test_xlsx_extract_content_succeeds_under_default_archive_entry_limit() {
+        let data = build_test_xlsx(&[]);
+        let extractor = ExcelExtractor::new();
+        let config = ExtractionConfig::default();
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &config,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a normal workbook must extract successfully under the default archive entry limit: {:?}",
+            result.err()
+        );
+    }
+
+    /// Gap: XLSX had only an entry-count check (`check_zip_entry_count`, now
+    /// `validate_zip_container`'s first half) -- no `ZipBombValidator`, so nothing
+    /// ever checked aggregate declared uncompressed size or compression ratio.
+    /// `ZipBombValidator` was previously uncallable from this file at all: its cfg
+    /// gate (`archives`/`hwpx`/`iwork`/`office`) did not include `excel`. Against
+    /// unfixed code this test fails: a highly compressible extra member sails
+    /// through regardless of `max_compression_ratio`.
+    #[cfg(feature = "excel")]
+    #[tokio::test]
+    async fn test_xlsx_extract_content_rejects_high_compression_ratio_archive() {
+        // 64 KiB of a single repeated byte, deflated: compresses far past any sane
+        // ratio in a few hundred bytes, so the archive stays tiny while the ratio
+        // comparison still fires.
+        let bomb_payload = vec![0u8; 64 * 1024];
+        let data = build_test_xlsx(&[("xl/media/bomb.bin", &bomb_payload)]);
+        let extractor = ExcelExtractor::new();
+        let config = ExtractionConfig {
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_compression_ratio: 5,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &config,
+            )
+            .await;
+
+        let err = result.expect_err("a highly compressible member must be rejected under a low ratio limit");
+        assert!(
+            matches!(err, crate::error::XbergError::Security { .. }),
+            "expected XbergError::Security, got: {err:?}"
+        );
+        assert!(
+            err.to_string().to_lowercase().contains("ratio") || err.to_string().contains("ZIP bomb"),
+            "error should name the ratio violation, got: {err}"
+        );
+    }
+
+    /// Sibling of the ratio test above, bounding aggregate declared uncompressed size
+    /// instead. Against unfixed code this also fails: no `max_archive_size` check
+    /// existed for XLSX at all.
+    #[cfg(feature = "excel")]
+    #[tokio::test]
+    async fn test_xlsx_extract_content_rejects_archive_exceeding_max_size() {
+        // Pseudo-random via a simple LCG so the entry's declared uncompressed size is
+        // what trips the limit, not the ratio check.
+        let mut state: u32 = 0x1234_5678;
+        let payload: Vec<u8> = (0..8192)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                (state >> 16) as u8
+            })
+            .collect();
+        let data = build_test_xlsx(&[("xl/media/big.bin", &payload)]);
+        let extractor = ExcelExtractor::new();
+        let config = ExtractionConfig {
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_archive_size: 1024,
+                max_compression_ratio: usize::MAX,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &config,
+            )
+            .await;
+
+        let err = result.expect_err("an archive declaring more bytes than max_archive_size must be rejected");
+        assert!(
+            matches!(err, crate::error::XbergError::Security { .. }),
+            "expected XbergError::Security, got: {err:?}"
+        );
+    }
+
+    /// Positive control for both tests above: a validator that rejects everything
+    /// would pass the negative tests too, so this proves an ordinary workbook's exact
+    /// cell text still extracts under the default `SecurityLimits`.
+    #[cfg(feature = "excel")]
+    #[tokio::test]
+    async fn test_xlsx_extract_content_positive_control_exact_text_under_default_limits() {
+        let data = build_test_xlsx(&[]);
+        let extractor = ExcelExtractor::new();
+        let config = ExtractionConfig::default();
+
+        let doc = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &config,
+            )
+            .await
+            .expect("an ordinary workbook must extract under the default security limits");
+
+        let pages = doc
+            .prebuilt_pages
+            .expect("workbook extraction always builds prebuilt pages");
+        assert!(
+            pages.iter().any(|p| p.content.contains("Hello")),
+            "extracted content must contain the source cell's exact text, got: {:?}",
+            pages
+        );
+    }
+
+    /// With no `security_limits` override the container must still enforce the default
+    /// `SecurityLimits::max_files_in_archive`: "unset" means the default ceiling, not "no
+    /// ceiling". An archive past that default must be rejected.
+    #[cfg(feature = "excel")]
+    #[tokio::test]
+    async fn test_xlsx_extract_content_rejects_archive_over_default_entry_limit() {
+        let default_limit = crate::extractors::security::SecurityLimits::default().max_files_in_archive;
+        // `build_test_xlsx` writes five fixed parts of its own, so this alone already
+        // exceeds the ceiling. Rebased onto the current helper, which takes the extra
+        // parts as a slice rather than a count.
+        let names: Vec<String> = (0..=default_limit).map(|i| format!("xl/extra_{i}.xml")).collect();
+        let extra_parts: Vec<(&str, &[u8])> = names.iter().map(|n| (n.as_str(), b"<x/>".as_slice())).collect();
+        let data = build_test_xlsx(&extra_parts);
+        let extractor = ExcelExtractor::new();
+        let config = ExtractionConfig::default();
+        assert!(
+            config.security_limits.is_none(),
+            "this test must exercise the unset fallback, not an explicit limit"
+        );
+
+        let result = extractor
+            .extract_content(
+                &data,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                &config,
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "an archive over the default max_files_in_archive must be rejected when no limit is configured"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains(&default_limit.to_string()),
+            "error should mention the default limit ({default_limit}), got: {err_msg}"
+        );
     }
 }

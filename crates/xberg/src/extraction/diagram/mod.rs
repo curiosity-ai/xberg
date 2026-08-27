@@ -1172,9 +1172,17 @@ mod tests {
         let graph = assemble(
             None,
             (400.0, 400.0),
-            vec![outline(0.0, 0.0, 100.0, 50.0), background, outline(0.0, 200.0, 100.0, 250.0)],
+            vec![
+                outline(0.0, 0.0, 100.0, 50.0),
+                background,
+                outline(0.0, 200.0, 100.0, 250.0),
+            ],
             vec![connector((50.0, 50.0), (50.0, 200.0))],
-            vec![label(50.0, 25.0, "Start"), label(65.0, 125.0, "yes"), label(50.0, 225.0, "End")],
+            vec![
+                label(50.0, 25.0, "Start"),
+                label(65.0, 125.0, "yes"),
+                label(50.0, 225.0, "End"),
+            ],
         )
         .expect("graph");
 

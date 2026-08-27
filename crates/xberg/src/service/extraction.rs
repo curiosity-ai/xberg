@@ -20,14 +20,19 @@ use super::request::{ExtractionRequest, ExtractionSource};
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust
 /// use xberg::service::{ExtractionService, ExtractionRequest};
 /// use xberg::ExtractionConfig;
-/// use tower::Service;
+/// use tower::ServiceExt;
 ///
-/// let mut svc = ExtractionService::new();
+/// # #[tokio::main]
+/// # async fn main() -> xberg::Result<()> {
+/// let svc = ExtractionService::new();
 /// let req = ExtractionRequest::bytes(b"hello".as_slice(), "text/plain", ExtractionConfig::default());
-/// let result = svc.call(req).await?;
+/// let result = svc.oneshot(req).await?;
+/// assert_eq!(result.content, "hello");
+/// # Ok(())
+/// # }
 /// ```
 #[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Clone)]
@@ -37,7 +42,7 @@ pub struct ExtractionService {
 
 impl ExtractionService {
     /// Create a new extraction service.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self { _private: () }
     }
 }

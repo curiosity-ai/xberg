@@ -1,10 +1,10 @@
 //! Scanned-page detection for PDFs.
 
-use pdf_oxide::PdfDocument;
-use pdf_oxide::document::ReadingOrder;
-use pdf_oxide::extractors::auto::{ImageCodecClass, ProducerPrior};
-use pdf_oxide::fonts::MappingProvenance;
-use pdf_oxide::layout::TextSpan;
+use xberg_native_pdf::PdfDocument;
+use xberg_native_pdf::document::ReadingOrder;
+use xberg_native_pdf::extractors::auto::{ImageCodecClass, ProducerPrior};
+use xberg_native_pdf::fonts::MappingProvenance;
+use xberg_native_pdf::layout::TextSpan;
 
 #[cfg(test)]
 use crate::core::config::DEFAULT_SCANNED_MIN_CONFIDENCE;
@@ -129,7 +129,7 @@ fn page_signals(doc: &PdfDocument, page_index: usize) -> Option<PageScanSignals>
     }
 
     // Detection is advisory: a page that panics must not abort the extraction. ~keep
-    let classified = super::oxide::guard_oxide_panic(
+    let classified = super::native::guard_native_panic(
         || doc.classify_page(page_index).map_err(|error| error.to_string()),
         |message| message,
     )
@@ -167,13 +167,13 @@ pub(crate) fn detect(doc: &PdfDocument) -> Option<ScanDetection> {
 /// Non-whitespace character counts `(fabricated, total)` for one page's spans.
 ///
 /// `fabricated` counts characters belonging to a span whose
-/// [`MappingProvenance`] is [`MappingProvenance::Fallback`] — pdf_oxide 0.3.75's
+/// [`MappingProvenance`] is [`MappingProvenance::Fallback`] — xberg_native_pdf 0.3.75's
 /// direct signal that no ISO 32000-1 §9.10.2 mapping tier produced the
 /// character's Unicode value, so it was fabricated by the extractor rather than
 /// read from the file (issue #1254). Every other provenance (`ActualText` ..
 /// `EmbeddedCmap`) was read from the file and never counts as fabricated. A
 /// span with `provenance: None` ("unknown", e.g. not populated by this
-/// pdf_oxide build) still contributes to `total` but never to `fabricated`, so
+/// xberg_native_pdf build) still contributes to `total` but never to `fabricated`, so
 /// a page with only unknown provenance can never look fabricated on its own.
 ///
 /// Pure and independent of any [`PdfDocument`], so it is unit-testable with
@@ -195,11 +195,11 @@ fn fabricated_char_counts(spans: &[TextSpan]) -> (usize, usize) {
 /// non-whitespace characters, at least `min_ratio` of which carry
 /// `MappingProvenance::Fallback` (issue #1254).
 ///
-/// Advisory like the rest of scan detection: a page pdf_oxide cannot extract or
+/// Advisory like the rest of scan detection: a page xberg_native_pdf cannot extract or
 /// that panics during extraction is reported as not fabricated rather than
 /// aborting the caller.
 fn page_has_fabricated_text(doc: &PdfDocument, page_index: usize, min_ratio: f64, min_chars: usize) -> bool {
-    let page_text = match super::oxide::guard_oxide_panic(
+    let page_text = match super::native::guard_native_panic(
         || {
             doc.extract_page_text_with_options(page_index, ReadingOrder::ColumnAware)
                 .map_err(|error| error.to_string())

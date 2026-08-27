@@ -63,6 +63,10 @@ docker build -f docker/Dockerfile.full -t xberg:full .
 
 The root `Dockerfile` is a symlink to `Dockerfile.full` for backward compatibility and complete feature support by default.
 
+## GPU Support
+
+All published images (Core, Full, CLI) run ONNX Runtime on CPU only — there is no published GPU/CUDA image. GPU acceleration exists in Xberg (the `cuda` Cargo feature) but requires building from source against a CUDA-enabled ONNX Runtime; the prebuilt `download-binaries` ORT these Dockerfiles use has no CUDA support. See the [GPU Acceleration docs](https://docs.xberg.io/getting-started/installation/#gpu-acceleration).
+
 ## Multi-Architecture Support
 
 Both images support:

@@ -1,26 +1,32 @@
-```typescript title="WASM"
-import { extract, initWasm } from "@xberg-io/xberg-wasm";
+---
+language: typescript
+target: wasm
+---
 
-await initWasm();
+```typescript title="WASM"
+import init, { extract } from "@xberg-io/xberg-wasm";
+
+await init();
 
 const fileInput = document.getElementById("file") as HTMLInputElement;
 const file = fileInput.files?.[0];
 
 if (file) {
-  const result = await extract({ kind: "bytes", bytes: file, mimeType: file.type || "application/octet-stream" });
-  console.log(`Metadata: ${JSON.stringify(result.metadata)}`);
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  const result = await extract({ kind: "bytes", bytes, mimeType: file.type || "application/octet-stream" }, undefined);
+  console.log(`Metadata: ${JSON.stringify(result.results[0].metadata)}`);
 
   // Access common metadata fields
-  if (result.metadata.title) {
-    console.log(`Title: ${result.metadata.title}`);
+  if (result.results[0].metadata.title) {
+    console.log(`Title: ${result.results[0].metadata.title}`);
   }
 
   // Access format-specific metadata
-  const metadata = result.metadata;
+  const metadata = result.results[0].metadata;
 
   // For HTML files
-  if (metadata.html) {
-    const htmlMeta = metadata.html;
+  if (metadata.format?.format_type === "html") {
+    const htmlMeta = metadata.format;
     console.log(`HTML Title: ${htmlMeta.title}`);
     console.log(`Description: ${htmlMeta.description}`);
 
@@ -75,8 +81,8 @@ if (file) {
   }
 
   // PDF-specific fields are at the top level of metadata
-  if (metadata.pageCount) {
-    console.log(`Pages: ${metadata.pageCount}`);
+  if (metadata.pages) {
+    console.log(`Pages: ${metadata.pages.totalCount}`);
   }
   if (metadata.authors && metadata.authors.length > 0) {
     console.log(`Authors: ${metadata.authors.join(", ")}`);

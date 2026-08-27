@@ -19,7 +19,6 @@
 //! diagnostic code is duplicated here — the cross-encoder pair encoding is the
 //! only reranker-specific step, applied at inference time via `EncodeInput::Dual`.
 //!
-//! Since v5.0.0.
 
 #[cfg(feature = "reranker")]
 pub mod engine;
@@ -38,7 +37,100 @@ use std::sync::{Arc, RwLock};
 type CachedEngine = Arc<RerankerEngine>;
 
 #[cfg(feature = "reranker")]
-static ENGINE_CACHE: LazyLock<RwLock<AHashMap<String, CachedEngine>>> = LazyLock::new(|| RwLock::new(AHashMap::new()));
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RerankerEngineCacheKey {
+    repo_name: String,
+    model_file: String,
+    additional_files: Vec<String>,
+    revision: String,
+    max_length: usize,
+    cache_root: String,
+    acceleration: crate::onnx::OnnxAccelerationCacheKey,
+    head: crate::core::config::reranker::RerankerHead,
+}
+
+#[cfg(all(test, feature = "reranker"))]
+mod engine_cache_key_tests {
+    use super::*;
+    use crate::core::config::acceleration::{AccelerationConfig, ExecutionProviderType};
+    use crate::core::config::reranker::RerankerHead;
+
+    fn key(
+        additional_files: &[String],
+        max_length: usize,
+        acceleration: &AccelerationConfig,
+        head: RerankerHead,
+    ) -> RerankerEngineCacheKey {
+        RerankerEngineCacheKey::new(
+            "owner/model",
+            "model.onnx",
+            additional_files,
+            "revision",
+            max_length,
+            "cache-root".to_string(),
+            crate::onnx::OnnxAccelerationCacheKey::from_resolved(acceleration.provider.clone(), acceleration.device_id),
+            head,
+        )
+    }
+
+    #[test]
+    fn engine_cache_reuses_equal_configs_and_isolates_distinct_configs() {
+        let cpu = AccelerationConfig {
+            provider: ExecutionProviderType::Cpu,
+            device_id: 0,
+        };
+        let cuda = AccelerationConfig {
+            provider: ExecutionProviderType::Cuda,
+            device_id: 1,
+        };
+        let files = vec!["config.json".to_string(), "weights.onnx.data".to_string()];
+        let reversed_files = vec!["weights.onnx.data".to_string(), "config.json".to_string()];
+        let original = key(&files, 512, &cpu, RerankerHead::CrossEncoder);
+        let equal = key(&files, 512, &cpu, RerankerHead::CrossEncoder);
+        let mut cache = AHashMap::new();
+        cache.insert(original, 7_u8);
+
+        assert_eq!(cache.get(&equal), Some(&7));
+        assert_eq!(cache.get(&key(&files, 1024, &cpu, RerankerHead::CrossEncoder)), None);
+        assert_eq!(cache.get(&key(&files, 512, &cuda, RerankerHead::CrossEncoder)), None);
+        assert_eq!(cache.get(&key(&[], 512, &cpu, RerankerHead::CrossEncoder)), None);
+        assert_eq!(
+            cache.get(&key(&reversed_files, 512, &cpu, RerankerHead::CrossEncoder)),
+            None
+        );
+        assert_eq!(cache.get(&key(&files, 512, &cpu, RerankerHead::Qwen3Generative)), None);
+    }
+}
+
+#[cfg(feature = "reranker")]
+impl RerankerEngineCacheKey {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        repo_name: &str,
+        model_file: &str,
+        additional_files: &[String],
+        revision: &str,
+        max_length: usize,
+        cache_root: String,
+        acceleration: crate::onnx::OnnxAccelerationCacheKey,
+        head: crate::core::config::reranker::RerankerHead,
+    ) -> Self {
+        Self {
+            repo_name: repo_name.to_string(),
+            model_file: model_file.to_string(),
+            additional_files: additional_files.to_vec(),
+            revision: revision.to_string(),
+            max_length,
+            cache_root,
+            acceleration,
+            head,
+        }
+    }
+}
+
+#[cfg(feature = "reranker")]
+static ENGINE_CACHE: LazyLock<RwLock<AHashMap<RerankerEngineCacheKey, CachedEngine>>> =
+    LazyLock::new(|| RwLock::new(AHashMap::new()));
 
 /// Global semaphore that limits concurrent ONNX reranker inference calls.
 ///
@@ -48,7 +140,6 @@ static ENGINE_CACHE: LazyLock<RwLock<AHashMap<String, CachedEngine>>> = LazyLock
 /// semaphore. The permit count matches the thread budget used by the embedding
 /// semaphore.
 ///
-/// Since v5.0.0.
 #[cfg(all(feature = "reranker", feature = "tokio-runtime"))]
 static RERANK_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
     let budget = crate::core::config::concurrency::resolve_batch_concurrency(None, true);
@@ -60,7 +151,6 @@ static RERANK_SEMAPHORE: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|
 /// `index` maps back to the caller's original document list, so metadata arrays
 /// (e.g. IDs, paths) can be reordered without passing them through the reranker.
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct RerankedDocument {
@@ -77,7 +167,6 @@ pub struct RerankedDocument {
 /// All string fields are owned `String` for FFI compatibility — instances are
 /// safe to clone and pass across language boundaries.
 ///
-/// Since v5.0.0.
 #[cfg(feature = "reranker-presets")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RerankerPreset {
@@ -120,7 +209,6 @@ pub struct RerankerPreset {
 /// `main` branch and update this list to match. The `live-hf` CI job will
 /// fail loudly if any preset path 404s.
 ///
-/// Since v5.0.0.
 #[cfg(any(feature = "reranker", test))]
 /// SHA-256 manifest pinning every hosted reranker preset file, verified at
 /// download time by [`crate::onnx::download_model_files`].
@@ -199,7 +287,6 @@ pub static RERANKER_PRESETS: LazyLock<Vec<RerankerPreset>> = LazyLock::new(|| {
 /// across releases. The catalog name is the underlying primitive — alias
 /// resolution is single-hop (aliases cannot point at other aliases).
 ///
-/// Since v5.0.0.
 #[cfg(feature = "reranker-presets")]
 const PRESET_ALIASES: &[(&str, &str)] = &[
     ("fast", "jina-reranker-v1-turbo-en"),
@@ -214,7 +301,6 @@ const PRESET_ALIASES: &[(&str, &str)] = &[
 /// to the alias table for the documented friendly names
 /// (`fast` / `balanced` / `quality` / `multilingual`).
 ///
-/// Since v5.0.0.
 #[cfg(feature = "reranker-presets")]
 pub(crate) fn get_preset(name: &str) -> Option<RerankerPreset> {
     if let Some(preset) = RERANKER_PRESETS.iter().find(|p| p.name == name) {
@@ -229,7 +315,6 @@ pub(crate) fn get_preset(name: &str) -> Option<RerankerPreset> {
 /// Returns the catalog short-names followed by the friendly aliases, so
 /// `list_presets()[..5]` is the catalog and `list_presets()[5..]` is aliases.
 ///
-/// Since v5.0.0.
 #[cfg(feature = "reranker-presets")]
 pub(crate) fn list_presets() -> Vec<String> {
     let mut out: Vec<String> = RERANKER_PRESETS.iter().map(|p| p.name.clone()).collect();
@@ -324,10 +409,15 @@ fn get_or_init_engine(
     head: crate::core::config::reranker::RerankerHead,
 ) -> crate::Result<Arc<RerankerEngine>> {
     let revision = (repo_name == "xberg-io/reranker-models").then_some(RERANKER_MODEL_REVISION);
-    let cache_key = crate::model_download::hf_cache_key(cache_dir.as_deref());
-    let engine_key = format!(
-        "{repo_name}_{model_file}_{}_{cache_key}_{head:?}",
-        revision.unwrap_or("main")
+    let engine_key = RerankerEngineCacheKey::new(
+        repo_name,
+        model_file,
+        additional_files,
+        revision.unwrap_or("main"),
+        max_length,
+        crate::model_download::hf_cache_key(cache_dir.as_deref()),
+        crate::onnx::OnnxAccelerationCacheKey::new(accel.as_ref()),
+        head,
     );
 
     {
@@ -571,7 +661,6 @@ fn build_results_from_scores(
 /// - `XbergError::MissingDependency` if ONNX Runtime is not installed (ONNX path).
 /// - `XbergError::Reranking` if the preset name is unknown or model download fails.
 ///
-/// Since v5.0.0.
 #[cfg(feature = "reranker")]
 pub fn rerank(
     query: String,
@@ -682,7 +771,6 @@ pub fn rerank(
 /// dedicated blocking thread pool via Tokio's `spawn_blocking`, keeping the
 /// async executor free.
 ///
-/// Since v5.0.0.
 #[doc(alias = "rerank")]
 #[cfg(all(feature = "reranker", feature = "tokio-runtime"))]
 #[cfg_attr(alef, alef(skip))]

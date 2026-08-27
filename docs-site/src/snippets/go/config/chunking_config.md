@@ -43,10 +43,7 @@ func main() {
 			MaxCharacters: &maxChars,
 			Overlap:       &overlap,
 			ChunkerType:   &chunkerType,
-			Sizing: xberg.ChunkSizing{
-				Type:  "tokenizer",
-				Model: &model,
-			},
+			Sizing:        xberg.ChunkSizingTokenizer{Model: model},
 		},
 	}
 

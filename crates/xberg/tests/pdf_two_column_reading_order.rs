@@ -7,6 +7,11 @@ use helpers::extract_bytes_document_blocking;
 
 use xberg::core::config::{ExtractionConfig, OutputFormat, PdfConfig};
 
+const ISSUE_1484_PDF: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../test_documents/pdf/issue-1484-two-column-hanging-number-gutter.pdf"
+);
+
 fn make_two_column_pdf() -> Vec<u8> {
     let stream = "\
 BT /F1 11 Tf 1 0 0 1 60 712 Tm (The committee reviewed the annual) Tj ET\n\
@@ -63,6 +68,16 @@ fn normalized_content(config: &ExtractionConfig) -> String {
         .join(" ")
 }
 
+fn assert_text_appears_in_order(content: &str, expected: &[&str]) {
+    let mut offset = 0;
+    for text in expected {
+        let relative = content[offset..]
+            .find(text)
+            .unwrap_or_else(|| panic!("expected {text:?} after byte {offset} in {content:?}"));
+        offset += relative + text.len();
+    }
+}
+
 #[test]
 fn native_two_column_pdf_uses_column_block_reading_order() {
     let expected = "The committee reviewed the annual report and approved the budget for the coming fiscal year.";
@@ -93,4 +108,42 @@ fn markdown_two_column_pdf_uses_column_block_reading_order() {
     let expected = "The committee reviewed the annual report and approved the budget for the coming fiscal year.";
 
     assert_eq!(normalized_content(&config), expected);
+}
+
+/// End-to-end corpus coverage for the reported two-page document. The focused
+/// span-level regression in `pdf::native::text` proves the gutter-snap path.
+#[test]
+fn issue_1484_corpus_pages_extract_in_column_block_order() {
+    let pdf = std::fs::read(ISSUE_1484_PDF).expect("issue #1484 corpus fixture must exist");
+    let content = extract_bytes_document_blocking(&pdf, "application/pdf", &ExtractionConfig::default())
+        .expect("issue #1484 PDF extraction must succeed")
+        .content;
+    let second_page = content
+        .match_indices("An agreement which, due to its nature")
+        .nth(1)
+        .map(|(index, _)| index)
+        .expect("fixture must contain its unnumbered control page");
+
+    assert_text_appears_in_order(
+        &content[..second_page],
+        &[
+            "15.3 An agreement",
+            "15.4 Client",
+            "15.5 Either",
+            "16.5 The exclusions",
+            "16.6 The exclusions",
+            "16.7 Unless",
+        ],
+    );
+    assert_text_appears_in_order(
+        &content[second_page..],
+        &[
+            "An agreement",
+            "Client is not entitled",
+            "Either party",
+            "The exclusions and limitations of supplier liability",
+            "The exclusions and limitations referred",
+            "Unless performance",
+        ],
+    );
 }

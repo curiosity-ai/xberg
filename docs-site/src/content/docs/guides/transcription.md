@@ -69,7 +69,7 @@ extraction returns a `XbergError::Transcription` with the message
 Add the feature to `Cargo.toml`:
 
 ```toml
-xberg = { version = "5", features = ["transcription"] }
+xberg = { version = "1", features = ["transcription"] }
 ```
 
 ```rust

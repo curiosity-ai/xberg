@@ -16,8 +16,26 @@ pub struct Table {
     pub markdown: String,
     /// Page number where the table was found (1-indexed)
     pub page_number: u32,
-    /// Bounding box of the table on the page (PDF coordinates: x0=left, y0=bottom, x1=right, y1=top).
-    /// Only populated for PDF-extracted tables when position data is available.
+    /// Bounding box of the table's position. Only populated when position data is
+    /// available from the producing extractor.
+    ///
+    /// The coordinate space depends on how the table was produced, and callers must
+    /// know which route produced a given `Table` before interpreting this field:
+    ///
+    /// - Tables extracted from a PDF's native content, and tables recognized on a
+    ///   scanned PDF page that went through xberg's OCR pipeline (`--force-ocr` /
+    ///   `--ocr-scanned-pages`), are in **PDF points with a bottom-left origin**
+    ///   (x0=left, y0=bottom, x1=right, y1=top; y increases upward). For the OCR
+    ///   case, the pipeline rescales the backend's raw pixel output into this space
+    ///   before it reaches `Table::bounding_box` — see
+    ///   `rescale_ocr_bboxes_to_page_points` in `extractors::pdf::ocr`.
+    /// - Tables detected by OCR on a standalone image with no backing PDF page (for
+    ///   example extracting a bare PNG/JPEG/TIFF) are in **raster pixel coordinates
+    ///   with a top-left origin** (x0=left, y0=top, x1=right, y1=bottom; y increases
+    ///   downward) — the same convention the OCR backend (Tesseract, PaddleOCR,
+    ///   candle-based backends) or the layout detector reported them in. There is no
+    ///   PDF page geometry to rescale into for this case, so the raw pixel box is
+    ///   passed through unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(default)]
     pub bounding_box: Option<BoundingBox>,

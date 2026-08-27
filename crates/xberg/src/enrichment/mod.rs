@@ -1,7 +1,8 @@
-//! Text-enrichment data types (keywords / entities / labels).
+//! Serializable text-enrichment transport types.
 //!
-//! Infrastructure only: these are the request/result data shapes. The enrichment
-//! *models and prompts* live in downstream consumers, not here.
+//! This module defines request, result, and lifecycle schemas for external
+//! enrichment workers. It does not execute enrichment. Use [`crate::enrich`]
+//! to run Xberg's post-extraction enrichment stages.
 //!
 //! # Types
 //!
@@ -11,23 +12,6 @@
 //! | [`EnrichResult`] | Structured output from a completed enrichment pass |
 //! | [`EnrichStatus`] | Tagged-union status for async enrichment pipelines |
 //!
-//! # Design notes
-//!
-//! **`EnrichTextMessage` was deliberately not lifted.** The cloud source wraps the
-//! options together with a `job_id` (ULID) and `project_id` (UUID) that are
-//! NATS JetStream / multi-tenant transport concerns with no OSS meaning. Lifting them
-//! here would couple the OSS library to a specific queueing topology.
-//!
-//! **`EnrichResult::entities` uses `Vec<Entity>` instead of `serde_json::Value`.**
-//! The cloud stores entities as an opaque JSON blob because it serialises through
-//! MessagePack without a common schema. The OSS library already defines a
-//! well-typed [`Entity`] / `EntityCategory` hierarchy in `crates/xberg/src/types/entity.rs`;
-//! using it here gives consumers a typed API without a lossy round-trip through
-//! `serde_json::Value`.
-//!
-//! **`EnrichResult::labels` uses `Vec<String>`** to mirror `EnrichOptions::labels`
-//! (passthrough labels). The cloud source stores them as `Option<serde_json::Value>`;
-//! in OSS context a concrete `Vec<String>` is both cleaner and sufficient.
 
 use serde::{Deserialize, Serialize};
 

@@ -9,12 +9,12 @@ import (
 )
 
 func main() {
-	maxChars := 1000
-	maxOverlap := 200
+	maxChars := uint(1000)
+	overlap := uint(200)
 	cfg := xberg.ExtractionConfig{
 		Chunking: &xberg.ChunkingConfig{
-			MaxChars:   &maxChars,
-			MaxOverlap: &maxOverlap,
+			MaxCharacters: &maxChars,
+			Overlap:       &overlap,
 		},
 	}
 
@@ -25,7 +25,8 @@ func main() {
 	}
 
 	for i, chunk := range result.Results[0].Chunks {
-		fmt.Printf("Chunk %d/%d (%d-%d)\n", i+1, chunk.Metadata.TotalChunks, chunk.Metadata.CharStart, chunk.Metadata.CharEnd)
+		// Byte offsets (UTF-8 valid boundaries) into the original document text.
+		fmt.Printf("Chunk %d/%d (%d-%d)\n", i+1, chunk.Metadata.TotalChunks, chunk.Metadata.ByteStart, chunk.Metadata.ByteEnd)
 		fmt.Printf("%s...\n", chunk.Content[:min(len(chunk.Content), 100)])
 	}
 }

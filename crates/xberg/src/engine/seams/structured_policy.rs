@@ -2,10 +2,7 @@
 //!
 //! The in-core default is [`DefaultStructuredPolicy`], which delegates verbatim
 //! to [`heuristics::choose_call_mode`](crate::heuristics::choose_call_mode) over
-//! the default [`StructuredThresholds`] and the default [`MergeMode`] — exactly
-//! the decision xberg makes today. Alternative policies implement this trait and
-//! are injected via
-//! [`EngineBuilder::with_structured_policy`](super::super::EngineBuilder::with_structured_policy).
+//! the default [`StructuredThresholds`] and the default [`MergeMode`].
 
 use crate::core::config::MergeMode;
 use crate::heuristics::{StructuredCallMode, StructuredInput, StructuredThresholds, choose_call_mode};

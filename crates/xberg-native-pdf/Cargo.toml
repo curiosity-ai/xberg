@@ -1,0 +1,126 @@
+[package]
+name = "xberg-native-pdf"
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+# Upstream authorship is retained deliberately -- see ATTRIBUTIONS.md and LICENSE. ~keep
+authors = [
+  "Na'aman Hirschfeld <naaman@xberg.io>",
+  "Tobias Perelstein <tobias@xberg.io>",
+]
+license = "MIT"
+description = "PDF parsing, extraction and rendering -- the native PDF engine behind xberg."
+repository.workspace = true
+documentation = "https://docs.rs/xberg-native-pdf"
+readme = "README.md"
+keywords = ["pdf", "text-extraction", "pdf-parser", "pdf-rendering", "document-parser"]
+categories = ["parsing", "text-processing"]
+# `include` is load-bearing, not tidiness. tests/ is ~10 MB dominated by PDFs and TTFs that
+# compress poorly; shipping it would push the .crate past crates.io's 10 MiB ceiling. Only the
+# six fixtures the doctests and packaged unit tests actually read are listed. ~keep
+include = [
+  "/src/**/*",
+  "/Cargo.toml",
+  "/LICENSE",
+  "/README.md",
+  "/ATTRIBUTIONS.md",
+  "/CHANGELOG.md",
+  "/tests/fixtures/jpx/sample_gray.jp2",
+  "/tests/fixtures/encrypted_needs_password.pdf",
+  "/tests/fixtures/encrypted_cid_truetype.pdf",
+  "/tests/fixtures/encrypted_objstm.pdf",
+  "/tests/fixtures/simple.pdf",
+  "/tests/fixtures/fonts/StandardSymbolsPS.otf",
+]
+
+[package.metadata.docs.rs]
+# The two features left both gate real pub fns
+# (fonts::form_fallback::{font_bytes, render_cjk_fallback_bytes}) that are
+# otherwise invisible on docs.rs, so enable both rather than dropping the key.
+features = ["cjk-form-fonts", "cjk-render-fallback"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+[package.metadata.cargo-machete]
+ignored = ["md-5"]
+
+[lib]
+# ~keep The tracing log target is `module_path!()`, rooted at THIS name -- not at the
+# dependency key a consumer writes. Changing it moves every one of this crate's ~680 tracing
+# call sites into a new target namespace with nothing failing to compile, which is how GH#697
+# lost twelve days of font warnings. `LOG_TARGET_ROOT` in src/lib.rs exports the live value so
+# consumers filter on that rather than on a copied string literal.
+name = "xberg_native_pdf"
+crate-type = ["rlib"]
+
+[features]
+# Everything this crate can do is unconditional. The only knobs left bundle
+# multi-megabyte fonts via include_bytes!, and xberg's wasm bundle sits inside
+# a hard CDN size budget, so they stay opt-in. ~keep
+default = []
+cjk-form-fonts = []
+cjk-render-fallback = []
+
+[dependencies]
+aes = "0.9"
+base64 = "0.23"
+brotli = "8"
+byteorder = "1.5"
+bytes = "1.12"
+cbc = "0.2"
+chrono = "0.4"
+encoding_rs = "0.8"
+fast_image_resize = "6"
+fax = "0.3"
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs"] }
+getrandom = "0.4"
+harfrust = "0.13"
+hayro-jbig2 = { version = "0.3", default-features = false }
+hayro-jpeg2000 = { version = "0.4", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "tiff"] }
+jpeg-decoder = { version = "0.3", default-features = false }                               # default = ["rayon"]; this crate has no other rayon user ~keep
+md-5 = "0.11"
+memchr = "2"
+nom = "8.0"
+phf = { version = "0.14", features = ["macros"] }
+qcms = "0.3"
+quick-xml = "0.42"
+regex = "1.13"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+skrifa = "0.46"
+smallvec = "1.15"
+stringprep = "0.1"
+subsetter = { version = "0.2", default-features = false }                                  # drops the duplicate skrifa 0.42/read-fonts 0.39 stack ~keep
+thiserror = "2.0"
+tiny-skia = "0.12"
+tracing = "0.1"
+# `hardcoded-data` carries the bidi class tables `bidi_class` reads. Without
+# it the crate compiles only while some other dependency happens to turn the
+# feature on, so it is declared here rather than relied on by unification.
+unicode-bidi = { version = "0.3", default-features = false, features = ["hardcoded-data"] }
+unicode-normalization = "0.1"
+uuid = { version = "1.25", features = ["v4", "js"] }
+weezl = "0.2"
+
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom = { version = "0.4", features = ["wasm_js"] }
+
+# Mirrors fontdb's own target gating for this dependency: Linux/BSD system-font
+# discovery (src/vendor/fontdb) reads the host's fontconfig config to resolve
+# CSS generic-family defaults and font directories; macOS/Windows don't use
+# fontconfig at all. ~keep
+[target.'cfg(all(unix, not(any(target_os = "macos", target_os = "android"))))'.dependencies]
+fontconfig-parser = { version = "0.5", default-features = false }
+
+[dev-dependencies]
+aes = "0.9"
+cbc = "0.2"
+hex-literal = "1.1.0"
+jpeg-encoder = "0.7.1"
+sha2 = "0.11"
+tempfile = "3.27"
+tracing-subscriber = "0.3"
+
+[lints]
+workspace = true

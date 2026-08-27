@@ -208,10 +208,10 @@ fn ocr_geometry_bounds(geometry: &crate::types::OcrBoundingGeometry) -> (u32, u3
             height,
         } => (*left, *top, *width, *height),
         crate::types::OcrBoundingGeometry::Quadrilateral { points } => {
-            let min_x = points.iter().map(|(x, _)| *x).min().unwrap_or(0);
-            let max_x = points.iter().map(|(x, _)| *x).max().unwrap_or(0);
-            let min_y = points.iter().map(|(_, y)| *y).min().unwrap_or(0);
-            let max_y = points.iter().map(|(_, y)| *y).max().unwrap_or(0);
+            let min_x = points.iter().map(|point| point.x).min().unwrap_or(0);
+            let max_x = points.iter().map(|point| point.x).max().unwrap_or(0);
+            let min_y = points.iter().map(|point| point.y).min().unwrap_or(0);
+            let max_y = points.iter().map(|point| point.y).max().unwrap_or(0);
             (min_x, min_y, max_x.saturating_sub(min_x), max_y.saturating_sub(min_y))
         }
     }
@@ -588,6 +588,7 @@ fn finish_cached_layout_document(
         speaker_notes: None,
         section_name: None,
         sheet_name: None,
+        image_preprocessing: whole_image_doc.metadata.image_preprocessing.clone(),
     }]);
     ImageExtractor::mark_ocr_extraction(&mut assembled);
     assembled
@@ -1037,6 +1038,7 @@ async fn extract_layout_regions(
     detections: &[crate::layout::LayoutDetection],
     ocr_config: &crate::core::config::OcrConfig,
     layout_config: Option<&crate::core::config::LayoutDetectionConfig>,
+    cancel_token: Option<&crate::cancellation::CancellationToken>,
 ) -> Result<InternalDocument> {
     let mut builder = InternalDocumentBuilder::new("image");
     let mut formulas = Vec::new();
@@ -1044,6 +1046,17 @@ async fn extract_layout_regions(
     #[cfg(not(feature = "formula-recognition"))]
     let _ = layout_config;
     for detection in detections {
+        // A timed-out extraction cancels this token (see
+        // `ExtractionConfig::ensure_cancel_token`); each region can involve a
+        // formula-recognition or OCR call, so stop dispatching further regions
+        // once cancelled rather than continuing until the last one finishes.
+        if cancel_token.is_some_and(crate::cancellation::CancellationToken::is_cancelled) {
+            processing_warnings.push(crate::core::diagnostics::warning(
+                "layout-ocr",
+                "extraction cancelled; remaining layout regions were not OCR'd".to_string(),
+            ));
+            break;
+        }
         // A configured formula model takes the region crop directly; the
         // plain OCR text is the fallback when recognition yields nothing.
         #[cfg(feature = "formula-recognition")]
@@ -1307,13 +1320,22 @@ fn sparse_image_ocr_fallback_config(
 /// Falls back to the original bytes unchanged if decoding or normalization
 /// fails; OCR should still be attempted on the original image rather than
 /// aborting the extraction.
-#[cfg(feature = "ocr")]
+#[cfg(feature = "ocr-pipeline")]
+struct NormalizedOcrImage {
+    bytes: Vec<u8>,
+    metadata: Option<crate::types::ImagePreprocessingMetadata>,
+}
+
+#[cfg(feature = "ocr-pipeline")]
 fn normalize_image_bytes_for_ocr(
     content: &[u8],
     images_config: &crate::core::config::ImageExtractionConfig,
-) -> Vec<u8> {
+) -> NormalizedOcrImage {
     let Ok(decoded) = image::load_from_memory(content) else {
-        return content.to_vec();
+        return NormalizedOcrImage {
+            bytes: content.to_vec(),
+            metadata: None,
+        };
     };
     let rgb = decoded.into_rgb8();
     let (width, height) = rgb.dimensions();
@@ -1328,14 +1350,31 @@ fn normalize_image_bytes_for_ocr(
     ) {
         Ok(result) => {
             let (new_width, new_height) = result.dimensions;
-            encode_rgb_as_png(&result.rgb_data, new_width as u32, new_height as u32)
-                .unwrap_or_else(|_| content.to_vec())
+            match encode_rgb_as_png(&result.rgb_data, new_width as u32, new_height as u32) {
+                Ok(bytes) => NormalizedOcrImage {
+                    bytes,
+                    metadata: Some(result.metadata),
+                },
+                Err(error) => {
+                    tracing::warn!(%error, "failed to encode normalized OCR image; using original image");
+                    NormalizedOcrImage {
+                        bytes: content.to_vec(),
+                        metadata: None,
+                    }
+                }
+            }
         }
-        Err(_) => content.to_vec(),
+        Err((error, _)) => {
+            tracing::warn!(%error, "failed to normalize OCR image; using original image");
+            NormalizedOcrImage {
+                bytes: content.to_vec(),
+                metadata: None,
+            }
+        }
     }
 }
 
-#[cfg(feature = "ocr")]
+#[cfg(feature = "ocr-pipeline")]
 fn encode_rgb_as_png(rgb_data: &[u8], width: u32, height: u32) -> Result<Vec<u8>> {
     use image::ImageEncoder;
 
@@ -1446,6 +1485,11 @@ fn enable_image_ocr_elements(config: &mut crate::core::config::OcrConfig, includ
     }
 }
 
+#[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
+fn apply_public_image_ocr_element_policy(document: &mut InternalDocument, config: &crate::core::config::OcrConfig) {
+    document.prebuilt_ocr_elements = config.select_public_elements(document.prebuilt_ocr_elements.take());
+}
+
 #[cfg_attr(alef, alef(skip))]
 /// Image extractor for various image formats.
 ///
@@ -1530,14 +1574,17 @@ impl ImageExtractor {
         // `ExtractionConfig::images`, so DPI/dimension normalization from
         // `ImageExtractionConfig` has to happen here, once, before any backend
         // ever sees the bytes (issue #209). ~keep
-        #[cfg(feature = "ocr")]
+        #[cfg(feature = "ocr-pipeline")]
         let normalized_ocr_bytes = config
             .images
             .as_ref()
             .map(|images_config| normalize_image_bytes_for_ocr(content, images_config));
-        #[cfg(feature = "ocr")]
-        let ocr_input: &[u8] = normalized_ocr_bytes.as_deref().unwrap_or(content);
-        #[cfg(not(feature = "ocr"))]
+        #[cfg(feature = "ocr-pipeline")]
+        let ocr_input: &[u8] = normalized_ocr_bytes
+            .as_ref()
+            .map(|normalized| normalized.bytes.as_slice())
+            .unwrap_or(content);
+        #[cfg(not(feature = "ocr-pipeline"))]
         let ocr_input: &[u8] = content;
 
         let ocr_result = backend.process_image(ocr_input, &ocr_config_with_format).await?;
@@ -1559,12 +1606,28 @@ impl ImageExtractor {
             }
             ocr_result
         };
+        #[cfg(feature = "ocr-pipeline")]
+        let ocr_result = {
+            let mut ocr_result = ocr_result;
+            if let Some(metadata) = normalized_ocr_bytes.and_then(|normalized| normalized.metadata) {
+                ocr_result.metadata.image_preprocessing = Some(metadata);
+            }
+            ocr_result
+        };
 
         let ocr_content = ocr_result.content;
         let ocr_metadata = ocr_result.metadata;
         let ocr_elements = ocr_result.ocr_elements;
         let ocr_formulas = ocr_result.formulas;
         let processing_warnings = ocr_result.processing_warnings;
+        // `ExtractedDocument::tables` (tables reconstructed by OCR table
+        // detection) used to be dropped here entirely: nothing on the
+        // standalone-image path ever read it, so a table found in a bare
+        // image never reached the output.
+        #[cfg(feature = "ocr")]
+        let ocr_tables = ocr_result.tables;
+        #[cfg(feature = "ocr")]
+        let ocr_internal_document = ocr_result.ocr_internal_document;
 
         #[cfg(feature = "ocr")]
         {
@@ -1575,13 +1638,46 @@ impl ImageExtractor {
                 config.pages.as_ref(),
             )?;
 
-            let mut doc = build_image_internal_document(Some(&ocr_extraction_result.content), None);
+            // The standalone-image path has no document-global structure pipeline
+            // behind it (unlike the PDF mixed route), so it is the one place that
+            // still needs to detect headings itself. Prefer the hOCR-derived
+            // element tree — which still carries per-paragraph `x_fsize` — so
+            // headings become real `Heading` elements the renderer understands,
+            // rather than a pre-escaped `## ` string baked into plain text (which
+            // produced `\#\#` under markdown escaping and leaked `## ` into
+            // `Plain` output). Only usable when OCR ran on the whole image in one
+            // pass: multi-frame TIFF page tracking slices `content` by byte
+            // offset and has no per-frame correspondence to hOCR elements, so it
+            // keeps the flat paragraph-split fallback.
+            let use_hocr_headings = ocr_extraction_result.page_contents.is_none();
+            let mut doc = match &ocr_internal_document {
+                Some(internal_doc) if use_hocr_headings && !internal_doc.elements.is_empty() => {
+                    build_image_internal_document_from_hocr_elements(&internal_doc.elements)
+                }
+                _ => build_image_internal_document(Some(&ocr_extraction_result.content), None),
+            };
             doc.metadata = ocr_metadata;
             doc.formulas = ocr_formulas;
             doc.processing_warnings = processing_warnings;
             Self::mark_ocr_extraction(&mut doc);
 
             doc.prebuilt_ocr_elements = ocr_elements;
+
+            let page_tables: Vec<std::sync::Arc<crate::types::Table>> = ocr_tables
+                .into_iter()
+                .map(|table| {
+                    let bbox = table.bounding_box;
+                    let table_index = doc.push_table(table.clone());
+                    let mut element = crate::types::internal::InternalElement::text(
+                        crate::types::internal::ElementKind::Table { table_index },
+                        "",
+                        0,
+                    );
+                    element.bbox = bbox;
+                    doc.push_element(element);
+                    std::sync::Arc::new(table)
+                })
+                .collect();
 
             if let Some(pages) = ocr_extraction_result.page_contents {
                 doc.prebuilt_pages = Some(pages);
@@ -1591,8 +1687,9 @@ impl ImageExtractor {
                     doc.prebuilt_pages = Some(vec![crate::types::PageContent {
                         page_number: 1,
                         content: text,
-                        tables: vec![],
+                        tables: page_tables,
                         image_indices: vec![],
+                        image_preprocessing: None,
                         hierarchy: None,
                         is_blank: None,
                         layout_regions: None,
@@ -1622,6 +1719,7 @@ impl ImageExtractor {
                     content: text,
                     tables: vec![],
                     image_indices: vec![],
+                    image_preprocessing: None,
                     hierarchy: None,
                     is_blank: None,
                     layout_regions: None,
@@ -1652,7 +1750,7 @@ impl ImageExtractor {
         })?;
         let images = [image];
 
-        let (text, _tables, ocr_elements, pipeline_doc, llm_usage, _page_texts, _rasters, formulas) =
+        let (text, _tables, ocr_elements, pipeline_doc, llm_usage, _page_texts, _rasters, formulas, _) =
             Box::pin(crate::extractors::pdf::ocr::run_ocr_pipeline(
                 None,
                 Some(&images),
@@ -1691,6 +1789,7 @@ impl ImageExtractor {
                 content: trimmed,
                 tables: vec![],
                 image_indices: vec![],
+                image_preprocessing: None,
                 hierarchy: None,
                 is_blank: None,
                 layout_regions: None,
@@ -1790,6 +1889,7 @@ impl ImageExtractor {
             &detections,
             &region_ocr_config,
             config.layout.as_ref(),
+            config.cancel_token.as_ref(),
         )
         .await
         {
@@ -1798,6 +1898,103 @@ impl ImageExtractor {
         };
         Ok(select_image_ocr_result(region_doc, whole_image_result))
     }
+}
+
+/// Minimum ratio of a paragraph's average hOCR font size (`x_fsize`) to the
+/// image's median paragraph font size before the paragraph is promoted to a
+/// heading (#185).
+///
+/// The standalone-image path is the last OCR route that still needs this
+/// heuristic locally: it has no document-global structure pipeline behind it
+/// (unlike the PDF mixed route, which classifies headings itself from the
+/// same `x_fsize` attribute across the whole document). See
+/// `ocr::processor::execution::flatten_hocr_elements_to_text` for why that
+/// function no longer bakes headings into its output string.
+#[cfg(feature = "ocr")]
+const STANDALONE_IMAGE_HEADING_FONT_SIZE_RATIO: f64 = 1.3;
+
+/// Maximum word count for a large-font paragraph to still be treated as a
+/// heading; see [`STANDALONE_IMAGE_HEADING_FONT_SIZE_RATIO`].
+#[cfg(feature = "ocr")]
+const STANDALONE_IMAGE_HEADING_MAX_WORD_COUNT: usize = 12;
+
+/// Read the paragraph-average hOCR font size stored by `hocr_parser`.
+#[cfg(feature = "ocr")]
+fn standalone_image_element_font_size(element: &crate::types::internal::InternalElement) -> Option<f64> {
+    element
+        .attributes
+        .as_ref()?
+        .get(crate::ocr::hocr_parser::HOCR_FONT_SIZE_ATTRIBUTE)?
+        .parse::<f64>()
+        .ok()
+}
+
+/// Build an `InternalDocument` from hOCR-derived paragraph elements.
+///
+/// Promotes large-font, short, single-line paragraphs to real `Heading`
+/// elements rather than baking `## ` into a plain-text string: a pre-escaped
+/// string is indistinguishable from literal user text once it reaches a
+/// renderer, so it either leaks markdown syntax into `Plain` output or gets
+/// escaped to `\#\#` by the markdown renderer. Always pushes the image
+/// itself as an `Image` node, matching `build_image_internal_document`.
+#[cfg(feature = "ocr")]
+fn build_image_internal_document_from_hocr_elements(
+    elements: &[crate::types::internal::InternalElement],
+) -> InternalDocument {
+    use crate::types::internal::ElementKind;
+
+    let mut font_sizes: Vec<f64> = elements.iter().filter_map(standalone_image_element_font_size).collect();
+    let median_font_size = if font_sizes.is_empty() {
+        None
+    } else {
+        font_sizes.sort_by(f64::total_cmp);
+        Some(font_sizes[font_sizes.len() / 2])
+    };
+
+    let mut builder = InternalDocumentBuilder::new("image");
+    for element in elements {
+        if matches!(element.kind, ElementKind::PageBreak) || element.text.is_empty() {
+            continue;
+        }
+        let is_heading = median_font_size.is_some_and(|median| {
+            standalone_image_element_font_size(element).is_some_and(|size| {
+                size >= median * STANDALONE_IMAGE_HEADING_FONT_SIZE_RATIO
+                    && !element.text.contains('\n')
+                    && element.text.split_whitespace().count() <= STANDALONE_IMAGE_HEADING_MAX_WORD_COUNT
+            })
+        });
+        if is_heading {
+            builder.push_heading(1, &element.text, None, None);
+        } else {
+            builder.push_paragraph(&element.text, vec![], None, None);
+        }
+    }
+    push_image_placeholder(&mut builder);
+    builder.build()
+}
+
+/// Push a placeholder `Image` element carrying no binary data.
+fn push_image_placeholder(builder: &mut InternalDocumentBuilder) {
+    use crate::types::document_structure::ContentLayer;
+    use crate::types::internal::{ElementKind, InternalElement, InternalElementId};
+
+    let kind = ElementKind::Image { image_index: 0 };
+    let id = InternalElementId::generate(kind.discriminant(), "", None, 0);
+    builder.push_element(InternalElement {
+        id,
+        kind,
+        text: String::new(),
+        depth: 0,
+        page: None,
+        bbox: None,
+        layer: ContentLayer::Body,
+        annotations: Vec::new(),
+        attributes: None,
+        anchor: None,
+        ocr_geometry: None,
+        ocr_confidence: None,
+        ocr_rotation: None,
+    });
 }
 
 /// Build a simple `InternalDocument` for an image extraction result.
@@ -1821,26 +2018,7 @@ fn build_image_internal_document(
     if let Some(img) = image_data {
         builder.push_image(None, img, None, None);
     } else {
-        use crate::types::document_structure::ContentLayer;
-        use crate::types::internal::{ElementKind, InternalElement, InternalElementId};
-
-        let kind = ElementKind::Image { image_index: 0 };
-        let id = InternalElementId::generate(kind.discriminant(), "", None, 0);
-        builder.push_element(InternalElement {
-            id,
-            kind,
-            text: String::new(),
-            depth: 0,
-            page: None,
-            bbox: None,
-            layer: ContentLayer::Body,
-            annotations: Vec::new(),
-            attributes: None,
-            anchor: None,
-            ocr_geometry: None,
-            ocr_confidence: None,
-            ocr_rotation: None,
-        });
+        push_image_placeholder(&mut builder);
     }
     builder.build()
 }
@@ -1897,6 +2075,101 @@ impl Plugin for ImageExtractor {
     }
 }
 
+/// Reject a multi-frame TIFF whose frame count exceeds `security_limits.max_pages`
+/// before per-frame OCR begins (#1451).
+///
+/// TIFF is the only image container this crate treats as multi-page: frames are
+/// OCR'd and their text tracked per page (see
+/// `crate::extraction::image::extract_text_from_image_with_ocr`), while an
+/// animated PNG/WebP/JPEG is always OCR'd as one whole image regardless of frame
+/// count. Counting is only possible under the `ocr` feature, the sole feature
+/// that pulls in the `tiff` crate `detect_tiff_frame_count` needs to walk IFDs
+/// without decoding any raster data; other OCR feature combinations
+/// (`ocr-wasm`, `ocr-pipeline` alone) have no way to count frames cheaply, so
+/// this is a no-op there and `max_pages` goes unenforced on TIFF in those
+/// builds.
+#[cfg(feature = "ocr")]
+fn enforce_image_page_limit(content: &[u8], mime_type: &str, config: &ExtractionConfig) -> Result<()> {
+    let max_pages = config.security_limits.as_ref().and_then(|limits| limits.max_pages);
+    let Some(max_pages) = max_pages else {
+        return Ok(());
+    };
+    if !mime_type.to_lowercase().contains("tiff") {
+        return Ok(());
+    }
+    let Ok(frame_count) = crate::extraction::image::detect_tiff_frame_count(content) else {
+        return Ok(());
+    };
+    Ok(crate::extractors::security::enforce_page_count(
+        frame_count,
+        Some(max_pages),
+    )?)
+}
+
+/// Guards the one-time "max_pages is unenforced for TIFF" warning so it fires
+/// at most once per process, not once per extraction — same idiom as
+/// `DEFAULT_CAP_WARNED` in `core::config::concurrency`.
+#[cfg(not(feature = "ocr"))]
+static UNENFORCED_TIFF_PAGE_LIMIT_WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Emit the "`max_pages` is unenforced for TIFF in this build" warning at most
+/// once per `already_warned` guard.
+///
+/// The guard is a parameter rather than a direct read of
+/// [`UNENFORCED_TIFF_PAGE_LIMIT_WARNED`] so the once-per-process property can be
+/// tested against a guard the test owns, following
+/// `warn_default_thread_cap_once` in `core::config::concurrency`: asserting on
+/// the real global from more than one test would be unfixably racy.
+#[cfg(not(feature = "ocr"))]
+fn warn_unenforced_tiff_page_limit_once(already_warned: &std::sync::atomic::AtomicBool, max_pages: usize) {
+    if already_warned
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_ok()
+    {
+        tracing::warn!(
+            max_pages,
+            "security_limits.max_pages is set but cannot be enforced on TIFF images in this \
+             build: counting TIFF frames requires the `ocr` feature, which this build does not \
+             have enabled. TIFF page limits are silently unenforced until the binary is rebuilt \
+             with `--features ocr`."
+        );
+    }
+}
+
+/// No-op stub for builds without the `ocr` feature: there is no `tiff` crate
+/// dependency available to count frames, so `max_pages` is not enforced on TIFF
+/// images at all in these builds (see `SecurityLimits::max_pages`'s doc
+/// comment). A one-shot warning surfaces the gap instead of silently ignoring
+/// a limit the caller explicitly set.
+#[cfg(not(feature = "ocr"))]
+fn enforce_image_page_limit(_content: &[u8], mime_type: &str, config: &ExtractionConfig) -> Result<()> {
+    enforce_image_page_limit_stub_with_guard(mime_type, config, &UNENFORCED_TIFF_PAGE_LIMIT_WARNED)
+}
+
+/// Pure core of the `not(feature = "ocr")` [`enforce_image_page_limit`], parameterized on the
+/// one-shot warning guard so tests can exercise it without touching process-global state.
+#[cfg(not(feature = "ocr"))]
+fn enforce_image_page_limit_stub_with_guard(
+    mime_type: &str,
+    config: &ExtractionConfig,
+    already_warned: &std::sync::atomic::AtomicBool,
+) -> Result<()> {
+    let max_pages = config.security_limits.as_ref().and_then(|limits| limits.max_pages);
+    let Some(max_pages) = max_pages else {
+        return Ok(());
+    };
+    if !mime_type.to_lowercase().contains("tiff") {
+        return Ok(());
+    }
+    warn_unenforced_tiff_page_limit_once(already_warned, max_pages);
+    Ok(())
+}
+
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl InternalDocumentExtractor for ImageExtractor {
@@ -1907,6 +2180,7 @@ impl InternalDocumentExtractor for ImageExtractor {
         config: &ExtractionConfig,
     ) -> Result<InternalDocument> {
         tracing::debug!(format = "image", size_bytes = content.len(), "extraction starting");
+        enforce_image_page_limit(content, mime_type, config)?;
         let extraction_metadata = extract_image_metadata(content)?;
         // Computed against the original bytes (before any HEIC->PNG rebinding
         // below) so it reflects the same input `extract_image_metadata` saw. ~keep
@@ -1994,6 +2268,9 @@ impl InternalDocumentExtractor for ImageExtractor {
                     || self.extract_with_ocr(content, mime_type, config),
                 )
                 .await?;
+                if let Some(ocr_config) = config.ocr.as_ref() {
+                    apply_public_image_ocr_element_policy(&mut doc, ocr_config);
+                }
                 Self::mark_ocr_extraction(&mut doc);
                 doc.metadata.format = Some(crate::types::FormatMetadata::Image(image_metadata));
                 doc.mime_type = mime_type.to_string();
@@ -2012,6 +2289,9 @@ impl InternalDocumentExtractor for ImageExtractor {
             ))]
             {
                 let mut doc = self.extract_with_ocr(content, mime_type, config).await?;
+                if let Some(ocr_config) = config.ocr.as_ref() {
+                    apply_public_image_ocr_element_policy(&mut doc, ocr_config);
+                }
                 Self::mark_ocr_extraction(&mut doc);
                 doc.metadata.format = Some(crate::types::FormatMetadata::Image(image_metadata));
                 doc.mime_type = mime_type.to_string();
@@ -2086,6 +2366,57 @@ impl InternalDocumentExtractor for ImageExtractor {
 mod tests {
     use super::*;
 
+    /// #860: `normalize_image_bytes_for_ocr` applies `ImageExtractionConfig`'s
+    /// `max_image_dimension` / DPI settings at the extractor boundary, because OCR
+    /// backends only ever see `OcrConfig` and have no route back to them (#209).
+    ///
+    /// It used to be gated on `feature = "ocr"`, while `extract_with_ocr` is gated on
+    /// `ocr` OR `ocr-wasm` OR `ocr-pipeline`. Every `candle-*` backend — and any
+    /// `liter-llm` VLM-only build — implies `ocr-pipeline` but NOT `ocr`, so those
+    /// builds took the `#[cfg(not(feature = "ocr"))]` arm and passed the raw bytes
+    /// through with the settings silently dropped.
+    ///
+    /// Run this under a candle-only feature set to see the fix: before it, the
+    /// function did not exist in such a build at all.
+    #[cfg(feature = "ocr-pipeline")]
+    #[test]
+    fn normalizes_a_standalone_image_to_the_configured_maximum_dimension() {
+        let oversized = image::RgbImage::from_pixel(1200, 600, image::Rgb([255, 255, 255]));
+        let png = encode_rgb_as_png(oversized.as_raw(), 1200, 600).expect("encode the fixture");
+
+        let images_config = crate::core::config::ImageExtractionConfig {
+            max_image_dimension: 300,
+            auto_adjust_dpi: false,
+            ..Default::default()
+        };
+        let normalized = normalize_image_bytes_for_ocr(&png, &images_config);
+
+        assert_ne!(
+            normalized.bytes, png,
+            "the oversized image should not pass through unchanged"
+        );
+        let decoded = image::load_from_memory(&normalized.bytes).expect("decode the normalized image");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (300, 150),
+            "the long edge should be clamped to max_image_dimension, preserving the 2:1 aspect ratio"
+        );
+        let metadata = normalized
+            .metadata
+            .expect("successful standalone-image normalization must retain metadata");
+        assert_eq!(metadata.original_dimensions.width, 1200);
+        assert_eq!(metadata.original_dimensions.height, 600);
+        assert_eq!(
+            metadata.new_dimensions.as_ref().map(|dimensions| dimensions.width),
+            Some(300)
+        );
+        assert_eq!(
+            metadata.new_dimensions.as_ref().map(|dimensions| dimensions.height),
+            Some(150)
+        );
+        assert!(metadata.dimension_clamped);
+    }
+
     #[cfg(any(feature = "ocr", feature = "ocr-wasm", feature = "ocr-pipeline"))]
     #[test]
     fn should_apply_vertical_block_psm_to_default_vertical_tesseract_config() {
@@ -2138,6 +2469,83 @@ mod tests {
         let tesseract_config = ocr_config.tesseract_config.expect("explicit config must remain");
         assert_eq!(tesseract_config.psm, 4);
         assert_eq!(tesseract_config.language, vec!["jpn_vert"]);
+    }
+
+    #[cfg(feature = "ocr")]
+    fn hocr_text_element_with_font_size(text: &str, font_size: Option<f64>) -> crate::types::internal::InternalElement {
+        let mut element = crate::types::internal::InternalElement::text(
+            crate::types::internal::ElementKind::OcrText {
+                level: crate::types::OcrElementLevel::Block,
+            },
+            text,
+            0,
+        );
+        if let Some(size) = font_size {
+            element.attributes.get_or_insert_with(Default::default).insert(
+                crate::ocr::hocr_parser::HOCR_FONT_SIZE_ATTRIBUTE.to_string(),
+                size.to_string(),
+            );
+        }
+        element
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn standalone_image_plain_output_never_contains_markdown_heading_syntax() {
+        // Regression test: `Plain` is the default output format and must never
+        // contain markdown syntax. The standalone-image OCR path used to feed a
+        // pre-baked `## Nasdaq & AMEX` string (produced by the now-removed
+        // heading heuristic in `ocr::processor::execution`) straight into
+        // `build_image_internal_document`, which stored it as literal paragraph
+        // text. `render_plain` then emitted that text unchanged, leaking `## `
+        // into `Plain` output. This must fail against that behavior.
+        let elements = vec![
+            hocr_text_element_with_font_size("Nasdaq & AMEX", Some(28.0)),
+            hocr_text_element_with_font_size("Body text at normal size.", Some(12.0)),
+        ];
+
+        let doc = build_image_internal_document_from_hocr_elements(&elements);
+        let plain = crate::rendering::render_plain(&doc);
+
+        assert!(
+            !plain.contains('#'),
+            "Plain output must contain no markdown syntax: {plain:?}"
+        );
+        assert_eq!(plain, "Nasdaq & AMEX\n\nBody text at normal size.");
+    }
+
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn standalone_image_markdown_output_emits_unescaped_heading() {
+        // Regression test: feeding a pre-baked `## ` string into
+        // `build_image_internal_document` (the old behavior) made the markdown
+        // renderer treat it as literal paragraph text and escape it to
+        // `\#\# Nasdaq & AMEX`, instead of a real level-1 `# Nasdaq & AMEX`
+        // heading, because the renderer has no way to distinguish "this text
+        // happens to start with #" from "this is a heading" once it has been
+        // flattened to a string. Expressing the promotion as a real `Heading`
+        // element (this function) avoids that ambiguity. This must fail
+        // against the old flat-text path, which produces
+        // "\\#\\# Nasdaq & AMEX" instead.
+        // Three elements, not two: the promotion is median-based, so the body size must be the
+        // median. With a single body element the median IS the heading size and nothing can exceed it.
+        let elements = vec![
+            hocr_text_element_with_font_size("Nasdaq & AMEX", Some(28.0)),
+            hocr_text_element_with_font_size("Body text at normal size.", Some(12.0)),
+            hocr_text_element_with_font_size("More body text at normal size.", Some(12.0)),
+        ];
+
+        let doc = build_image_internal_document_from_hocr_elements(&elements);
+        let markdown = crate::rendering::render_markdown(&doc);
+
+        assert!(
+            markdown.contains("# Nasdaq & AMEX"),
+            "markdown output must contain an unescaped level-1 heading: {markdown:?}"
+        );
+        assert!(
+            !markdown.contains(r"\#"),
+            "markdown output must not escape the heading marker: {markdown:?}"
+        );
     }
 
     #[cfg(all(
@@ -2246,6 +2654,39 @@ mod tests {
 
             assert_eq!(tesseract_config.psm, SPARSE_IMAGE_OCR_FALLBACK_PSM);
             assert!(tesseract_config.preprocessing.is_some());
+        }
+
+        /// Regression test for the standalone-image-OCR variant of the `TesseractConfig`
+        /// duplication hazard: `apply_default_whole_image_tesseract_psm` materializes
+        /// `crate::types::TesseractConfig::default()` (the public struct) whenever the
+        /// caller never set `tesseract_config` explicitly, which is the default path for
+        /// every plain image (PNG/JPG/TIFF/...) OCR request. That materialized value is
+        /// later converted into `crate::ocr::types::TesseractConfig` (the internal,
+        /// engine-facing struct) via `From`, which carries the value across as-is — it does
+        /// NOT fall back to the internal struct's own `Default`. So if the public struct's
+        /// default ever drifts from the internal struct's default, standalone image OCR
+        /// silently keeps using the stale public value while other callers that reach the
+        /// internal `Default` directly (e.g. PDF-embedded OCR, which never calls this
+        /// function) get the current one.
+        ///
+        /// Against the unfixed code, `crate::types::TesseractConfig::default()` still has
+        /// `language_model_ngram_on: false`, so this assertion fails with `false` even
+        /// though `crate::ocr::types::TesseractConfig::default()` already has `true`.
+        #[test]
+        fn should_apply_public_ngram_default_to_whole_image_tesseract_config() {
+            let mut whole_image_config = crate::core::config::OcrConfig::default();
+            apply_default_whole_image_tesseract_psm(&mut whole_image_config);
+
+            let tesseract_config = whole_image_config
+                .tesseract_config
+                .expect("default whole-image OCR must materialize a Tesseract configuration");
+
+            assert!(
+                tesseract_config.language_model_ngram_on,
+                "standalone image OCR must use the same language_model_ngram_on default as the \
+                 internal TesseractConfig, not a stale value baked in from the public struct's \
+                 own Default impl"
+            );
         }
     }
 
@@ -2362,6 +2803,7 @@ mod tests {
             content: text.to_string(),
             tables: vec![],
             image_indices: vec![],
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,
@@ -3038,6 +3480,82 @@ mod tests {
         assert!(try_retain_canonical_whole_image_ocr(&whole, &detections, 200, 100, source_is_single_frame).is_none());
     }
 
+    /// Build an in-memory, single-pixel-per-frame TIFF with `frame_count` frames.
+    #[cfg(feature = "ocr")]
+    fn build_multiframe_tiff(frame_count: usize) -> Vec<u8> {
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut encoder = tiff::encoder::TiffEncoder::new(&mut cursor).unwrap();
+            for i in 0..frame_count {
+                encoder
+                    .write_image::<tiff::encoder::colortype::Gray8>(1, 1, &[i as u8])
+                    .unwrap();
+            }
+        }
+        cursor.into_inner()
+    }
+
+    /// #1451: `max_pages` must reject a multi-frame TIFF once its frame count is
+    /// known, before per-frame OCR begins. Against unfixed code
+    /// `enforce_image_page_limit` does not exist at all, so this fails to compile;
+    /// once it exists but does not check frame count, it returns `Ok(())` for a
+    /// 3-frame TIFF under a configured limit of 2 instead of the expected
+    /// `SecurityError::TooManyPages`.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn should_reject_tiff_exceeding_max_pages() {
+        let tiff_bytes = build_multiframe_tiff(3);
+        let config = ExtractionConfig {
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_pages: Some(2),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = enforce_image_page_limit(&tiff_bytes, "image/tiff", &config)
+            .expect_err("a TIFF with more frames than max_pages must be rejected");
+        let message = error.to_string();
+        assert!(
+            message.contains("too many pages") || message.contains("max_pages"),
+            "error must name the limit that was hit: {message}"
+        );
+    }
+
+    /// A TIFF exactly at the configured `max_pages` ceiling must not be rejected --
+    /// the off-by-one boundary case #1451 asked to get right.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn should_accept_tiff_at_max_pages_boundary() {
+        let tiff_bytes = build_multiframe_tiff(3);
+        let config = ExtractionConfig {
+            security_limits: Some(crate::extractors::security::SecurityLimits {
+                max_pages: Some(3),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        assert!(
+            enforce_image_page_limit(&tiff_bytes, "image/tiff", &config).is_ok(),
+            "a TIFF exactly at max_pages must not be rejected"
+        );
+    }
+
+    /// The default `SecurityLimits` (`max_pages: None`) must never reject a
+    /// multi-frame TIFF: a real ceiling here is opt-in, not implied by #1451.
+    #[cfg(feature = "ocr")]
+    #[test]
+    fn should_accept_tiff_under_default_max_pages() {
+        let tiff_bytes = build_multiframe_tiff(3);
+        let config = ExtractionConfig::default();
+
+        assert!(
+            enforce_image_page_limit(&tiff_bytes, "image/tiff", &config).is_ok(),
+            "default security limits (max_pages: None) must not reject a multi-frame TIFF"
+        );
+    }
+
     #[cfg(all(feature = "layout-detection", feature = "ocr"))]
     #[test]
     fn should_clip_layout_regions_to_image_bounds_and_drop_invalid_boxes() {
@@ -3278,7 +3796,9 @@ mod tests {
     async fn test_extract_with_ocr_populates_pages_for_elements_gated_backend() {
         use crate::core::config::OcrConfig;
         use crate::plugins::{OcrBackend, OcrBackendType, Plugin, register_ocr_backend, unregister_ocr_backend};
-        use crate::types::{ExtractedDocument, OcrBoundingGeometry, OcrConfidence, OcrElement, OcrElementLevel};
+        use crate::types::{
+            ExtractedDocument, OcrBoundingGeometry, OcrConfidence, OcrElement, OcrElementConfig, OcrElementLevel,
+        };
 
         let mut png_buf = std::io::Cursor::new(Vec::new());
         image::ImageBuffer::<image::Rgb<u8>, _>::from_pixel(1, 1, image::Rgb([255u8, 255, 255]))
@@ -3302,16 +3822,25 @@ mod tests {
                 let include_elements = config.element_config.as_ref().is_some_and(|ec| ec.include_elements);
 
                 let elements = if include_elements {
-                    let geo = OcrBoundingGeometry::Rectangle {
-                        left: 0,
-                        top: 0,
-                        width: 100,
-                        height: 20,
+                    let element = |text: &str, level: OcrElementLevel, confidence: f64, left: u32, width: u32| {
+                        OcrElement::new(
+                            text.to_string(),
+                            OcrBoundingGeometry::Rectangle {
+                                left,
+                                top: 0,
+                                width,
+                                height: 20,
+                            },
+                            OcrConfidence::from_tesseract(confidence),
+                        )
+                        .with_level(level)
+                        .with_page_number(1)
                     };
-                    let elem = OcrElement::new("hello world".to_string(), geo, OcrConfidence::from_tesseract(99.0))
-                        .with_level(OcrElementLevel::Line)
-                        .with_page_number(1);
-                    Some(vec![elem])
+                    Some(vec![
+                        element("hello world", OcrElementLevel::Line, 99.0, 0, 100),
+                        element("hello", OcrElementLevel::Word, 95.0, 5, 30),
+                        element("noise", OcrElementLevel::Word, 20.0, 60, 30),
+                    ])
                 } else {
                     None
                 };
@@ -3363,12 +3892,59 @@ mod tests {
             "successful image OCR must be reflected in metadata"
         );
         assert_eq!(result.extraction_method, Some(crate::types::ExtractionMethod::Ocr));
+        assert!(
+            result.ocr_elements.is_none(),
+            "elements forced for internal page assembly must remain private unless requested"
+        );
         let pages = result
             .pages
             .as_ref()
             .expect("pages must be populated (regression of #705)");
         assert!(!pages.is_empty(), "pages[] must not be empty (regression of #705)");
         assert_eq!(pages[0].content.trim(), "hello world");
+
+        let explicitly_disabled = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                backend: "gated-elements-test".to_string(),
+                element_config: Some(OcrElementConfig::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let disabled_doc = extractor
+            .extract_content(&png_1x1, "image/png", &explicitly_disabled)
+            .await
+            .unwrap();
+        assert!(disabled_doc.prebuilt_ocr_elements.is_none());
+
+        let filtered_config = ExtractionConfig {
+            ocr: Some(OcrConfig {
+                backend: "gated-elements-test".to_string(),
+                element_config: Some(OcrElementConfig {
+                    include_elements: true,
+                    min_level: OcrElementLevel::Word,
+                    min_confidence: 0.8,
+                    build_hierarchy: true,
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let filtered_doc = extractor
+            .extract_content(&png_1x1, "image/png", &filtered_config)
+            .await
+            .unwrap();
+        let filtered = filtered_doc
+            .prebuilt_ocr_elements
+            .expect("requested custom-backend elements must be published");
+        assert_eq!(
+            filtered.iter().map(|element| element.text.as_str()).collect::<Vec<_>>(),
+            ["hello world", "hello"]
+        );
+        let line = filtered.iter().find(|element| element.text == "hello world").unwrap();
+        let word = filtered.iter().find(|element| element.text == "hello").unwrap();
+        assert!(line.parent_id.is_none());
+        assert!(word.parent_id.is_some());
 
         unregister_ocr_backend("gated-elements-test").unwrap();
     }
@@ -3694,5 +4270,284 @@ mod tests {
             1,
             "image count must survive the derive.rs conversion"
         );
+    }
+
+    /// Regression test for task #709: `extract_layout_regions` must stop dispatching
+    /// OCR calls for further layout regions once cancellation is signalled, instead of
+    /// working through every remaining region regardless.
+    ///
+    /// Proves the checkpoint actually stops work (not merely that an error comes back):
+    /// a counting backend records how many regions it was actually asked to OCR. With a
+    /// token cancelled *before* the call, the loop's first-iteration check must break
+    /// before the backend is invoked for *any* region, so the counter stays at 0 out of
+    /// 3 regions — against code with the checkpoint removed, this backend is invoked for
+    /// all 3 regions regardless of cancellation, so the counter would be 3, not 0.
+    #[cfg(all(feature = "layout-detection", any(feature = "ocr", feature = "ocr-wasm")))]
+    #[tokio::test]
+    async fn extract_layout_regions_stops_dispatching_once_cancelled() {
+        use crate::cancellation::CancellationToken;
+        use crate::core::config::OcrConfig;
+        use crate::layout::{BBox, LayoutClass, LayoutDetection};
+        use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
+        use crate::types::ExtractedDocument;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// A backend that counts how many regions it was actually asked to OCR,
+        /// standing in for a real (slow) OCR call so the test stays fast and
+        /// deterministic while still proving the loop-level checkpoint's effect.
+        struct CountingOcrBackend(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl OcrBackend for CountingOcrBackend {
+            fn backend_type(&self) -> OcrBackendType {
+                OcrBackendType::Custom
+            }
+            fn supports_language(&self, _: &str) -> bool {
+                true
+            }
+            async fn process_image(&self, _: &[u8], _: &OcrConfig) -> crate::Result<ExtractedDocument> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(ExtractedDocument {
+                    content: "region text".to_string(),
+                    ..Default::default()
+                })
+            }
+        }
+
+        impl Plugin for CountingOcrBackend {
+            fn name(&self) -> &str {
+                "counting-ocr-test-709"
+            }
+            fn version(&self) -> String {
+                "0.0.0".to_string()
+            }
+            fn initialize(&self) -> crate::Result<()> {
+                Ok(())
+            }
+            fn shutdown(&self) -> crate::Result<()> {
+                Ok(())
+            }
+        }
+
+        let rgb = image::RgbImage::from_pixel(100, 100, image::Rgb([255u8, 255, 255]));
+        let detections = vec![
+            LayoutDetection::new(LayoutClass::Text, 0.9, BBox::new(0.0, 0.0, 20.0, 20.0)),
+            LayoutDetection::new(LayoutClass::Text, 0.9, BBox::new(30.0, 0.0, 50.0, 20.0)),
+            LayoutDetection::new(LayoutClass::Text, 0.9, BBox::new(60.0, 0.0, 80.0, 20.0)),
+        ];
+        let ocr_config = OcrConfig::default();
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend: Arc<dyn OcrBackend> = Arc::new(CountingOcrBackend(Arc::clone(&calls)));
+        let cancelled_token = CancellationToken::new();
+        cancelled_token.cancel();
+
+        let doc = extract_layout_regions(
+            Arc::clone(&backend),
+            &rgb,
+            &detections,
+            &ocr_config,
+            None,
+            Some(&cancelled_token),
+        )
+        .await
+        .expect("extract_layout_regions must not error when cancelled, only skip remaining work");
+
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "no region should be OCR'd once the token is already cancelled"
+        );
+        assert!(
+            doc.processing_warnings
+                .iter()
+                .any(|warning| warning.message.contains("cancelled")),
+            "a cancelled run should explain why regions were skipped, got {:?}",
+            doc.processing_warnings
+        );
+
+        // Sanity check: the same 3 regions, uncancelled, all reach the backend — this
+        // rules out the zero count above being an unrelated bug (e.g. a bbox rejected
+        // by `encode_layout_region`) rather than the cancellation checkpoint.
+        calls.store(0, Ordering::SeqCst);
+        let _ = extract_layout_regions(Arc::clone(&backend), &rgb, &detections, &ocr_config, None, None)
+            .await
+            .expect("uncancelled extract_layout_regions must succeed");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "all 3 regions should be OCR'd when nothing is cancelled"
+        );
+    }
+
+    // -- enforce_image_page_limit stub (not(feature = "ocr")) -------------------
+    //
+    // The `ocr`-enabled sibling counts real TIFF frames and is exercised
+    // elsewhere; these tests cover the no-op stub compiled when the `tiff`
+    // crate isn't available, which instead emits a one-shot warning so a
+    // caller-set `max_pages` going unenforced is discoverable (#1451-adjacent).
+    //
+    // `warn_unenforced_tiff_page_limit_once` takes its "already warned" guard
+    // as a parameter rather than reading `UNENFORCED_TIFF_PAGE_LIMIT_WARNED`
+    // directly, mirroring `warn_default_thread_cap_once` in
+    // `core::config::concurrency`: a shared process-global guard can only be
+    // asserted from a single test without the assertion racing every other
+    // test in the binary that reaches the same code path. Three of the four
+    // tests below use a guard they own, so they are independent of each other
+    // and of test execution order; only the "fires" test below exercises the
+    // real global-backed entry point (`enforce_image_page_limit`), and it is
+    // the only test in this binary that does so.
+    #[cfg(not(feature = "ocr"))]
+    mod enforce_image_page_limit_stub {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{Arc, Mutex};
+
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::{EnvFilter, Layer};
+
+        use super::super::{ExtractionConfig, enforce_image_page_limit, enforce_image_page_limit_stub_with_guard};
+        use crate::extractors::security::SecurityLimits;
+
+        /// A tracing `Layer` that records the level of every emitted event.
+        #[derive(Clone, Default)]
+        struct EventCapture {
+            levels: Arc<Mutex<Vec<tracing::Level>>>,
+        }
+
+        impl<S> Layer<S> for EventCapture
+        where
+            S: tracing::Subscriber,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+                self.levels.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+
+        fn warn_event_count(capture: &EventCapture) -> usize {
+            capture
+                .levels
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|level| **level == tracing::Level::WARN)
+                .count()
+        }
+
+        fn config_with_max_pages(max_pages: usize) -> ExtractionConfig {
+            ExtractionConfig {
+                security_limits: Some(SecurityLimits {
+                    max_pages: Some(max_pages),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+
+        /// Changing this to `_content.is_empty()` (as opposed to inspecting
+        /// `mime_type`) would make this test pass for the wrong reason; the
+        /// content bytes are irrelevant to the stub, which is the point.
+        const TIFF_MIME: &str = "image/tiff";
+
+        /// The real, process-global-backed entry point warns exactly once
+        /// across repeated calls when `max_pages` is set on a TIFF. Bundled
+        /// into a single test (rather than a separate "fires" and "fires
+        /// once" test) because both assertions read the same global guard;
+        /// splitting them would make the pass/fail outcome depend on which
+        /// test the harness happens to run first.
+        ///
+        /// Fails if: the `if !mime_type...contains("tiff")` check in
+        /// `enforce_image_page_limit_stub_with_guard` is removed or inverted;
+        /// the `let Some(max_pages) = max_pages else { return Ok(()) };` guard
+        /// is removed; `warn_unenforced_tiff_page_limit_once` is changed to
+        /// unconditionally warn (no longer once); or the call to
+        /// `warn_unenforced_tiff_page_limit_once` is deleted altogether.
+        #[test]
+        fn fires_exactly_once_for_tiff_with_max_pages_set_across_repeated_calls() {
+            let capture = EventCapture::default();
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new("warn"))
+                .with(capture.clone());
+            let config = config_with_max_pages(3);
+
+            tracing::subscriber::with_default(subscriber, || {
+                for _ in 0..5 {
+                    let result = enforce_image_page_limit(b"unused", TIFF_MIME, &config);
+                    assert!(result.is_ok(), "the stub warns but never rejects extraction");
+                }
+            });
+
+            assert_eq!(
+                warn_event_count(&capture),
+                1,
+                "expected exactly one WARN across repeated calls, got {:?}",
+                capture.levels.lock().unwrap()
+            );
+        }
+
+        /// Fails if: the `let Some(max_pages) = max_pages else { return
+        /// Ok(()) };` early return in `enforce_image_page_limit_stub_with_guard`
+        /// is removed (or its condition inverted), causing an unset
+        /// `max_pages` to warn anyway.
+        #[test]
+        fn does_not_fire_when_max_pages_is_unset() {
+            let already_warned = AtomicBool::new(false);
+            let capture = EventCapture::default();
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new("warn"))
+                .with(capture.clone());
+            let config = ExtractionConfig::default();
+            assert!(config.security_limits.is_none());
+
+            let result = tracing::subscriber::with_default(subscriber, || {
+                enforce_image_page_limit_stub_with_guard(TIFF_MIME, &config, &already_warned)
+            });
+
+            assert!(result.is_ok());
+            assert_eq!(warn_event_count(&capture), 0);
+        }
+
+        /// Fails if: the `if !mime_type.to_lowercase().contains("tiff") {
+        /// return Ok(()); }` guard in `enforce_image_page_limit_stub_with_guard`
+        /// is removed (or its condition inverted), causing a non-TIFF mime type
+        /// to warn.
+        #[test]
+        fn does_not_fire_for_non_tiff_mime() {
+            let already_warned = AtomicBool::new(false);
+            let capture = EventCapture::default();
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new("warn"))
+                .with(capture.clone());
+            let config = config_with_max_pages(3);
+
+            let result = tracing::subscriber::with_default(subscriber, || {
+                enforce_image_page_limit_stub_with_guard("image/png", &config, &already_warned)
+            });
+
+            assert!(result.is_ok());
+            assert_eq!(warn_event_count(&capture), 0);
+        }
+
+        /// A second, independently-guarded call for a TIFF with `max_pages`
+        /// set still succeeds and still warns — proving the "does not fire"
+        /// tests above are silent because their inputs don't qualify, not
+        /// because the warning path is broken. Fails under the same mutations
+        /// as `fires_exactly_once_for_tiff_with_max_pages_set_across_repeated_calls`.
+        #[test]
+        fn fires_when_max_pages_is_set_and_mime_is_tiff_with_a_fresh_guard() {
+            let already_warned = AtomicBool::new(false);
+            let capture = EventCapture::default();
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new("warn"))
+                .with(capture.clone());
+            let config = config_with_max_pages(3);
+
+            let result = tracing::subscriber::with_default(subscriber, || {
+                enforce_image_page_limit_stub_with_guard(TIFF_MIME, &config, &already_warned)
+            });
+
+            assert!(result.is_ok());
+            assert_eq!(warn_event_count(&capture), 1);
+        }
     }
 }

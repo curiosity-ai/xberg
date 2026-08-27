@@ -17,7 +17,7 @@ use ort::value::Value;
 use tokenizers::Tokenizer;
 /// Pooling strategy for extracting a single fixed-length vector from per-token embeddings.
 #[cfg_attr(alef, alef(skip))]
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Pooling {
     /// Use the `[CLS]` token embedding (first token).
     Cls,

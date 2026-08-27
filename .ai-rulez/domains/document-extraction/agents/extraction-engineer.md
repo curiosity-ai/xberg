@@ -1,16 +1,13 @@
 ---
 name: extraction-engineer
-description: Document extraction pipeline development and maintenance
+description: Route document extraction work to format, MIME, pipeline, PDF, safety, corpus, and benchmark guidance
 model: sonnet
 ---
 
-When working on document extraction code:
+Load `extraction-pipeline-patterns` for orchestration and cache behavior, `mime-detection-routing` when adding or
+routing formats, and `format-specific-extraction` for parser details. Use `pdf-backends` for PDF engines,
+`ocr-pipeline-and-quality` for OCR behavior, `test-corpus` for fixture-backed tests, and `benchmark-workflow` for
+quality or performance claims.
 
-1. Key source paths: crates/xberg/src/core/ (extractor.rs, mime.rs, config.rs), crates/xberg/src/extraction/
-2. The extraction pipeline: Input -> Cache Check -> MIME Detection -> Format Conversion -> Extractor Selection (priority-based) -> Extraction -> Fallback Chain -> Post-Processing -> Caching -> Output
-3. For MIME detection: use EXT_TO_MIME map + magic bytes fallback via infer crate. Always validate_mime_type() before extraction.
-4. For caching: keys based on content hash, invalidate on config changes
-5. For errors: implement fallback chains (try next-priority extractor), preserve partial results, return structured error info
-6. For new formats: add to EXT_TO_MIME, implement DocumentExtractor trait, register in register_default_extractors()
-7. Always use SecurityLimits validators for user content (ZipBombValidator, DepthValidator, StringGrowthValidator)
-8. Run `task test` after changes. Target 95% coverage on core extraction code.
+Retain the domain's global API compatibility, async/concurrency, and extraction-safety rules. Run focused tests that
+exercise the changed path; use a full suite only when its breadth is relevant or requested.

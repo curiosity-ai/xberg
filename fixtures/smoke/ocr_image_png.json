@@ -10,7 +10,7 @@
       "files": [
         {
           "field": "/bytes",
-          "path": "test_documents/images/test_hello_world.png"
+          "path": "images/test_hello_world.png"
         }
       ],
       "operations": [

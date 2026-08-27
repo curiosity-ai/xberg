@@ -70,6 +70,7 @@ impl Plugin for VlmOcrBackend {
     }
 }
 
+/// Inherits the `RequiresUpright` default for `page_orientation_handling` — unmeasured, not validated (#657).
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl OcrBackend for VlmOcrBackend {
@@ -114,6 +115,14 @@ impl OcrBackend for VlmOcrBackend {
     fn backend_type(&self) -> OcrBackendType {
         OcrBackendType::Custom
     }
+
+    /// VLM OCR reports no page-level confidence.
+    fn confidence_semantics(&self) -> crate::plugins::ConfidenceSemantics {
+        crate::plugins::ConfidenceSemantics::None
+    }
+
+    // Rotation handling has not been measured for this backend; it stays on the trait's
+    // `RequiresUpright` default.
 
     #[cfg_attr(alef, alef(skip))]
     fn probe(&self, config: &crate::OcrConfig) -> crate::doctor::DoctorCheck {

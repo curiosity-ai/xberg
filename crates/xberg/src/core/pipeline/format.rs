@@ -45,13 +45,6 @@ pub fn apply_output_format(result: ExtractedDocument, output_format: OutputForma
         OutputFormat::Djot => "djot",
         OutputFormat::Html => "html",
         OutputFormat::Json => "json",
-        // `Structured` has no dedicated renderer: `derive_extraction_result` never
-        // populates `formatted_content` for it (see
-        // `extraction::derive::derive_extraction_result`), so this arm only swaps
-        // the metadata label. The `content` field stays whatever plain text the
-        // extractor and post-processors produced — identical to `Plain` — until a
-        // real structured (OCR element / bounding-box) renderer is implemented. ~keep
-        OutputFormat::Structured => "structured",
         OutputFormat::DocTags => "doctags",
         OutputFormat::Custom(ref name) => {
             if custom_fallback_to_plain {
@@ -164,20 +157,6 @@ mod tests {
 
         assert_eq!(result.content, "<doctag><text>Hello</text></doctag>");
         assert_eq!(result.metadata.output_format, Some("doctags".to_string()));
-    }
-
-    #[test]
-    fn test_apply_output_format_structured() {
-        let result = ExtractedDocument {
-            content: "Hello World".to_string(),
-            mime_type: Cow::Borrowed("text/plain"),
-            ..Default::default()
-        };
-
-        let result = apply_output_format(result, OutputFormat::Structured);
-
-        assert_eq!(result.content, "Hello World");
-        assert_eq!(result.metadata.output_format, Some("structured".to_string()));
     }
 
     #[test]

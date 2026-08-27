@@ -173,8 +173,8 @@ fn collect_id_titles(content: &str, budget: &mut SecurityBudget) -> Result<HashM
 
                 let mut id_attr = None;
                 for attr in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(attr.key.as_ref());
-                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                    let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                     budget.check_attr(&key, &val)?;
                     if key == "id" || key == "xml:id" {
                         id_attr = Some(val.to_string());
@@ -195,8 +195,8 @@ fn collect_id_titles(content: &str, budget: &mut SecurityBudget) -> Result<HashM
             Ok(Event::Empty(e)) => {
                 budget.enter()?;
                 for attr in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(attr.key.as_ref());
-                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                    let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                     budget.check_attr(&key, &val)?;
                 }
                 budget.leave();
@@ -206,12 +206,12 @@ fn collect_id_titles(content: &str, budget: &mut SecurityBudget) -> Result<HashM
                 id_stack.pop();
             }
             Ok(Event::Text(t)) => {
-                let s = String::from_utf8_lossy(t.as_ref());
+                let s = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&s)?;
                 budget.account_text(s.trim().len())?;
             }
             Ok(Event::CData(t)) => {
-                let s = String::from_utf8_lossy(t.as_ref());
+                let s = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&s)?;
                 budget.account_text(s.trim().len())?;
             }
@@ -284,8 +284,8 @@ fn build_docbook_internal_document(
 
                 let mut language_attr: Option<String> = None;
                 for attr in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(attr.key.as_ref());
-                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                    let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                     budget.check_attr(&key, &val)?;
                     if key == "language" {
                         language_attr = Some(val.to_string());
@@ -498,12 +498,12 @@ fn build_docbook_internal_document(
                 }
             }
             Ok(Event::Text(t)) => {
-                let s = String::from_utf8_lossy(t.as_ref());
+                let s = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&s)?;
                 budget.account_text(s.trim().len())?;
             }
             Ok(Event::CData(t)) => {
-                let s = String::from_utf8_lossy(t.as_ref());
+                let s = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&s)?;
                 budget.account_text(s.trim().len())?;
             }
@@ -563,8 +563,8 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
 
                 let mut language_attr: Option<String> = None;
                 for attr in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(attr.key.as_ref());
-                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                    let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                     budget.check_attr(&key, &val)?;
                     if key == "language" {
                         language_attr = Some(val.to_string());
@@ -819,12 +819,12 @@ fn parse_docbook_single_pass(content: &str, plain: bool, budget: &mut SecurityBu
                 }
             }
             Ok(Event::Text(t)) => {
-                let s = String::from_utf8_lossy(t.as_ref());
+                let s = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&s)?;
                 budget.account_text(s.trim().len())?;
             }
             Ok(Event::CData(t)) => {
-                let s = String::from_utf8_lossy(t.as_ref());
+                let s = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&s)?;
                 budget.account_text(s.trim().len())?;
             }
@@ -879,8 +879,8 @@ fn extract_element_text_with_inline(
                         "emphasis" => {
                             let mut is_bold = false;
                             for attr in e.attributes().flatten() {
-                                let attr_name = String::from_utf8_lossy(attr.key.as_ref());
-                                let val = String::from_utf8_lossy(attr.value.as_ref());
+                                let attr_name = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                                let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                                 budget.check_attr(&attr_name, &val)?;
                                 if attr_name == "role" && (val == "bold" || val == "strong") {
                                     is_bold = true;
@@ -895,32 +895,32 @@ fn extract_element_text_with_inline(
                         }
                         "literal" | "command" => {
                             for attr in e.attributes().flatten() {
-                                let key = String::from_utf8_lossy(attr.key.as_ref());
-                                let val = String::from_utf8_lossy(attr.value.as_ref());
+                                let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                                let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                                 budget.check_attr(&key, &val)?;
                             }
                             text.push('`');
                         }
                         "link" | "ulink" => {
                             for attr in e.attributes().flatten() {
-                                let key = String::from_utf8_lossy(attr.key.as_ref());
-                                let val = String::from_utf8_lossy(attr.value.as_ref());
+                                let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                                let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                                 budget.check_attr(&key, &val)?;
                             }
                             text.push('[');
                         }
                         _ => {
                             for attr in e.attributes().flatten() {
-                                let key = String::from_utf8_lossy(attr.key.as_ref());
-                                let val = String::from_utf8_lossy(attr.value.as_ref());
+                                let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                                let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                                 budget.check_attr(&key, &val)?;
                             }
                         }
                     }
                 } else {
                     for attr in e.attributes().flatten() {
-                        let key = String::from_utf8_lossy(attr.key.as_ref());
-                        let val = String::from_utf8_lossy(attr.value.as_ref());
+                        let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                        let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                         budget.check_attr(&key, &val)?;
                     }
                 }
@@ -965,8 +965,8 @@ fn extract_element_text_with_inline(
                 let mut linkend: Option<String> = None;
                 let mut xreflabel: Option<String> = None;
                 for attr in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(attr.key.as_ref());
-                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                    let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                     budget.check_attr(&key, &val)?;
                     if key == "linkend" {
                         linkend = Some(val.to_string());
@@ -994,7 +994,7 @@ fn extract_element_text_with_inline(
                 budget.leave();
             }
             Ok(Event::Text(t)) => {
-                let decoded = String::from_utf8_lossy(t.as_ref());
+                let decoded = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&decoded)?;
                 let trimmed = decoded.trim();
                 if !trimmed.is_empty() {
@@ -1012,7 +1012,7 @@ fn extract_element_text_with_inline(
                 }
             }
             Ok(Event::CData(t)) => {
-                let decoded_str = utf8_validation::from_utf8(t.as_ref()).unwrap_or("");
+                let decoded_str = t.as_ref();
                 budget.check_entity(decoded_str)?;
                 let trimmed = decoded_str.trim();
                 if !trimmed.is_empty() {
@@ -1049,8 +1049,8 @@ fn extract_figure_with_caption(reader: &mut EntityReader<'_>, budget: &mut Secur
                 let tag = strip_namespace(&tag_cow);
 
                 for attr in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(attr.key.as_ref());
-                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                    let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                     budget.check_attr(&key, &val)?;
                 }
 
@@ -1074,7 +1074,7 @@ fn extract_figure_with_caption(reader: &mut EntityReader<'_>, budget: &mut Secur
                 }
             }
             Ok(Event::Text(t)) if caption.is_empty() => {
-                let decoded = String::from_utf8_lossy(t.as_ref());
+                let decoded = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&decoded)?;
                 let trimmed = decoded.trim();
                 if !trimmed.is_empty() {
@@ -1083,12 +1083,12 @@ fn extract_figure_with_caption(reader: &mut EntityReader<'_>, budget: &mut Secur
                 }
             }
             Ok(Event::Text(t)) => {
-                let decoded = String::from_utf8_lossy(t.as_ref());
+                let decoded = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&decoded)?;
                 budget.account_text(decoded.trim().len())?;
             }
             Ok(Event::CData(t)) => {
-                let decoded = String::from_utf8_lossy(t.as_ref());
+                let decoded = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&decoded)?;
                 budget.account_text(decoded.trim().len())?;
             }
@@ -1115,7 +1115,11 @@ fn extract_para_with_annotations(
     reader: &mut EntityReader<'_>,
     budget: &mut SecurityBudget,
     xref_titles: &HashMap<String, String>,
-) -> Result<(String, Vec<crate::types::document_structure::TextAnnotation>, Vec<String>)> {
+) -> Result<(
+    String,
+    Vec<crate::types::document_structure::TextAnnotation>,
+    Vec<String>,
+)> {
     use crate::types::builder;
 
     let mut text = String::new();
@@ -1159,8 +1163,8 @@ fn extract_para_with_annotations(
                     "emphasis" => {
                         let mut role = String::new();
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                             if key == "role" {
                                 role = val.to_string();
@@ -1175,8 +1179,8 @@ fn extract_para_with_annotations(
                     }
                     "literal" | "command" => {
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                         }
                         inline_stack.push(("code", depth, text.len() as u32, None));
@@ -1184,8 +1188,8 @@ fn extract_para_with_annotations(
                     "link" | "ulink" => {
                         let mut href = None;
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                             if key == "url" || key == "href" || key.ends_with(":href") || key == "linkend" {
                                 href = Some(val.to_string());
@@ -1195,24 +1199,24 @@ fn extract_para_with_annotations(
                     }
                     "subscript" => {
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                         }
                         inline_stack.push(("subscript", depth, text.len() as u32, None));
                     }
                     "superscript" => {
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                         }
                         inline_stack.push(("superscript", depth, text.len() as u32, None));
                     }
                     _ => {
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                         }
                     }
@@ -1269,8 +1273,8 @@ fn extract_para_with_annotations(
                 let mut linkend: Option<String> = None;
                 let mut xreflabel: Option<String> = None;
                 for attr in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(attr.key.as_ref());
-                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                    let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                     budget.check_attr(&key, &val)?;
                     if key == "linkend" {
                         linkend = Some(val.to_string());
@@ -1298,7 +1302,7 @@ fn extract_para_with_annotations(
                 budget.leave();
             }
             Ok(Event::Text(t)) => {
-                let decoded = String::from_utf8_lossy(t.as_ref());
+                let decoded = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&decoded)?;
                 let trimmed = decoded.trim();
                 if !trimmed.is_empty() {
@@ -1310,7 +1314,7 @@ fn extract_para_with_annotations(
                 }
             }
             Ok(Event::CData(t)) => {
-                let decoded_str = utf8_validation::from_utf8(t.as_ref()).unwrap_or("");
+                let decoded_str = t.as_ref();
                 budget.check_entity(decoded_str)?;
                 let trimmed = decoded_str.trim();
                 if !trimmed.is_empty() {
@@ -1344,8 +1348,8 @@ fn extract_element_text(reader: &mut EntityReader<'_>, budget: &mut SecurityBudg
             Ok(Event::Start(e)) => {
                 budget.enter()?;
                 for attr in e.attributes().flatten() {
-                    let key = String::from_utf8_lossy(attr.key.as_ref());
-                    let val = String::from_utf8_lossy(attr.value.as_ref());
+                    let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                    let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                     budget.check_attr(&key, &val)?;
                 }
                 depth += 1;
@@ -1358,7 +1362,7 @@ fn extract_element_text(reader: &mut EntityReader<'_>, budget: &mut SecurityBudg
                 depth -= 1;
             }
             Ok(Event::Text(t)) => {
-                let decoded = String::from_utf8_lossy(t.as_ref());
+                let decoded = std::borrow::Cow::Borrowed(t.as_ref());
                 budget.check_entity(&decoded)?;
                 let trimmed = decoded.trim();
                 if !trimmed.is_empty() {
@@ -1370,7 +1374,7 @@ fn extract_element_text(reader: &mut EntityReader<'_>, budget: &mut SecurityBudg
                 }
             }
             Ok(Event::CData(t)) => {
-                let decoded_str = utf8_validation::from_utf8(t.as_ref()).unwrap_or("");
+                let decoded_str = t.as_ref();
                 budget.check_entity(decoded_str)?;
                 let trimmed = decoded_str.trim();
                 if !trimmed.is_empty() {
@@ -1730,8 +1734,14 @@ mod tests {
         let mut budget = SecurityBudget::with_defaults();
         let internal = build_docbook_internal_document(docbook, false, &mut budget).expect("prefixed DocBook parses");
 
-        let text = internal.content();
-        assert!(text.contains("Prefixed text."), "prefixed elements must reach the text: {text}");
+        assert!(
+            internal
+                .elements
+                .iter()
+                .any(|element| element.text.contains("Prefixed text.")),
+            "prefixed elements must reach the extracted elements: {:?}",
+            internal.elements
+        );
     }
 
     #[test]

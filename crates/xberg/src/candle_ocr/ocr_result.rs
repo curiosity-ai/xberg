@@ -20,7 +20,7 @@ use std::borrow::Cow;
 use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
 
 use crate::core::config::OcrConfig;
-use crate::types::{ExtractedDocument, FormatMetadata, Formula, Metadata, OcrMetadata, Table};
+use crate::types::{ExtractedDocument, FormatMetadata, Formula, Metadata, OcrMetadata, ProcessingWarning, Table};
 
 // Taken from the ungated `crate::ocr_metadata_keys` rather than `crate::ocr`, which is
 // gated on `feature = "ocr"` / `"ocr-wasm"` — neither of which any `candle-*` backend
@@ -59,17 +59,33 @@ fn effective_languages(config: &OcrConfig) -> Vec<String> {
 ///
 /// Populates `metadata` (`FormatMetadata::Ocr`, `ocr_used`, processed image
 /// dimensions read from `image_bytes`), `tables` (parsed out of any GFM tables
-/// present in `content`), and `detected_languages` (the languages the caller
-/// requested; these backends do not perform independent language detection).
+/// present in `content`), `detected_languages` (the languages the caller
+/// requested; these backends do not perform independent language detection),
+/// and `processing_warnings` (see [`auto_rotate_unsupported_warning`]).
+///
+/// `backend_name` is the same string each backend's `OcrBackend::name()`
+/// returns (e.g. `"candle-trocr"`) and is used only to attribute warnings.
+///
+/// This is the single call site all four candle backends route their
+/// `process_image` result through (issue #179's precedent for not pasting
+/// shared OCR-result plumbing a fifth time), which makes it the one place
+/// that needs to know about `auto_rotate` rather than four separate call
+/// sites that could drift the way the sceptre/paddle indent check did (#861).
 pub(crate) fn build_ocr_document(
     content: String,
     formulas: Vec<Formula>,
     mime_type: Cow<'static, str>,
     image_bytes: &[u8],
     config: &OcrConfig,
+    backend_name: &'static str,
 ) -> ExtractedDocument {
     let tables = extract_gfm_tables(&content);
     let metadata = build_metadata(image_bytes, tables.len() as u32);
+
+    let mut processing_warnings = Vec::new();
+    if let Some(warning) = auto_rotate_unsupported_warning(config, backend_name) {
+        processing_warnings.push(warning);
+    }
 
     ExtractedDocument {
         content,
@@ -78,8 +94,39 @@ pub(crate) fn build_ocr_document(
         metadata,
         tables,
         detected_languages: Some(effective_languages(config)),
+        processing_warnings,
         ..Default::default()
     }
+}
+
+/// Warn once per extraction when `auto_rotate` was requested of a candle
+/// backend that has no orientation-detection step at all (#861).
+///
+/// Unlike Tesseract's `auto_rotate_unavailable` (gated on whether the
+/// `auto-rotate` *build feature* is compiled in) and PaddleOCR's own
+/// `config.auto_rotate` handling in `paddle_ocr::backend`, none of the four
+/// candle backends (TrOCR, PaddleOCR-VL, GLM-OCR, DeepSeek-OCR) read
+/// `OcrConfig::auto_rotate` at all, in any build — there is no feature flag
+/// that would make them honour it. So this always fires when the flag is
+/// set, rather than being conditioned on `cfg!(auto_rotate)` the way
+/// Tesseract's is.
+///
+/// A warning rather than a hard error, matching the precedent at
+/// `ocr::processor::execution::is_auto_rotate_requested_but_unavailable`
+/// (#309): the caller asked for orientation correction that silently will
+/// not happen, but the rest of the extraction is otherwise sound, so failing
+/// the whole call would be a worse outcome than telling them.
+fn auto_rotate_unsupported_warning(config: &OcrConfig, backend_name: &'static str) -> Option<ProcessingWarning> {
+    if !config.auto_rotate {
+        return None;
+    }
+    Some(crate::core::diagnostics::warning(
+        backend_name,
+        format!(
+            "auto_rotate was requested but the `{backend_name}` backend has no orientation \
+             detection or correction step; the image was OCR'd in its original orientation"
+        ),
+    ))
 }
 
 /// Build OCR metadata: `FormatMetadata::Ocr` with the table count, `ocr_used`,
@@ -246,6 +293,7 @@ mod tests {
             Cow::Borrowed("text/markdown"),
             png_1x1,
             &config,
+            "candle-trocr",
         );
 
         assert_eq!(doc.content, content);
@@ -264,5 +312,75 @@ mod tests {
         );
         assert_eq!(doc.tables.len(), 1);
         assert_eq!(doc.detected_languages, Some(vec!["deu".to_string()]));
+        assert!(
+            doc.processing_warnings.is_empty(),
+            "auto_rotate defaults to false; no warning should be emitted, got: {:?}",
+            doc.processing_warnings
+        );
+    }
+
+    /// #861: none of the four candle OCR backends (TrOCR, PaddleOCR-VL,
+    /// GLM-OCR, DeepSeek-OCR) implement orientation detection, so a caller
+    /// who sets `auto_rotate: true` must be told the request was silently
+    /// unactionable rather than getting no signal at all. Before this fix,
+    /// `build_ocr_document` never inspected `config.auto_rotate` and always
+    /// returned an empty `processing_warnings` (via `..Default::default()`),
+    /// so this assertion fails against the unfixed code with:
+    /// `assertion failed: !doc.processing_warnings.is_empty()`.
+    #[test]
+    fn should_warn_when_auto_rotate_requested_of_a_backend_with_no_rotation_support() {
+        let config = OcrConfig {
+            auto_rotate: true,
+            ..Default::default()
+        };
+
+        let doc = build_ocr_document(
+            "text".to_string(),
+            Vec::new(),
+            Cow::Borrowed("text/plain"),
+            &[],
+            &config,
+            "candle-trocr",
+        );
+
+        assert_eq!(
+            doc.processing_warnings.len(),
+            1,
+            "expected exactly one auto_rotate warning, got: {:?}",
+            doc.processing_warnings
+        );
+        assert_eq!(doc.processing_warnings[0].source, "candle-trocr");
+        assert_eq!(
+            doc.processing_warnings[0].message,
+            "auto_rotate was requested but the `candle-trocr` backend has no orientation \
+             detection or correction step; the image was OCR'd in its original orientation"
+        );
+    }
+
+    /// The warning must fire exactly once per extraction (not once per page,
+    /// once per region, or duplicated), matching the single call site inside
+    /// `build_ocr_document` this test exercises directly.
+    #[test]
+    fn should_not_warn_when_auto_rotate_is_not_requested() {
+        let config = OcrConfig::default();
+        assert!(
+            !config.auto_rotate,
+            "test assumes the OcrConfig default is auto_rotate: false"
+        );
+
+        let doc = build_ocr_document(
+            "text".to_string(),
+            Vec::new(),
+            Cow::Borrowed("text/plain"),
+            &[],
+            &config,
+            "candle-glm-ocr",
+        );
+
+        assert!(
+            doc.processing_warnings.is_empty(),
+            "auto_rotate: false must not produce a warning, got: {:?}",
+            doc.processing_warnings
+        );
     }
 }

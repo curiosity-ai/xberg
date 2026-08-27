@@ -22,7 +22,7 @@
 //! `backend_options.model_path`, when present, always wins (offline / custom weights).
 //! Otherwise the backend auto-downloads `backend_options.model_id` (default
 //! `xberg-io/paddleocr-vl-1.6`, a checksum-pinned mirror of
-//! `PaddlePaddle/PaddleOCR-VL-1.6`) through [`super::model_stager`].
+//! `PaddlePaddle/PaddleOCR-VL-1.6`) through the internal `model_stager` module.
 
 use async_trait::async_trait;
 use std::borrow::Cow;
@@ -33,6 +33,9 @@ use ahash::AHashMap;
 use parking_lot::{Mutex, RwLock};
 
 use crate::Result;
+use crate::candle_ocr::config::{
+    PaddleOcrVlBackendOptions, PaddleOcrVlTaskKind, parse_backend_options, validate_optional_non_empty,
+};
 use crate::core::config::OcrConfig;
 use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
 use crate::types::ExtractedDocument;
@@ -130,7 +133,8 @@ const DEFAULT_MODEL_ID: &str = "xberg-io/paddleocr-vl-1.6";
 /// }
 /// ```
 ///
-/// - `task` (string): `"ocr"` (default), `"table"`, `"formula"`, `"chart"`
+/// - `task` (string, optional): per-call override for `"ocr"`, `"table"`, `"formula"`, or `"chart"`.
+///   When omitted, the task selected when constructing the backend is used.
 /// - `device` (string): `"auto"`, `"cpu"`, `"cuda"`, `"metal"`
 /// - `model_id` (string): HuggingFace repo id to auto-download weights from. Defaults to
 ///   `xberg-io/paddleocr-vl-1.6`, a checksum-pinned mirror of
@@ -147,6 +151,7 @@ pub struct PaddleOcrVlBackend {
     task: PaddleOcrVlTask,
 }
 
+#[derive(Debug)]
 struct PaddleOcrVlOptions {
     task: PaddleOcrVlTask,
     model_path: Option<String>,
@@ -174,47 +179,32 @@ impl PaddleOcrVlBackend {
     ///
     /// `model_id` defaults to [`DEFAULT_MODEL_ID`] and is only consulted when
     /// `model_path` is absent.
-    fn parse_options(config: &OcrConfig) -> PaddleOcrVlOptions {
-        let mut task = PaddleOcrVlTask::default();
-        let mut model_path: Option<String> = None;
-        let mut model_id = DEFAULT_MODEL_ID.to_string();
-        let mut hf_revision = None;
-        let mut cache_dir = None;
-
-        if let Some(opts) = &config.backend_options {
-            if let Some(t) = opts.get("task").and_then(|v| v.as_str()) {
-                task = match t {
-                    "table" => PaddleOcrVlTask::Table,
-                    "formula" => PaddleOcrVlTask::Formula,
-                    "chart" => PaddleOcrVlTask::Chart,
-                    _ => PaddleOcrVlTask::Ocr,
-                };
-            }
-            if let Some(p) = opts.get("model_path").and_then(|v| v.as_str()) {
-                model_path = Some(p.to_string());
-            }
-            if let Some(id) = opts.get("model_id").and_then(|v| v.as_str()) {
-                model_id = id.to_string();
-            }
-            hf_revision = opts
-                .get("hf_revision")
-                .or_else(|| opts.get("revision"))
-                .and_then(|value| value.as_str())
-                .map(str::to_string);
-            cache_dir = opts
-                .get("cache_dir")
-                .and_then(|value| value.as_str())
-                .map(PathBuf::from);
+    fn parse_options(&self, config: &OcrConfig) -> Result<PaddleOcrVlOptions> {
+        let options: PaddleOcrVlBackendOptions =
+            parse_backend_options(config.backend_options.as_ref(), "candle-paddleocr-vl")?;
+        for (field, value) in [
+            ("model_path", options.model_path.as_deref()),
+            ("model_id", options.model_id.as_deref()),
+            ("hf_revision", options.hf_revision.as_deref()),
+            ("cache_dir", options.cache_dir.as_deref()),
+        ] {
+            validate_optional_non_empty(value, "candle-paddleocr-vl", field)?;
         }
-
-        PaddleOcrVlOptions {
+        let task = match options.task {
+            Some(PaddleOcrVlTaskKind::Ocr) => PaddleOcrVlTask::Ocr,
+            Some(PaddleOcrVlTaskKind::Table) => PaddleOcrVlTask::Table,
+            Some(PaddleOcrVlTaskKind::Formula) => PaddleOcrVlTask::Formula,
+            Some(PaddleOcrVlTaskKind::Chart) => PaddleOcrVlTask::Chart,
+            None => self.task,
+        };
+        Ok(PaddleOcrVlOptions {
             task,
-            model_path,
-            model_id,
-            hf_revision,
-            cache_dir,
-            device: super::resolve_device_preference(config),
-        }
+            model_path: options.model_path,
+            model_id: options.model_id.unwrap_or_else(|| DEFAULT_MODEL_ID.to_string()),
+            hf_revision: options.hf_revision,
+            cache_dir: options.cache_dir.map(PathBuf::from),
+            device: super::resolve_device_preference(config, options.device),
+        })
     }
 }
 
@@ -237,6 +227,40 @@ impl Plugin for PaddleOcrVlBackend {
     }
 }
 
+/// Inherits the `RequiresUpright` default for `page_orientation_handling` — unmeasured, not validated (#657).
+///
+/// # Why this backend must not copy `crate::paddle_ocr`'s `page_rotation_degrees` handling (#734)
+///
+/// It was previously suspected that this backend simply *forgot* to read the
+/// `backend_options["page_rotation_degrees"]` hint the way
+/// The native PaddleOCR backend does. That comparison does not transfer,
+/// for two independent reasons, and copying it here would introduce a real defect:
+///
+/// 1. **No block list to reorder.** `PaddleOcrBackend`'s fix
+///    (`page_rotation_degrees_from_backend_options` -> `residual_rotation_for_reorder` ->
+///    `reorder_blocks_for_page_rotation`) exists because its two-stage detector+recognizer
+///    warps each detected text quad upright internally but leaves its *block list* in raw
+///    raster `(y, x)` order, so the caller must reorder. This backend
+///    (`xberg_candle_ocr::models::PaddleOcrVlEngine::process_image`) is a single-pass
+///    vision-language model that autoregressively decodes one markdown string per page
+///    (`CandleOcrOutput { content, .. }`, no bounding boxes) — there is no block list here to
+///    reorder.
+/// 2. **Reading the hint under `RequiresUpright` would double-rotate.** `page_rotation_degrees`
+///    is injected into `backend_options` *unconditionally* by
+///    `ocr_config_with_page_rotation_hint` whenever a page carries a `/Rotate` value —
+///    regardless of the backend's declared `page_orientation_handling`
+///    (`crate::extractors::pdf::ocr`). For a `RequiresUpright` backend specifically, the
+///    pipeline *also* pre-rotates the raster to upright before calling `process_image`
+///    (`upright_raster_for_backend`), so the raster this backend receives is already upright
+///    even though the hint in its config still reports the page's raw, uncorrected rotation.
+///    Rotating that already-upright raster again by the raw hint would be a strictly worse
+///    defect than not reading it at all.
+///
+/// Reading `page_rotation_degrees` here would only become sound if this backend's declared
+/// capability changed away from `RequiresUpright` (out of scope for #734 — that decision needs
+/// its own measurement, see the module-level rotation-order benchmark notes) *and* the new
+/// logic operated on raw, unrotated raster pixels rather than reordering blocks that do not
+/// exist. Until then, not reading the hint is correct, not an omission.
 #[async_trait]
 impl OcrBackend for PaddleOcrVlBackend {
     /// Process an image using the PaddleOCR-VL engine.
@@ -247,7 +271,7 @@ impl OcrBackend for PaddleOcrVlBackend {
     /// Returns [`crate::XbergError::Ocr`] if weight download, device selection,
     /// engine initialisation, or inference fails.
     async fn process_image(&self, image_bytes: &[u8], config: &OcrConfig) -> Result<ExtractedDocument> {
-        let options = Self::parse_options(config);
+        let options = self.parse_options(config)?;
 
         if image_bytes.is_empty() {
             return Err(crate::XbergError::Validation {
@@ -296,6 +320,7 @@ impl OcrBackend for PaddleOcrVlBackend {
             Cow::Borrowed("text/markdown"),
             image_bytes,
             config,
+            "candle-paddleocr-vl",
         ))
     }
 
@@ -330,11 +355,23 @@ impl OcrBackend for PaddleOcrVlBackend {
     fn emits_structured_markdown(&self) -> bool {
         true
     }
+
+    /// PaddleOCR-VL reports no page-level confidence.
+    fn confidence_semantics(&self) -> crate::plugins::ConfidenceSemantics {
+        crate::plugins::ConfidenceSemantics::None
+    }
+
+    // Rotation handling has not been measured for this backend; it stays on the trait's
+    // `RequiresUpright` default.
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_default_options(config: &OcrConfig) -> Result<PaddleOcrVlOptions> {
+        PaddleOcrVlBackend::default_task().parse_options(config)
+    }
 
     #[test]
     fn test_paddleocr_vl_backend_creation() {
@@ -371,7 +408,7 @@ mod tests {
     #[test]
     fn test_parse_options_defaults() {
         let config = OcrConfig::default();
-        let options = PaddleOcrVlBackend::parse_options(&config);
+        let options = parse_default_options(&config).unwrap();
         assert_eq!(options.task, PaddleOcrVlTask::Ocr);
         assert!(options.model_path.is_none());
         assert_eq!(options.model_id, DEFAULT_MODEL_ID);
@@ -388,8 +425,33 @@ mod tests {
             })),
             ..Default::default()
         };
-        let options = PaddleOcrVlBackend::parse_options(&config);
+        let options = parse_default_options(&config).unwrap();
         assert_eq!(options.task, PaddleOcrVlTask::Table);
+    }
+
+    #[test]
+    fn should_use_constructor_task_when_backend_options_omit_task() {
+        let backend = PaddleOcrVlBackend::new(PaddleOcrVlTask::Table);
+
+        let options = backend.parse_options(&OcrConfig::default()).unwrap();
+
+        assert_eq!(options.task, backend.task);
+    }
+
+    #[test]
+    fn should_prefer_explicit_task_over_constructor_task() {
+        let backend = PaddleOcrVlBackend::new(PaddleOcrVlTask::Chart);
+        let config = OcrConfig {
+            backend_options: Some(serde_json::json!({
+                "task": "formula"
+            })),
+            ..Default::default()
+        };
+
+        let options = backend.parse_options(&config).unwrap();
+
+        assert_eq!(backend.task, PaddleOcrVlTask::Chart);
+        assert_eq!(options.task, PaddleOcrVlTask::Formula);
     }
 
     #[test]
@@ -400,7 +462,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let options = PaddleOcrVlBackend::parse_options(&config);
+        let options = parse_default_options(&config).unwrap();
         assert_eq!(options.device, DevicePreference::Cpu);
     }
 
@@ -412,7 +474,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let options = PaddleOcrVlBackend::parse_options(&config);
+        let options = parse_default_options(&config).unwrap();
         assert_eq!(options.model_path.as_deref(), Some("/models/paddleocr-vl"));
     }
 
@@ -424,7 +486,7 @@ mod tests {
             })),
             ..Default::default()
         };
-        let options = PaddleOcrVlBackend::parse_options(&config);
+        let options = parse_default_options(&config).unwrap();
         assert!(options.model_path.is_none());
         assert_eq!(options.model_id, "some-org/custom-paddleocr-vl");
     }
@@ -438,9 +500,34 @@ mod tests {
             })),
             ..Default::default()
         };
-        let options = PaddleOcrVlBackend::parse_options(&config);
+        let options = parse_default_options(&config).unwrap();
         assert_eq!(options.hf_revision.as_deref(), Some("0123456789abcdef"));
         assert_eq!(options.cache_dir.as_deref(), Some(Path::new("/tmp/hf-hub")));
+    }
+
+    #[test]
+    fn test_parse_options_non_object_json_returns_contextual_error() {
+        let config = OcrConfig {
+            backend_options: Some(serde_json::json!(false)),
+            ..Default::default()
+        };
+        let error = parse_default_options(&config).unwrap_err().to_string();
+        assert!(error.contains("candle-paddleocr-vl backend_options"));
+    }
+
+    #[test]
+    fn test_parse_options_empty_object_returns_defaults() {
+        let config = OcrConfig {
+            backend_options: Some(serde_json::json!({})),
+            ..Default::default()
+        };
+        let options = parse_default_options(&config).unwrap();
+        assert_eq!(options.task, PaddleOcrVlTask::Ocr);
+        assert!(options.model_path.is_none());
+        assert_eq!(options.model_id, DEFAULT_MODEL_ID);
+        assert!(options.hf_revision.is_none());
+        assert!(options.cache_dir.is_none());
+        assert_eq!(options.device, DevicePreference::Auto);
     }
 
     #[test]
@@ -448,5 +535,23 @@ mod tests {
         let backend = PaddleOcrVlBackend::default_task();
         assert!(backend.initialize().is_ok());
         assert!(backend.shutdown().is_ok());
+    }
+
+    /// Regression tripwire for #734: this backend has no block list to reorder (see the
+    /// `OcrBackend` impl's doc comment), so it must stay on the inherited `RequiresUpright`
+    /// default rather than declaring `SelfCorrecting`/`RecognisesRotatedText` without also
+    /// adding raster-level rotation handling. This test passes today — there is no bug in the
+    /// current code, only a hazard in copying `crate::paddle_ocr::backend`'s block-reorder fix
+    /// here — and exists to fail the moment someone flips the declared capability without also
+    /// working out how a single-pass VLM with no bounding boxes is supposed to honour
+    /// `page_rotation_degrees`.
+    #[test]
+    fn should_stay_on_requires_upright_until_rotation_handling_is_measured() {
+        let backend = PaddleOcrVlBackend::default_task();
+        let dynamic: &dyn OcrBackend = &backend;
+        assert_eq!(
+            dynamic.page_orientation_handling(),
+            crate::plugins::PageOrientationHandling::RequiresUpright
+        );
     }
 }

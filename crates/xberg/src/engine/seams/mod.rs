@@ -1,9 +1,8 @@
 //! Rust-only engine extension seams.
 //!
-//! Each seam is a small trait paired with a behavior-preserving in-core default.
-//! The [`Engine`](super::Engine) stores one `Arc<dyn …>` per seam (filled with
-//! its default by [`EngineBuilder`](super::EngineBuilder)) so callers can inject
-//! alternative implementations without altering the default extraction path.
+//! Cache and progress are injectable through [`EngineBuilder`](super::EngineBuilder).
+//! The remaining traits expose standalone Rust primitives for structured extraction,
+//! preset lookup, LLM calls, and model resolution; they are not Engine configuration.
 //!
 //! These are deliberately **not** part of the language-binding surface: the
 //! whole `engine` module is a bare `pub mod engine;` in `lib.rs` whose files are
@@ -11,9 +10,6 @@
 //! for them. The trait names and public seam types are also listed in
 //! `alef.toml` `[crates.exclude] types` as belt-and-suspenders.
 //!
-//! This phase establishes the seam points and dependency-injection wiring only;
-//! the in-core defaults reproduce exactly what xberg does today. Routing the
-//! internal structured/LLM/model paths through these seams is a later phase.
 
 mod cache;
 mod progress;

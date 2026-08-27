@@ -13,7 +13,11 @@ const apiExamplesSchema = z.object({
   id: z.string(),
   language: z.string(),
   target: z.string(),
-  level: z.string(),
+  // Optional because alef omits `level:` entirely for `side_effect: safe` fixtures (alef
+  // fe34499d5): an absent key means "validate as deep as the workspace allows", and alef
+  // deliberately writes no key rather than `level: null`, which this schema would reject as an
+  // object. Requiring it here failed `astro build` on the first of 810 such files. ~keep
+  level: z.string().optional(),
   requires: z.array(z.string()),
   side_effect: z.string(),
 });

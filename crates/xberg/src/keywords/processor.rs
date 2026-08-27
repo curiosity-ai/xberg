@@ -64,6 +64,7 @@ impl PostProcessor for KeywordExtractor {
             Some(cfg) => cfg,
             None => return Ok(()),
         };
+        keyword_config.validate()?;
 
         let word_count = result.content.split_whitespace().count();
         if word_count < MIN_WORD_COUNT_FOR_KEYWORDS {
@@ -194,6 +195,36 @@ machine learning that uses neural networks with multiple layers.
             result.processing_warnings[0].message,
             "Document has 2 word(s), below the 10-word minimum; keyword extraction was skipped"
         );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "keywords-rake")]
+    async fn should_reject_invalid_ngram_range_before_short_document_skip() {
+        let processor = KeywordExtractor;
+        let config = ExtractionConfig {
+            keywords: Some(KeywordConfig {
+                ngram_range: crate::keywords::NgramRange { min: 4, max: 2 },
+                ..KeywordConfig::rake()
+            }),
+            ..Default::default()
+        };
+        let mut result = ExtractedDocument {
+            content: "Short text".to_string(),
+            mime_type: Cow::Borrowed("text/plain"),
+            ..Default::default()
+        };
+
+        let error = processor
+            .process(&mut result, &config)
+            .await
+            .expect_err("invalid range must fail before short-document handling");
+
+        match error {
+            XbergError::Validation { message, .. } => {
+                assert_eq!(message, "ngram range minimum must not exceed maximum (4 > 2)");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

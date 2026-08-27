@@ -6,7 +6,7 @@ import { Tabs, TabItem } from "@astrojs/starlight/components";
 
 A map of what Xberg can do. Each section links to the guide or reference page with configuration details and code examples.
 
-![Xberg features overview -- 101 input formats flow through extraction, OCR, and processing to produce text, tables, chunks, and metadata](../../assets/feature-overview.png)
+![Xberg features overview -- 100 input formats flow through extraction, OCR, and processing to produce text, tables, chunks, and metadata](../../assets/feature-overview.png)
 
 ---
 
@@ -177,7 +177,7 @@ flowchart LR
 ```
 
 1. **MIME detection** -- Xberg identifies the file type from magic bytes and extension, then selects the matching native extractor from the registry.
-2. **Format extraction** -- The extractor pulls text, tables, metadata, and optionally images from the file. PDF extraction uses pdf_oxide (pure Rust); Office formats use native XML or OLE/CFB parsers; images pass directly to OCR.
+2. **Format extraction** -- The extractor pulls text, tables, metadata, and optionally images from the file. PDF extraction uses xberg-native-pdf (pure Rust); Office formats use native XML or OLE/CFB parsers; images pass directly to OCR.
 3. **OCR** -- When the extractor finds no text layer (or `force_ocr` is set), the file is routed to the configured OCR backend. The OCR result replaces or supplements the extracted text.
 4. **Post-processing** -- Validators, quality processing, chunking, embeddings, keyword extraction, and any registered post-processor plugins run in sequence.
 5. **Caching** -- If caching is enabled, results are stored keyed by a content hash so repeated extractions skip the entire pipeline.
@@ -186,7 +186,7 @@ For a deep dive into each stage, see [Extraction Pipeline](/concepts/extraction-
 
 ### Output Formats
 
-Xberg supports five output formats: **Plain text**, **Markdown**, **Djot**, **HTML**, and **Structured (JSON)**. The HTML format includes a styled renderer with semantic `kb-*` CSS classes, five built-in themes, and CSS custom properties for full customization. See [HTML Output](/guides/html-output/) for details.
+Xberg supports six built-in output formats: **Plain text**, **Markdown**, **Djot**, **HTML**, **JSON**, and **DocTags**. Registered renderers can add custom formats such as Graphviz DOT. The HTML renderer uses semantic `kb-*` CSS classes, five built-in themes, and CSS custom properties. See [Output Formats](/guides/output-formats/) for details.
 
 ---
 
@@ -373,7 +373,7 @@ Customize the prompts sent to LLMs with Minijinja templates. Available variables
 
 </details>
 
-`LlmConfig` and `StructuredExtractionConfig` types are exposed in Python, Node.js, and PHP bindings. Five new environment variables (`XBERG_LLM_MODEL`, `XBERG_LLM_API_KEY`, `XBERG_LLM_BASE_URL`, `XBERG_VLM_OCR_MODEL`, `XBERG_VLM_EMBEDDING_MODEL`) provide zero-code configuration.
+`LlmConfig` and `StructuredExtractionConfig` are part of the generated binding surface. Use the per-language API reference to confirm representation and package support for your target. Five environment variables (`XBERG_LLM_MODEL`, `XBERG_LLM_API_KEY`, `XBERG_LLM_BASE_URL`, `XBERG_VLM_OCR_MODEL`, `XBERG_VLM_EMBEDDING_MODEL`) provide zero-code configuration.
 
 ### Document Enrichment
 
@@ -425,7 +425,7 @@ Detect and classify document regions using ONNX-based deep learning. Layout dete
 - **SLANeXT Wired/Wireless/Auto** (365–737 MB) — Optimized for bordered/borderless tables with auto-detection
 - **SLANet-plus** (7.78 MB) — Lightweight, resource-constrained environments
 
-GPU acceleration via ONNX Runtime (CUDA, CoreML, TensorRT) significantly reduces inference time. Models are automatically downloaded and cached on first use.
+GPU acceleration via ONNX Runtime (CUDA, CoreML, TensorRT) significantly reduces inference time. Models are automatically downloaded and cached on first use. The published Docker images are CPU-only — see [GPU Acceleration](/getting-started/installation/#gpu-acceleration) for building with GPU support.
 
 **Availability:** Native builds that include ONNX Runtime, including the full `windows-target` aggregate. RT-DETR layout detection (and the wired/wireless table classifier) also runs off ONNX Runtime through the pure-Rust `tract` engine on `wasm-target` and `android-target` via the `layout-tract` feature; TATR, SLANeXT, and PP-DocLayout-V3 table-structure models stay ONNX Runtime-only.
 
@@ -542,7 +542,7 @@ dependency, platform restriction, or CI-untested status per Cargo.toml's own com
 | `ner-llm`                                                     | Zero-shot NER via any configured liter-llm provider                     | Requires `liter-llm`; no ORT needed |
 | `ner-onnx`                                                    | NER via the `xberg-gliner` ONNX backend                                 | ORT-dependent; downloads models from Hugging Face on first use |
 | `presets`                                                     | Built-in extraction preset format, registry, and resolver               | Pure Rust, no native deps |
-| `structured`                                                  | Enables `ExtractionConfig.structured_extraction` (LLM-driven typed JSON extraction against a caller-supplied schema) | Requires `liter-llm`; unrelated to `OutputFormat::Structured`, which is a metadata-only label that renders identically to Plain |
+| `structured`                                                  | Enables `ExtractionConfig.structured_extraction` (LLM-driven typed JSON extraction against a caller-supplied schema) | Requires `liter-llm` |
 | `redaction-rehydrate`                                         | Encrypted rehydration map capture for reversible PII redaction          | Requires `redaction`; adds `aes-gcm`, `scrypt`, `zeroize` |
 | `redaction-ml`                                                | Couples NER into redaction for PERSON/ORG/LOC pattern matching          | Requires `redaction` + `ner` |
 | `summarization-llm`                                           | Abstractive summarization via any liter-llm provider                    | Requires `summarization` + `liter-llm` (the base `summarization` feature is pure-Rust TextRank only) |
@@ -554,7 +554,7 @@ dependency, platform restriction, or CI-untested status per Cargo.toml's own com
 Skipped as internal plumbing (pure marker/aggregate features with no independent behavior, or types-only
 subsets already covered by their parent feature above): `paddle-ocr-types`, `layout-types`,
 `auto-rotate-types`, `transcription-types`, `embedding-presets`, `reranker-presets`,
-`sparse-embedding-presets`, `late-interaction-presets`, `api-types`, `ner-llm-types`, `onnx-runtime`,
+`sparse-embedding-presets`, `late-interaction-presets`, `api-types`, `onnx-runtime`,
 `ocr-pipeline`, `image-encode`, `url-config-types`, `tower-service`, `no-ort-target`, `formats-no-heic`,
 `full-no-heic`, `simd-utf8`, `tokio-runtime`, `profiling`, `pool-metrics`.
 
@@ -581,7 +581,7 @@ npm install @xberg-io/xberg-wasm            # WASM (browser/edge)
 
 ```toml
 [dependencies]
-xberg = { version = "5", features = ["pdf", "ocr", "chunking"] }
+xberg = { version = "1", features = ["pdf", "ocr", "chunking"] }
 ```
 
 </TabItem>

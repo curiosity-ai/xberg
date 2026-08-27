@@ -330,14 +330,27 @@ async fn test_csv_malformed() {
 
     let result = extract_bytes_document(csv_content, "text/csv", &config).await;
 
-    assert!(
-        result.is_ok() || result.is_err(),
-        "Should handle malformed CSV gracefully"
+    // `CsvExtractor::extract_content` (crates/xberg/src/extractors/csv.rs) has no notion of
+    // a malformed row: `parse_csv` accepts any number of fields per line and the only error
+    // path is `SecurityBudget` exhaustion, which this tiny input can never hit. So a ragged
+    // row count must not be rejected -- it is preserved verbatim, one row per input line,
+    // with no padding or truncation.
+    let extraction = result.expect("a ragged column count is not a parse error, extraction always succeeds");
+    assert_eq!(
+        extraction.tables[0].cells,
+        vec![
+            vec!["Name".to_string(), "Age".to_string(), "City".to_string()],
+            vec!["Alice".to_string(), "30".to_string()],
+            vec![
+                "Bob".to_string(),
+                "25".to_string(),
+                "LA".to_string(),
+                "Extra".to_string()
+            ],
+            vec!["Carlos".to_string(), "35".to_string(), "SF".to_string()],
+        ],
+        "each row's actual field count must survive unmodified, ragged or not"
     );
-
-    if let Ok(extraction) = result {
-        assert!(!extraction.content.is_empty());
-    }
 }
 
 /// Test empty CSV file.
@@ -349,7 +362,21 @@ async fn test_csv_empty() {
 
     let result = extract_bytes_document(empty_csv, "text/csv", &config).await;
 
-    assert!(result.is_ok() || result.is_err(), "Should handle empty CSV gracefully");
+    // `parse_csv("")` (crates/xberg/src/extractors/csv.rs) never enters its trailing-field
+    // push (both `current_field` and `current_row` start and stay empty), so it returns zero
+    // rows; nothing in the extractor treats an empty row set as an error, so this must always
+    // succeed with an empty table and empty content, not merely "not panic".
+    let extraction = result.expect("zero rows is not a parse error, extraction always succeeds");
+    assert!(
+        extraction.tables[0].cells.is_empty(),
+        "an empty CSV must produce zero rows, got {:?}",
+        extraction.tables[0].cells
+    );
+    assert_eq!(extraction.content, "", "an empty CSV must produce empty content");
+    match extraction.metadata.format.as_ref() {
+        Some(xberg::FormatMetadata::Csv(meta)) => assert_eq!(meta.row_count, 0),
+        other => panic!("expected FormatMetadata::Csv, got: {other:?}"),
+    }
 }
 
 /// Test CSV with only headers.

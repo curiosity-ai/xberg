@@ -9,7 +9,7 @@
 //! - Removed file-path based APIs (we only need bytes/reader)
 //! - Added markdown rendering and formatting support (fixes #376)
 
-use crate::extractors::security::{SecurityBudget, SecurityError};
+use crate::extractors::security::{SecurityBudget, SecurityError, SecurityLimits, ZipBombValidator};
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 use std::io::{Cursor, Read, Seek};
@@ -70,6 +70,21 @@ pub struct Paragraph {
     pub numbering_id: Option<i64>,
     /// Indentation level within the numbering definition (0-based).
     pub numbering_level: Option<i64>,
+    /// Bookmark names (`w:bookmarkStart/@w:name`) that start inside this paragraph.
+    ///
+    /// A generated table of contents links each entry to the `_Toc…` bookmark Word
+    /// writes into the heading paragraph, so these are the link targets internal
+    /// `w:hyperlink w:anchor` references resolve against. Word's `_GoBack` bookmark
+    /// is filtered out — it records the last edit position, not a link target.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bookmarks: Vec<String>,
+    /// True when this paragraph is part of a table of contents.
+    ///
+    /// Set by either of the two markers Word emits: a `w:sdt` whose
+    /// `w:sdtPr/w:docPartObj/w:docPartGallery` is `Table of Contents`, or a `TOC`
+    /// field code.
+    #[serde(default)]
+    pub in_table_of_contents: bool,
 }
 
 /// A formatted text run within a DOCX paragraph.
@@ -209,9 +224,8 @@ pub struct Comment {
 /// Check if a formatting element is enabled (not explicitly set to false/0/none).
 fn is_format_enabled(e: &BytesStart) -> bool {
     for attr in e.attributes().flatten() {
-        if attr.key.as_ref() == b"w:val"
-            && let Ok(val) = std::str::from_utf8(&attr.value)
-        {
+        if attr.key.as_ref() == "w:val" {
+            let val = attr.value.as_ref();
             return !matches!(val, "false" | "0" | "none");
         }
     }
@@ -221,9 +235,8 @@ fn is_format_enabled(e: &BytesStart) -> bool {
 /// Read `w:val` attribute as i64.
 fn get_val_attr(e: &BytesStart) -> Option<i64> {
     for attr in e.attributes().flatten() {
-        if attr.key.as_ref() == b"w:val"
-            && let Ok(val) = std::str::from_utf8(&attr.value)
-        {
+        if attr.key.as_ref() == "w:val" {
+            let val = attr.value.as_ref();
             return val.parse().ok();
         }
     }
@@ -233,9 +246,8 @@ fn get_val_attr(e: &BytesStart) -> Option<i64> {
 /// Read `w:val` attribute as String.
 fn get_val_attr_string(e: &BytesStart) -> Option<String> {
     for attr in e.attributes().flatten() {
-        if attr.key.as_ref() == b"w:val"
-            && let Ok(val) = std::str::from_utf8(&attr.value)
-        {
+        if attr.key.as_ref() == "w:val" {
+            let val = attr.value.as_ref();
             return Some(val.to_string());
         }
     }
@@ -273,17 +285,17 @@ fn collect_revision_attrs(e: &BytesStart) -> (Option<String>, Option<String>, Op
     let mut date: Option<String> = None;
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"w:id" => {
-                id = std::str::from_utf8(&attr.value).ok().map(String::from);
+            "w:id" => {
+                id = Some(attr.value.to_string());
             }
-            b"w:author" => {
-                author = std::str::from_utf8(&attr.value).ok().map(String::from);
+            "w:author" => {
+                author = Some(attr.value.to_string());
                 if author.as_deref() == Some("") {
                     author = None;
                 }
             }
-            b"w:date" => {
-                date = std::str::from_utf8(&attr.value).ok().map(String::from);
+            "w:date" => {
+                date = Some(attr.value.to_string());
                 if date.as_deref() == Some("") {
                     date = None;
                 }
@@ -303,7 +315,11 @@ fn heading_level_from_style_name(style: &str) -> Option<u8> {
             if let Ok(n) = num_part.parse::<u8>()
                 && (1..=6).contains(&n)
             {
-                return Some((n + 1).min(6));
+                // The trailing digit of a Word style ID is already the 1-indexed heading
+                // level: `Heading1` IS level 1. The `+ 1` that the StyleCatalog branch
+                // applies belongs to `w:outlineLvl`, which is 0-indexed; applying it here
+                // too reported every H1 as an H2 (#732).
+                return Some(n);
             }
             None
         }
@@ -400,7 +416,12 @@ impl Document {
                 visited += 1;
                 if let Some(style_def) = catalog.styles.get(id) {
                     if let Some(level) = style_def.paragraph_properties.outline_level {
-                        return Some((level + 1).min(6));
+                        // `outline_level` is a document-controlled `u8` (styles.xml's
+                        // `w:outlineLvl w:val`) that can legally be as high as 255; a
+                        // plain `level + 1` overflows when `level == 255` (panics under
+                        // overflow-checks, wraps to 0 otherwise). `saturating_add` keeps
+                        // this branch's result pinned at the `.min(6)` ceiling either way.
+                        return Some(level.saturating_add(1).min(6));
                     }
                     if let Some(ref name) = style_def.name
                         && (name == "Title" || name == "title")
@@ -414,6 +435,30 @@ impl Document {
             }
         }
         heading_level_from_style_name(style_id)
+    }
+
+    /// Resolve the human-readable style name for a paragraph style using the StyleCatalog.
+    ///
+    /// Walks the style inheritance chain (via `w:basedOn`) until it finds a `w:name`,
+    /// so styles that only set `w:basedOn` without their own name still resolve to the
+    /// ancestor's canonical name. Returns `None` if no `StyleCatalog` is available or no
+    /// style in the chain has a name.
+    pub(crate) fn resolve_style_name(&self, style_id: &str) -> Option<String> {
+        let catalog = self.style_catalog.as_ref()?;
+        let mut current_id = Some(style_id);
+        let mut visited = 0;
+        while let Some(id) = current_id {
+            if visited > 20 {
+                break;
+            }
+            visited += 1;
+            let style_def = catalog.styles.get(id)?;
+            if let Some(ref name) = style_def.name {
+                return Some(name.clone());
+            }
+            current_id = style_def.based_on.as_deref();
+        }
+        None
     }
 
     #[cfg(test)]
@@ -540,12 +585,9 @@ impl Document {
             }
         }
 
-        let trimmed_end = output.trim_end().len();
-        output.truncate(trimmed_end);
-        let trimmed_start = output.len() - output.trim_start().len();
-        if trimmed_start > 0 {
-            output.drain(..trimmed_start);
-        }
+        let (content_start, content_end) = blank_line_trim_range(&output);
+        output.truncate(content_end);
+        output.drain(..content_start);
         output
     }
 
@@ -1124,12 +1166,12 @@ struct BodyParseOutputs {
 /// Works for both `Event::Start` and `Event::Empty` events.
 fn apply_run_formatting(e: &BytesStart, current_run: &mut Option<Run>) {
     if let Some(run) = current_run {
-        match e.name().as_ref() as &[u8] {
-            b"w:b" => run.bold = is_format_enabled(e),
-            b"w:i" => run.italic = is_format_enabled(e),
-            b"w:u" => run.underline = is_format_enabled(e),
-            b"w:strike" | b"w:dstrike" => run.strikethrough = is_format_enabled(e),
-            b"w:vertAlign" => {
+        match e.name().as_ref() {
+            "w:b" => run.bold = is_format_enabled(e),
+            "w:i" => run.italic = is_format_enabled(e),
+            "w:u" => run.underline = is_format_enabled(e),
+            "w:strike" | "w:dstrike" => run.strikethrough = is_format_enabled(e),
+            "w:vertAlign" => {
                 if let Some(val) = get_val_attr_string(e) {
                     match val.as_str() {
                         "subscript" => {
@@ -1147,12 +1189,12 @@ fn apply_run_formatting(e: &BytesStart, current_run: &mut Option<Run>) {
                     }
                 }
             }
-            b"w:sz" => {
+            "w:sz" => {
                 if let Some(val) = get_val_attr(e) {
                     run.font_size = Some(val as u32);
                 }
             }
-            b"w:color" => {
+            "w:color" => {
                 if let Some(val) = get_val_attr_string(e)
                     && val != "auto"
                     && val.len() == 6
@@ -1161,7 +1203,7 @@ fn apply_run_formatting(e: &BytesStart, current_run: &mut Option<Run>) {
                     run.font_color = Some(val);
                 }
             }
-            b"w:highlight" => {
+            "w:highlight" => {
                 if let Some(val) = get_val_attr_string(e) {
                     const VALID_HIGHLIGHTS: &[&str] = &[
                         "yellow",
@@ -1192,15 +1234,15 @@ fn apply_run_formatting(e: &BytesStart, current_run: &mut Option<Run>) {
 }
 
 fn collect_run_property_change(e: &BytesStart, changes: &mut Vec<crate::types::revisions::PropertyChange>) {
-    let (name, from) = match e.name().as_ref() as &[u8] {
-        b"w:b" => ("bold", Some(is_format_enabled(e).to_string())),
-        b"w:i" => ("italic", Some(is_format_enabled(e).to_string())),
-        b"w:u" => ("underline", Some(is_format_enabled(e).to_string())),
-        b"w:strike" | b"w:dstrike" => ("strikethrough", Some(is_format_enabled(e).to_string())),
-        b"w:vertAlign" => ("vertical_align", get_val_attr_string(e)),
-        b"w:sz" => ("font_size", get_val_attr(e).map(|v| v.to_string())),
-        b"w:color" => ("font_color", get_val_attr_string(e)),
-        b"w:highlight" => ("highlight", get_val_attr_string(e)),
+    let (name, from) = match e.name().as_ref() {
+        "w:b" => ("bold", Some(is_format_enabled(e).to_string())),
+        "w:i" => ("italic", Some(is_format_enabled(e).to_string())),
+        "w:u" => ("underline", Some(is_format_enabled(e).to_string())),
+        "w:strike" | "w:dstrike" => ("strikethrough", Some(is_format_enabled(e).to_string())),
+        "w:vertAlign" => ("vertical_align", get_val_attr_string(e)),
+        "w:sz" => ("font_size", get_val_attr(e).map(|v| v.to_string())),
+        "w:color" => ("font_color", get_val_attr_string(e)),
+        "w:highlight" => ("highlight", get_val_attr_string(e)),
         _ => return,
     };
 
@@ -1318,6 +1360,57 @@ fn push_format_revision(
     });
 }
 
+/// Maximum indentation depth honoured for a `w:ilvl` (list nesting level).
+///
+/// Word's own list-formatting UI caps nesting at 9 levels (`w:ilvl` 0-8); this is also
+/// the practical ceiling for `Paragraph::to_markdown`'s two-space-per-level indent and
+/// for the internal-document builder's per-level `push_list` loop
+/// (`extractors/docx.rs::build_internal_document`). `w:ilvl` is a bare `.parse::<i64>()`
+/// of document-controlled text with no sign check or upper bound, so without this clamp
+/// a crafted `w:val="-1"` turns into `usize::MAX` in the indent's `"  ".repeat(level as
+/// usize)` (capacity-overflow panic), and `w:val="10000000000"` turns into a ~20 GB
+/// allocation attempt (uncatchable `handle_alloc_error` abort) or, via the list-depth
+/// loop, billions of `push_list` calls.
+const MAX_LIST_NESTING_LEVEL: i64 = 8;
+
+/// Clamp a raw `w:ilvl` value into the plausible `0..=MAX_LIST_NESTING_LEVEL` range.
+///
+/// A negative or absurdly large indentation level is malformed input, not a list depth
+/// to be honoured verbatim: this clamps rather than rejecting the whole paragraph, so a
+/// document with one garbage `w:ilvl` still extracts its text and list structure (just
+/// pinned to the nearest valid depth), matching the crate's "preserve partial results on
+/// failure" extraction-safety rule instead of discarding an otherwise-good paragraph.
+fn clamp_numbering_level(level: i64) -> i64 {
+    level.clamp(0, MAX_LIST_NESTING_LEVEL)
+}
+
+/// Byte range of `text` with its leading and trailing blank lines removed, keeping the
+/// indentation of the first content line intact.
+///
+/// `Paragraph::to_markdown` encodes list nesting depth as leading spaces
+/// (`"  ".repeat(level)`), so the blanket `trim_start` this replaced silently flattened
+/// any list whose first item was also the document's first line: a list starting at
+/// `w:ilvl="8"` rendered with zero indentation while the same list preceded by one
+/// ordinary paragraph rendered with all sixteen spaces.
+pub(crate) fn blank_line_trim_range(text: &str) -> (usize, usize) {
+    let end = text.trim_end().len();
+    let head = &text[..end];
+    let start = head
+        .char_indices()
+        .find(|(_, character)| !character.is_whitespace())
+        .map_or(end, |(index, _)| {
+            head[..index].rfind('\n').map_or(0, |newline| newline + 1)
+        });
+    (start, end)
+}
+
+/// `text` with its leading and trailing blank lines removed, preserving the first
+/// content line's indentation. See [`blank_line_trim_range`].
+pub(crate) fn trim_blank_lines(text: &str) -> &str {
+    let (start, end) = blank_line_trim_range(text);
+    &text[start..end]
+}
+
 /// Apply paragraph-level properties from a `<w:pStyle>`, `<w:ilvl>`, or `<w:numId>` element.
 ///
 /// Resolves the correct paragraph (table context vs top-level) automatically.
@@ -1333,10 +1426,10 @@ fn apply_paragraph_property(
     };
 
     if let Some(para) = para {
-        match e.name().as_ref() as &[u8] {
-            b"w:pStyle" => para.style = get_val_attr_string(e),
-            b"w:ilvl" => para.numbering_level = get_val_attr(e),
-            b"w:numId" => para.numbering_id = get_val_attr(e),
+        match e.name().as_ref() {
+            "w:pStyle" => para.style = get_val_attr_string(e),
+            "w:ilvl" => para.numbering_level = get_val_attr(e).map(clamp_numbering_level),
+            "w:numId" => para.numbering_id = get_val_attr(e),
             _ => {}
         }
     }
@@ -1375,24 +1468,28 @@ fn apply_fld_char(
     field_instruction: &mut String,
     current_hyperlink_url: &mut Option<String>,
     field_hyperlink_stack: &mut Vec<Option<String>>,
+    toc: &mut TocState,
 ) {
     for attr in e.attributes().flatten() {
-        if attr.key.as_ref() == b"w:fldCharType" {
-            match attr.value.as_ref() as &[u8] {
-                b"begin" => {
+        if attr.key.as_ref() == "w:fldCharType" {
+            match attr.value.as_ref() {
+                "begin" => {
                     *in_field_instruction = true;
                     field_instruction.clear();
+                    toc.field_begin();
                 }
-                b"separate" => {
+                "separate" => {
                     *in_field_instruction = false;
+                    toc.field_separate(field_instruction);
                     let url = extract_hyperlink_field_url(field_instruction);
                     field_hyperlink_stack.push(current_hyperlink_url.clone());
                     if url.is_some() {
                         *current_hyperlink_url = url;
                     }
                 }
-                b"end" => {
+                "end" => {
                     *in_field_instruction = false;
+                    toc.field_end();
                     if let Some(saved) = field_hyperlink_stack.pop() {
                         *current_hyperlink_url = saved;
                     }
@@ -1400,6 +1497,163 @@ fn apply_fld_char(
                 _ => {}
             }
         }
+    }
+}
+
+/// `w:sdtPr/w:docPartObj/w:docPartGallery/@w:val` value that marks a structured
+/// document tag as a Word-generated table of contents.
+const TOC_DOC_PART_GALLERY: &str = "Table of Contents";
+
+/// Bookmark Word writes to remember the last edit position. Never a link target.
+const GO_BACK_BOOKMARK: &str = "_GoBack";
+
+/// True when a field instruction is a table-of-contents field (`TOC \o "1-3" \h \z \u`).
+///
+/// Only the leading keyword is matched: the switches vary per document and carry no
+/// membership information. `TOA` (table of authorities) and `TC` (a TOC *entry* marker
+/// placed on the target, not on the entry) are deliberately not matched.
+fn is_toc_field_instruction(instruction: &str) -> bool {
+    instruction
+        .split_whitespace()
+        .next()
+        .is_some_and(|keyword| keyword.eq_ignore_ascii_case("TOC"))
+}
+
+/// Tracks whether the element-dispatch loop is currently inside a table of contents.
+///
+/// Word marks a generated TOC two independent ways, and normally emits both:
+///
+/// - a `w:sdt` structured document tag whose `w:sdtPr/w:docPartObj/w:docPartGallery`
+///   has `w:val="Table of Contents"` — the reliable marker when present;
+/// - a `TOC` field code, written either as `w:fldSimple/@w:instr` or as the
+///   `w:fldChar` begin/separate/end triple with the instruction in `w:instrText` —
+///   the only marker for a TOC that is not wrapped in an `sdt`.
+///
+/// The field-code form needs real nesting bookkeeping: a TOC field's *result* contains
+/// one nested `PAGEREF` field per entry, so the region must close on the TOC field's own
+/// `end`, not on the first `end` that arrives.
+#[derive(Debug, Default)]
+struct TocState {
+    /// One entry per currently-open `w:sdt`; `true` once its gallery said TOC.
+    sdt_stack: Vec<bool>,
+    /// Number of `true` entries in `sdt_stack`, so [`Self::active`] stays O(1).
+    open_toc_sdts: usize,
+    /// One entry per currently-open `w:fldSimple`; `true` when its instruction is TOC.
+    fld_simple_stack: Vec<bool>,
+    /// Number of `true` entries in `fld_simple_stack`.
+    open_toc_fld_simple: usize,
+    /// Current `w:fldChar` begin/end nesting depth.
+    field_depth: usize,
+    /// `field_depth` of the TOC field code currently open, if any.
+    toc_field_depth: Option<usize>,
+}
+
+impl TocState {
+    /// True when content parsed right now belongs to a table of contents.
+    fn active(&self) -> bool {
+        self.open_toc_sdts > 0 || self.open_toc_fld_simple > 0 || self.toc_field_depth.is_some()
+    }
+
+    fn open_sdt(&mut self) {
+        self.sdt_stack.push(false);
+    }
+
+    fn close_sdt(&mut self) {
+        if self.sdt_stack.pop() == Some(true) {
+            self.open_toc_sdts = self.open_toc_sdts.saturating_sub(1);
+        }
+    }
+
+    /// Apply a `w:docPartGallery` to the innermost open `w:sdt`.
+    fn apply_doc_part_gallery(&mut self, e: &BytesStart) {
+        let is_toc = get_val_attr_string(e).is_some_and(|val| val.trim().eq_ignore_ascii_case(TOC_DOC_PART_GALLERY));
+        if !is_toc {
+            return;
+        }
+        if let Some(flag) = self.sdt_stack.last_mut()
+            && !*flag
+        {
+            *flag = true;
+            self.open_toc_sdts += 1;
+        }
+    }
+
+    fn open_fld_simple(&mut self, instruction: Option<&str>) {
+        let is_toc = instruction.is_some_and(is_toc_field_instruction);
+        self.fld_simple_stack.push(is_toc);
+        if is_toc {
+            self.open_toc_fld_simple += 1;
+        }
+    }
+
+    fn close_fld_simple(&mut self) {
+        if self.fld_simple_stack.pop() == Some(true) {
+            self.open_toc_fld_simple = self.open_toc_fld_simple.saturating_sub(1);
+        }
+    }
+
+    fn field_begin(&mut self) {
+        self.field_depth += 1;
+    }
+
+    /// A field's instruction is complete at `separate`; that is where the result
+    /// content starts, so that is where a TOC region opens.
+    fn field_separate(&mut self, instruction: &str) {
+        if self.toc_field_depth.is_none() && is_toc_field_instruction(instruction) {
+            self.toc_field_depth = Some(self.field_depth);
+        }
+    }
+
+    fn field_end(&mut self) {
+        if self.toc_field_depth == Some(self.field_depth) {
+            self.toc_field_depth = None;
+        }
+        self.field_depth = self.field_depth.saturating_sub(1);
+    }
+}
+
+/// Resolve whichever paragraph is currently open — a table cell's or the top-level one —
+/// exactly as [`apply_paragraph_property`] does.
+fn current_paragraph_mut<'a>(
+    table_stack: &'a mut [TableContext],
+    current_paragraph: &'a mut Option<Paragraph>,
+) -> Option<&'a mut Paragraph> {
+    if let Some(ctx) = table_stack.last_mut() {
+        ctx.paragraph.as_mut()
+    } else {
+        current_paragraph.as_mut()
+    }
+}
+
+/// Mark the open paragraph as part of a table of contents.
+///
+/// Called both when a paragraph opens inside an already-active TOC region and right
+/// after a `w:fldChar` moves the parser into one: Word puts the TOC field's `begin`
+/// inside the first entry's paragraph, so a check made only at `<w:p>` would miss it.
+/// The flag is never cleared, which is what lets the *last* entry stay marked even
+/// though its `</w:p>` arrives after the field's `end`.
+fn mark_paragraph_in_toc(table_stack: &mut [TableContext], current_paragraph: &mut Option<Paragraph>) {
+    if let Some(para) = current_paragraph_mut(table_stack, current_paragraph) {
+        para.in_table_of_contents = true;
+    }
+}
+
+/// Record a `w:bookmarkStart` on the open paragraph so internal `w:hyperlink w:anchor`
+/// references — every entry of a generated TOC — have something to resolve against.
+fn apply_bookmark_start(e: &BytesStart, table_stack: &mut [TableContext], current_paragraph: &mut Option<Paragraph>) {
+    let Some(name) = e
+        .attributes()
+        .flatten()
+        .find(|attr| attr.key.as_ref() == "w:name")
+        .map(|attr| attr.value.to_string())
+    else {
+        return;
+    };
+    if name.is_empty() || name == GO_BACK_BOOKMARK {
+        return;
+    }
+    if let Some(para) = current_paragraph_mut(table_stack, current_paragraph) {
+        para.bookmarks.push(name);
     }
 }
 
@@ -1481,7 +1735,7 @@ fn apply_break(
 ) {
     let mut is_page_break = false;
     for attr in e.attributes().flatten() {
-        if attr.key.as_ref() == b"w:type" && attr.value.as_ref() == b"page" {
+        if attr.key.as_ref() == "w:type" && attr.value.as_ref() == "page" {
             is_page_break = true;
             break;
         }
@@ -1546,8 +1800,8 @@ fn apply_symbol(e: &BytesStart, current_run: &mut Option<Run>, warnings: &mut Ve
     let mut code: Option<String> = None;
     for attr in e.attributes().flatten() {
         match attr.key.as_ref() {
-            b"w:font" => font = std::str::from_utf8(&attr.value).ok().map(String::from),
-            b"w:char" => code = std::str::from_utf8(&attr.value).ok().map(String::from),
+            "w:font" => font = Some(attr.value.to_string()),
+            "w:char" => code = Some(attr.value.to_string()),
             _ => {}
         }
     }
@@ -1581,16 +1835,34 @@ fn apply_symbol(e: &BytesStart, current_run: &mut Option<Run>, warnings: &mut Ve
 ///
 /// Checks:
 /// - Maximum uncompressed size per file (100 MB default)
-/// - Maximum total number of entries (10,000 default)
+/// - Maximum total number of entries (from `SecurityLimits::max_files_in_archive`,
+///   10,000 by default; see `SecurityBudget::from_config`/`from_limits` for how a
+///   caller-supplied `ExtractionConfig` overrides the default)
 /// - Maximum total uncompressed size (500 MB default)
-fn validate_archive_security(archive: &mut zip::ZipArchive<impl Read + Seek>) -> Result<(), DocxParseError> {
-    use super::{MAX_TOTAL_UNCOMPRESSED_SIZE, MAX_UNCOMPRESSED_FILE_SIZE, MAX_ZIP_ENTRIES};
+/// - Maximum compression ratio (`SecurityLimits::max_compression_ratio`, 100:1 by
+///   default), delegated to [`ZipBombValidator`] -- every other OOXML/ODF container
+///   (XLSX, PPTX, ODT, ODP, HWPX, EPUB, iWork, generic archives) routes its ratio check
+///   through the same validator, and DOCX had been the one exception: the two size
+///   checks above bound how large a member's *declared* uncompressed size may be, but
+///   say nothing about how much smaller its *compressed* size was, so a member that
+///   declares (and, being `.take()`-bounded downstream, can actually only inflate to)
+///   a size within those limits can still be a compression bomb by ratio.
+///
+/// `pub(crate)` so the second, metadata-only archive open in
+/// `extractors/docx.rs::extract_content` can run the same checks the first (parsing)
+/// open does — that second open used to bypass validation entirely (GH security
+/// review: unvalidated second archive open).
+pub(crate) fn validate_archive_security(
+    archive: &mut zip::ZipArchive<impl Read + Seek>,
+    limits: &SecurityLimits,
+) -> Result<(), DocxParseError> {
+    use super::{MAX_TOTAL_UNCOMPRESSED_SIZE, MAX_UNCOMPRESSED_FILE_SIZE};
 
-    if archive.len() > MAX_ZIP_ENTRIES {
+    if archive.len() > limits.max_files_in_archive {
         return Err(DocxParseError::SecurityLimit(format!(
             "Archive contains {} entries, exceeds limit of {}",
             archive.len(),
-            MAX_ZIP_ENTRIES
+            limits.max_files_in_archive
         )));
     }
 
@@ -1617,6 +1889,8 @@ fn validate_archive_security(archive: &mut zip::ZipArchive<impl Read + Seek>) ->
             total_uncompressed, MAX_TOTAL_UNCOMPRESSED_SIZE
         )));
     }
+
+    ZipBombValidator::new(limits.clone()).validate(archive)?;
 
     Ok(())
 }
@@ -1645,9 +1919,11 @@ struct DocxParser<R: Read + Seek> {
 }
 
 impl<R: Read + Seek> DocxParser<R> {
-    fn new(reader: R) -> Result<Self, DocxParseError> {
+    /// `limits` is the caller's configured `SecurityLimits` (see `parse_document`), not a
+    /// hardcoded ceiling.
+    fn new(reader: R, limits: &SecurityLimits) -> Result<Self, DocxParseError> {
         let mut archive = zip::ZipArchive::new(reader)?;
-        validate_archive_security(&mut archive)?;
+        validate_archive_security(&mut archive, limits)?;
 
         let styles = {
             let mut styles_result = None;
@@ -1763,20 +2039,18 @@ impl<R: Read + Seek> DocxParser<R> {
 
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"Relationship" => {
+                Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.name().as_ref() == "Relationship" => {
                     let mut id = None;
                     let mut target = None;
                     let mut rel_type_matches = false;
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
-                            b"Id" => id = std::str::from_utf8(&attr.value).ok().map(String::from),
-                            b"Target" => {
-                                target = std::str::from_utf8(&attr.value).ok().map(String::from);
+                            "Id" => id = Some(attr.value.to_string()),
+                            "Target" => {
+                                target = Some(attr.value.to_string());
                             }
-                            b"Type" => {
-                                rel_type_matches = std::str::from_utf8(&attr.value)
-                                    .ok()
-                                    .is_some_and(|t| t.contains("hyperlink") || t.contains("image"));
+                            "Type" => {
+                                rel_type_matches = attr.value.contains("hyperlink") || attr.value.contains("image");
                             }
                             _ => {}
                         }
@@ -1858,7 +2132,7 @@ impl<R: Read + Seek> DocxParser<R> {
     fn parse_body_elements(
         &self,
         reader: &mut Reader<&[u8]>,
-        stop_tag: Option<&[u8]>,
+        stop_tag: Option<String>,
         budget: &mut SecurityBudget,
         warnings: &mut Vec<crate::types::ProcessingWarning>,
     ) -> Result<BodyParseOutputs, DocxParseError> {
@@ -1877,6 +2151,7 @@ impl<R: Read + Seek> DocxParser<R> {
         let mut field_instruction = String::new();
         let mut field_hyperlink_stack: Vec<Option<String>> = Vec::new();
         let mut current_hyperlink_url: Option<String> = None;
+        let mut toc = TocState::default();
         let mut table_stack: Vec<TableContext> = Vec::new();
         let mut mc_fallback_depth: u32 = 0;
         let mut stop_depth: u32 = if stop_tag.is_some() { 1 } else { 0 };
@@ -1904,48 +2179,64 @@ impl<R: Read + Seek> DocxParser<R> {
                 Ok(Event::Start(ref e)) => {
                     budget.enter()?;
                     let name = e.name();
-                    if Some(name.as_ref()) == stop_tag {
+                    if Some(name.as_ref()) == stop_tag.as_deref() {
                         stop_depth += 1;
                     }
-                    match name.as_ref() as &[u8] {
-                        b"w:p" => {
+                    match name.as_ref() {
+                        "w:p" => {
                             if let Some(ctx) = table_stack.last_mut() {
                                 ctx.paragraph = Some(Paragraph::new());
                             } else {
                                 current_paragraph_index = out.paragraphs.len();
                                 current_paragraph = Some(Paragraph::new());
                             }
+                            if toc.active() {
+                                mark_paragraph_in_toc(&mut table_stack, &mut current_paragraph);
+                            }
                         }
-                        b"w:r" => {
+                        "w:r" => {
                             let mut run = Run::default();
                             if let Some(ref url) = current_hyperlink_url {
                                 run.hyperlink_url = Some(url.clone());
                             }
                             current_run = Some(run);
                         }
-                        b"w:t" if !in_field_instruction => {
+                        "w:t" if !in_field_instruction => {
                             in_text = true;
                         }
-                        b"w:fldChar" => {
+                        "w:fldChar" => {
                             apply_fld_char(
                                 e,
                                 &mut in_field_instruction,
                                 &mut field_instruction,
                                 &mut current_hyperlink_url,
                                 &mut field_hyperlink_stack,
+                                &mut toc,
                             );
+                            if toc.active() {
+                                mark_paragraph_in_toc(&mut table_stack, &mut current_paragraph);
+                            }
                         }
-                        b"w:instrText" => {
+                        "w:sdt" => {
+                            toc.open_sdt();
+                        }
+                        "w:docPartGallery" => {
+                            toc.apply_doc_part_gallery(e);
+                        }
+                        "w:bookmarkStart" => {
+                            apply_bookmark_start(e, &mut table_stack, &mut current_paragraph);
+                        }
+                        "w:instrText" => {
                             in_instr_text = true;
                         }
-                        b"w:fldSimple" => {
+                        "w:fldSimple" => {
                             // Normalized, not raw: Word writes the instruction's quotes
                             // as `&quot;`, and the URL extractor looks for real quote
                             // characters. OOXML parts are XML 1.0.
                             let instr = e
                                 .attributes()
                                 .flatten()
-                                .find(|a| a.key.as_ref() == b"w:instr")
+                                .find(|a| a.key.as_ref() == "w:instr")
                                 .and_then(|a| {
                                     a.normalized_value(quick_xml::XmlVersion::Explicit1_0)
                                         .ok()
@@ -1956,11 +2247,15 @@ impl<R: Read + Seek> DocxParser<R> {
                             if url.is_some() {
                                 current_hyperlink_url = url;
                             }
+                            toc.open_fld_simple(instr.as_deref());
+                            if toc.active() {
+                                mark_paragraph_in_toc(&mut table_stack, &mut current_paragraph);
+                            }
                         }
-                        b"mc:Fallback" => {
+                        "mc:Fallback" => {
                             mc_fallback_depth += 1;
                         }
-                        b"w:pict" => {
+                        "w:pict" => {
                             // `parse_vml_pict` now threads `budget` through and balances
                             // its own `</w:pict>` end tag against the `enter()` above
                             // internally, so no manual `budget.leave()` is needed here. ~keep
@@ -1975,7 +2270,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                 page_breaks.text_since_break = true;
                             }
                         }
-                        b"m:oMathPara" => {
+                        "m:oMathPara" => {
                             let latex = super::math::collect_and_convert_omath_para(reader, budget)?;
                             if !latex.is_empty() {
                                 let run = Run {
@@ -1986,7 +2281,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                 page_breaks.text_since_break = true;
                             }
                         }
-                        b"m:oMath" => {
+                        "m:oMath" => {
                             let latex = super::math::collect_and_convert_omath(reader, budget)?;
                             if !latex.is_empty() {
                                 let run = Run {
@@ -1997,10 +2292,10 @@ impl<R: Read + Seek> DocxParser<R> {
                                 page_breaks.text_since_break = true;
                             }
                         }
-                        b"w:tbl" => {
+                        "w:tbl" => {
                             table_stack.push(TableContext::new());
                         }
-                        b"w:tblPr" => {
+                        "w:tblPr" => {
                             if let Some(ctx) = table_stack.last_mut() {
                                 // `parse_table_properties` now threads `budget` through and
                                 // balances its own `</w:tblPr>` end tag against the `enter()`
@@ -2008,56 +2303,81 @@ impl<R: Read + Seek> DocxParser<R> {
                                 ctx.table.properties = Some(super::table::parse_table_properties(reader, budget)?);
                             }
                         }
-                        b"w:tblGrid" => {
+                        "w:tblGrid" => {
                             if let Some(ctx) = table_stack.last_mut() {
                                 ctx.table.grid = Some(super::table::parse_table_grid(reader, budget)?);
                             }
                         }
-                        b"w:tr" => {
+                        "w:tr" => {
                             if let Some(ctx) = table_stack.last_mut() {
                                 ctx.current_row = Some(TableRow::default());
                             }
                         }
-                        b"w:trPr" => {
+                        "w:trPr" => {
                             if let Some(ctx) = table_stack.last_mut()
                                 && let Some(ref mut row) = ctx.current_row
                             {
                                 row.properties = Some(super::table::parse_row_properties(reader, budget)?);
                             }
                         }
-                        b"w:tc" => {
+                        "w:tc" => {
                             if let Some(ctx) = table_stack.last_mut() {
                                 ctx.current_cell = Some(TableCell::default());
                             }
                         }
-                        b"w:tcPr" => {
+                        "w:tcPr" => {
                             if let Some(ctx) = table_stack.last_mut()
                                 && let Some(ref mut cell) = ctx.current_cell
                             {
                                 cell.properties = Some(super::table::parse_cell_properties(reader, budget)?);
                             }
                         }
-                        b"w:b" | b"w:i" | b"w:u" | b"w:strike" | b"w:dstrike" | b"w:vertAlign" | b"w:sz"
-                        | b"w:color" | b"w:highlight" => {
+                        "w:b" | "w:i" | "w:u" | "w:strike" | "w:dstrike" | "w:vertAlign" | "w:sz" | "w:color"
+                        | "w:highlight" => {
                             if in_run_property_change {
                                 collect_run_property_change(e, &mut pending_property_changes);
                             } else {
                                 apply_run_formatting(e, &mut current_run);
                             }
                         }
-                        b"w:pStyle" | b"w:ilvl" | b"w:numId" => {
+                        "w:pStyle" | "w:ilvl" | "w:numId" => {
                             apply_paragraph_property(e, &mut table_stack, &mut current_paragraph);
                         }
-                        b"w:hyperlink" => {
+                        "w:hyperlink" => {
+                            let mut has_relationship_id = false;
+                            let mut relationship_url: Option<String> = None;
+                            let mut anchor: Option<String> = None;
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"r:id"
-                                    && let Ok(rid) = std::str::from_utf8(&attr.value)
-                                {
-                                    current_hyperlink_url = self.relationships.get(rid).cloned();
+                                match attr.key.as_ref() {
+                                    "r:id" => {
+                                        has_relationship_id = true;
+                                        let rid = attr.value.as_ref();
+                                        relationship_url = self.relationships.get(rid).cloned();
+                                    }
+                                    "w:anchor" => {
+                                        anchor = Some(attr.value.as_ref())
+                                            .filter(|value| !value.is_empty())
+                                            .map(String::from);
+                                    }
+                                    _ => {}
                                 }
                             }
+                            // `w:anchor` names a bookmark inside the document and was
+                            // previously ignored, so an internal jump — every entry of a
+                            // generated table of contents — produced no link at all. On its
+                            // own the anchor is the whole target; alongside an `r:id` it is
+                            // that external URL's fragment.
+                            match (has_relationship_id, relationship_url, anchor) {
+                                (_, Some(url), Some(anchor)) if !url.contains('#') => {
+                                    current_hyperlink_url = Some(format!("{url}#{anchor}"));
+                                }
+                                (_, Some(url), _) => current_hyperlink_url = Some(url),
+                                (_, None, Some(anchor)) => current_hyperlink_url = Some(format!("#{anchor}")),
+                                (true, None, None) => current_hyperlink_url = None,
+                                (false, None, None) => {}
+                            }
                         }
-                        b"w:drawing" => {
+                        "w:drawing" => {
                             // `parse_drawing` now threads `budget` through and balances its
                             // own `</w:drawing>` end tag against the `enter()` above
                             // internally, so no manual `budget.leave()` is needed here. ~keep
@@ -2067,7 +2387,7 @@ impl<R: Read + Seek> DocxParser<R> {
                             out.elements.push(DocumentElement::Drawing(idx));
                             page_breaks.text_since_break = true;
                         }
-                        b"w:br" => {
+                        "w:br" => {
                             apply_break(
                                 e,
                                 &table_stack,
@@ -2077,7 +2397,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                 &mut page_breaks,
                             );
                         }
-                        b"w:lastRenderedPageBreak" => {
+                        "w:lastRenderedPageBreak" => {
                             apply_last_rendered_page_break(
                                 &table_stack,
                                 &current_run,
@@ -2086,7 +2406,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                 &mut page_breaks,
                             );
                         }
-                        b"w:sectPr" => {
+                        "w:sectPr" => {
                             // `parse_section_properties_streaming` now threads `budget`
                             // through and balances its own `</w:sectPr>` end tag against the
                             // `enter()` above internally, so no manual `budget.leave()` is
@@ -2094,22 +2414,22 @@ impl<R: Read + Seek> DocxParser<R> {
                             let sect_props = super::section::parse_section_properties_streaming(reader, budget)?;
                             out.sections.push(sect_props);
                         }
-                        b"w:ins" => {
+                        "w:ins" => {
                             revision_kind = Some(RevisionKind::Insertion);
                             revision_attrs = collect_revision_attrs(e);
                             revision_text.clear();
                         }
-                        b"w:del" => {
+                        "w:del" => {
                             revision_kind = Some(RevisionKind::Deletion);
                             revision_attrs = collect_revision_attrs(e);
                             revision_text.clear();
                         }
-                        b"w:rPrChange" if revision_kind.is_none() => {
+                        "w:rPrChange" if revision_kind.is_none() => {
                             in_run_property_change = true;
                             pending_format_revision_attrs = Some(collect_revision_attrs(e));
                             pending_property_changes.clear();
                         }
-                        b"w:delText" => {
+                        "w:delText" => {
                             in_del_text = true;
                         }
                         _ => {}
@@ -2117,28 +2437,38 @@ impl<R: Read + Seek> DocxParser<R> {
                 }
                 Ok(Event::Empty(ref e)) => {
                     let name = e.name();
-                    match name.as_ref() as &[u8] {
-                        b"w:fldChar" => {
+                    match name.as_ref() {
+                        "w:fldChar" => {
                             apply_fld_char(
                                 e,
                                 &mut in_field_instruction,
                                 &mut field_instruction,
                                 &mut current_hyperlink_url,
                                 &mut field_hyperlink_stack,
+                                &mut toc,
                             );
+                            if toc.active() {
+                                mark_paragraph_in_toc(&mut table_stack, &mut current_paragraph);
+                            }
                         }
-                        b"w:b" | b"w:i" | b"w:u" | b"w:strike" | b"w:dstrike" | b"w:vertAlign" | b"w:sz"
-                        | b"w:color" | b"w:highlight" => {
+                        "w:docPartGallery" => {
+                            toc.apply_doc_part_gallery(e);
+                        }
+                        "w:bookmarkStart" => {
+                            apply_bookmark_start(e, &mut table_stack, &mut current_paragraph);
+                        }
+                        "w:b" | "w:i" | "w:u" | "w:strike" | "w:dstrike" | "w:vertAlign" | "w:sz" | "w:color"
+                        | "w:highlight" => {
                             if in_run_property_change {
                                 collect_run_property_change(e, &mut pending_property_changes);
                             } else {
                                 apply_run_formatting(e, &mut current_run);
                             }
                         }
-                        b"w:pStyle" | b"w:ilvl" | b"w:numId" => {
+                        "w:pStyle" | "w:ilvl" | "w:numId" => {
                             apply_paragraph_property(e, &mut table_stack, &mut current_paragraph);
                         }
-                        b"w:br" => {
+                        "w:br" => {
                             apply_break(
                                 e,
                                 &table_stack,
@@ -2148,23 +2478,23 @@ impl<R: Read + Seek> DocxParser<R> {
                                 &mut page_breaks,
                             );
                         }
-                        b"w:tab" => {
+                        "w:tab" => {
                             if let Some(ref mut run) = current_run {
                                 run.text.push('\t');
                                 page_breaks.text_since_break = true;
                             }
                         }
-                        b"w:noBreakHyphen" => {
+                        "w:noBreakHyphen" => {
                             if let Some(ref mut run) = current_run {
                                 run.text.push('\u{2011}');
                                 page_breaks.text_since_break = true;
                             }
                         }
-                        b"w:sym" => {
+                        "w:sym" => {
                             apply_symbol(e, &mut current_run, warnings);
                             page_breaks.text_since_break = true;
                         }
-                        b"w:lastRenderedPageBreak" => {
+                        "w:lastRenderedPageBreak" => {
                             apply_last_rendered_page_break(
                                 &table_stack,
                                 &current_run,
@@ -2173,25 +2503,23 @@ impl<R: Read + Seek> DocxParser<R> {
                                 &mut page_breaks,
                             );
                         }
-                        b"w:footnoteReference" | b"w:endnoteReference" => {
+                        "w:footnoteReference" | "w:endnoteReference" => {
                             if let Some(ref mut run) = current_run {
                                 for attr in e.attributes().flatten() {
-                                    if attr.key.as_ref() == b"w:id"
-                                        && let Ok(id) = std::str::from_utf8(&attr.value)
-                                        && id != "0"
-                                        && id != "1"
-                                    {
-                                        run.text.push_str(&format!("[^{}]", id));
-                                        page_breaks.text_since_break = true;
+                                    if attr.key.as_ref() == "w:id" {
+                                        let id = attr.value.as_ref();
+                                        if id != "0" && id != "1" {
+                                            run.text.push_str(&format!("[^{}]", id));
+                                            page_breaks.text_since_break = true;
+                                        }
                                     }
                                 }
                             }
                         }
-                        b"w:commentReference" => {
+                        "w:commentReference" => {
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"w:id"
-                                    && let Ok(id) = std::str::from_utf8(&attr.value)
-                                {
+                                if attr.key.as_ref() == "w:id" {
+                                    let id = attr.value.as_ref();
                                     out.comment_ref_ids.push(id.to_string());
                                     if let Some(ref mut run) = current_run {
                                         run.text.push_str(&format!("[cmt:{}]", id));
@@ -2199,27 +2527,27 @@ impl<R: Read + Seek> DocxParser<R> {
                                 }
                             }
                         }
-                        b"w:sectPr" => {
+                        "w:sectPr" => {
                             out.sections.push(super::section::SectionProperties::default());
                         }
-                        b"w:tblPr" => {
+                        "w:tblPr" => {
                             if let Some(ctx) = table_stack.last_mut() {
                                 ctx.table.properties = Some(super::table::TableProperties::default());
                             }
                         }
-                        b"w:tblGrid" => {
+                        "w:tblGrid" => {
                             if let Some(ctx) = table_stack.last_mut() {
                                 ctx.table.grid = Some(super::table::TableGrid::default());
                             }
                         }
-                        b"w:trPr" => {
+                        "w:trPr" => {
                             if let Some(ctx) = table_stack.last_mut()
                                 && let Some(ref mut row) = ctx.current_row
                             {
                                 row.properties = Some(super::table::RowProperties::default());
                             }
                         }
-                        b"w:tcPr" => {
+                        "w:tcPr" => {
                             if let Some(ctx) = table_stack.last_mut()
                                 && let Some(ref mut cell) = ctx.current_cell
                             {
@@ -2231,12 +2559,12 @@ impl<R: Read + Seek> DocxParser<R> {
                 }
                 Ok(Event::Text(e)) => {
                     if in_instr_text {
-                        let text = e.decode()?;
+                        let text = e.xml10_content();
                         budget.check_entity(&text)?;
                         budget.account_text(text.len())?;
                         field_instruction.push_str(&text);
                     } else if in_text && let Some(ref mut run) = current_run {
-                        let text = e.decode()?;
+                        let text = e.xml10_content();
                         budget.check_entity(&text)?;
                         budget.account_text(text.len())?;
                         run.text.push_str(&text);
@@ -2247,7 +2575,7 @@ impl<R: Read + Seek> DocxParser<R> {
                             revision_text.push_str(&text);
                         }
                     } else if in_del_text {
-                        let text = e.decode()?;
+                        let text = e.xml10_content();
                         budget.check_entity(&text)?;
                         budget.account_text(text.len())?;
                         revision_text.push_str(&text);
@@ -2273,28 +2601,32 @@ impl<R: Read + Seek> DocxParser<R> {
                 Ok(Event::End(ref e)) => {
                     budget.leave();
                     let name = e.name();
-                    if Some(name.as_ref()) == stop_tag {
+                    if Some(name.as_ref()) == stop_tag.as_deref() {
                         stop_depth = stop_depth.saturating_sub(1);
                     }
-                    match name.as_ref() as &[u8] {
-                        b"w:t" => {
+                    match name.as_ref() {
+                        "w:t" => {
                             in_text = false;
                         }
-                        b"w:instrText" => {
+                        "w:instrText" => {
                             in_instr_text = false;
                         }
-                        b"w:fldSimple" => {
+                        "w:sdt" => {
+                            toc.close_sdt();
+                        }
+                        "w:fldSimple" => {
+                            toc.close_fld_simple();
                             if let Some(saved) = field_hyperlink_stack.pop() {
                                 current_hyperlink_url = saved;
                             }
                         }
-                        b"mc:Fallback" => {
+                        "mc:Fallback" => {
                             mc_fallback_depth = mc_fallback_depth.saturating_sub(1);
                         }
-                        b"w:rPrChange" => {
+                        "w:rPrChange" => {
                             in_run_property_change = false;
                         }
-                        b"w:rPr" if !in_run_property_change => {
+                        "w:rPr" if !in_run_property_change => {
                             if let Some(attrs) = pending_format_revision_attrs.take() {
                                 push_format_revision(
                                     &mut out.revisions,
@@ -2306,7 +2638,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                 );
                             }
                         }
-                        b"w:r" => {
+                        "w:r" => {
                             if let Some(attrs) = pending_format_revision_attrs.take() {
                                 push_format_revision(
                                     &mut out.revisions,
@@ -2321,7 +2653,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                 push_run_to_current(&mut table_stack, &mut current_paragraph, run);
                             }
                         }
-                        b"w:p" => {
+                        "w:p" => {
                             if let Some(ctx) = table_stack.last_mut() {
                                 if let Some(para) = ctx.paragraph.take()
                                     && let Some(ref mut cell) = ctx.current_cell
@@ -2337,7 +2669,7 @@ impl<R: Read + Seek> DocxParser<R> {
                                 }
                             }
                         }
-                        b"w:tc" => {
+                        "w:tc" => {
                             if let Some(ctx) = table_stack.last_mut()
                                 && let Some(cell) = ctx.current_cell.take()
                                 && let Some(ref mut row) = ctx.current_row
@@ -2346,14 +2678,14 @@ impl<R: Read + Seek> DocxParser<R> {
                                 row.cells.push(cell);
                             }
                         }
-                        b"w:tr" => {
+                        "w:tr" => {
                             if let Some(ctx) = table_stack.last_mut()
                                 && let Some(row) = ctx.current_row.take()
                             {
                                 ctx.table.rows.push(row);
                             }
                         }
-                        b"w:tbl" => {
+                        "w:tbl" => {
                             if let Some(completed_ctx) = table_stack.pop() {
                                 let completed_table = completed_ctx.table;
                                 if let Some(parent_ctx) = table_stack.last_mut() {
@@ -2385,10 +2717,10 @@ impl<R: Read + Seek> DocxParser<R> {
                                 }
                             }
                         }
-                        b"w:hyperlink" => {
+                        "w:hyperlink" => {
                             current_hyperlink_url = None;
                         }
-                        b"w:ins" if revision_kind == Some(RevisionKind::Insertion) => {
+                        "w:ins" if revision_kind == Some(RevisionKind::Insertion) => {
                             let (id_opt, author_opt, date_opt) = (
                                 revision_attrs.0.take(),
                                 revision_attrs.1.take(),
@@ -2420,7 +2752,7 @@ impl<R: Read + Seek> DocxParser<R> {
                             revision_kind = None;
                             revision_text.clear();
                         }
-                        b"w:del" if revision_kind == Some(RevisionKind::Deletion) => {
+                        "w:del" if revision_kind == Some(RevisionKind::Deletion) => {
                             let (id_opt, author_opt, date_opt) = (
                                 revision_attrs.0.take(),
                                 revision_attrs.1.take(),
@@ -2452,7 +2784,7 @@ impl<R: Read + Seek> DocxParser<R> {
                             revision_kind = None;
                             revision_text.clear();
                         }
-                        b"w:delText" => {
+                        "w:delText" => {
                             in_del_text = false;
                         }
                         _ => {}
@@ -2504,35 +2836,32 @@ impl<R: Read + Seek> DocxParser<R> {
             match reader.read_event_into(&mut buf) {
                 Ok(Event::Start(ref e)) => {
                     budget.enter()?;
-                    match e.name().as_ref() as &[u8] {
-                        b"w:abstractNum" => {
+                    match e.name().as_ref() {
+                        "w:abstractNum" => {
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"w:abstractNumId"
-                                    && let Ok(id_str) = std::str::from_utf8(&attr.value)
-                                {
+                                if attr.key.as_ref() == "w:abstractNumId" {
+                                    let id_str = attr.value.as_ref();
                                     current_abstract_num_id = id_str.parse().ok();
                                 }
                             }
                         }
-                        b"w:num" => {
+                        "w:num" => {
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"w:numId"
-                                    && let Ok(id_str) = std::str::from_utf8(&attr.value)
-                                {
+                                if attr.key.as_ref() == "w:numId" {
+                                    let id_str = attr.value.as_ref();
                                     current_num_id = id_str.parse().ok();
                                 }
                             }
                         }
-                        b"w:lvl" => {
+                        "w:lvl" => {
                             for attr in e.attributes().flatten() {
-                                if attr.key.as_ref() == b"w:ilvl"
-                                    && let Ok(id_str) = std::str::from_utf8(&attr.value)
-                                {
+                                if attr.key.as_ref() == "w:ilvl" {
+                                    let id_str = attr.value.as_ref();
                                     current_lvl = id_str.parse().ok();
                                 }
                             }
                         }
-                        b"w:numFmt" => {
+                        "w:numFmt" => {
                             if let (Some(abstract_id), Some(lvl)) = (current_abstract_num_id, current_lvl) {
                                 let fmt = get_val_attr_string(e);
                                 let list_type = match fmt.as_deref() {
@@ -2551,15 +2880,15 @@ impl<R: Read + Seek> DocxParser<R> {
                         _ => {}
                     }
                 }
-                Ok(Event::Empty(ref e)) => match e.name().as_ref() as &[u8] {
-                    b"w:abstractNumId" => {
+                Ok(Event::Empty(ref e)) => match e.name().as_ref() {
+                    "w:abstractNumId" => {
                         if let Some(num_id) = current_num_id
                             && let Some(abstract_id) = get_val_attr(e)
                         {
                             num_to_abstract.insert(num_id, abstract_id);
                         }
                     }
-                    b"w:numFmt" => {
+                    "w:numFmt" => {
                         if let (Some(abstract_id), Some(lvl)) = (current_abstract_num_id, current_lvl) {
                             let fmt = get_val_attr_string(e);
                             let list_type = match fmt.as_deref() {
@@ -2577,15 +2906,15 @@ impl<R: Read + Seek> DocxParser<R> {
                 },
                 Ok(Event::End(ref e)) => {
                     budget.leave();
-                    match e.name().as_ref() as &[u8] {
-                        b"w:abstractNum" => {
+                    match e.name().as_ref() {
+                        "w:abstractNum" => {
                             current_abstract_num_id = None;
                             current_lvl = None;
                         }
-                        b"w:lvl" => {
+                        "w:lvl" => {
                             current_lvl = None;
                         }
-                        b"w:num" => {
+                        "w:num" => {
                             current_num_id = None;
                         }
                         _ => {}
@@ -2685,22 +3014,20 @@ impl<R: Read + Seek> DocxParser<R> {
 
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"Relationship" => {
+                Ok(Event::Empty(ref e)) | Ok(Event::Start(ref e)) if e.name().as_ref() == "Relationship" => {
                     let mut target: Option<String> = None;
                     let mut kind: Option<bool> = None;
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
-                            b"Target" => target = std::str::from_utf8(&attr.value).ok().map(String::from),
-                            b"Type" => {
-                                kind = std::str::from_utf8(&attr.value).ok().and_then(|t| {
-                                    if t.ends_with("/header") {
-                                        Some(true)
-                                    } else if t.ends_with("/footer") {
-                                        Some(false)
-                                    } else {
-                                        None
-                                    }
-                                });
+                            "Target" => target = Some(attr.value.to_string()),
+                            "Type" => {
+                                kind = if attr.value.ends_with("/header") {
+                                    Some(true)
+                                } else if attr.value.ends_with("/footer") {
+                                    Some(false)
+                                } else {
+                                    None
+                                };
                             }
                             _ => {}
                         }
@@ -2761,15 +3088,15 @@ impl<R: Read + Seek> DocxParser<R> {
         loop {
             budget.step()?;
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if matches!(e.name().as_ref() as &[u8], b"w:footnote" | b"w:endnote") => {
+                Ok(Event::Start(ref e)) if matches!(e.name().as_ref(), "w:footnote" | "w:endnote") => {
                     let mut id = String::new();
                     for attr in e.attributes().flatten() {
-                        if attr.key.as_ref() == b"w:id" {
-                            id = String::from_utf8_lossy(&attr.value).to_string();
+                        if attr.key.as_ref() == "w:id" {
+                            id = attr.value.as_ref().to_string();
                         }
                     }
-                    let stop_tag = e.name().as_ref().to_vec();
-                    let out = self.parse_body_elements(&mut reader, Some(stop_tag.as_slice()), budget, warnings)?;
+                    let stop_tag = e.name().as_ref().to_string();
+                    let out = self.parse_body_elements(&mut reader, Some(stop_tag), budget, warnings)?;
 
                     if id != "-1" && id != "0" && id != "1" {
                         let mut paragraphs = out.paragraphs;
@@ -2813,22 +3140,19 @@ impl<R: Read + Seek> DocxParser<R> {
         loop {
             budget.step()?;
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"w:comment" => {
+                Ok(Event::Start(ref e)) if e.name().as_ref() == "w:comment" => {
                     let mut id = String::new();
                     let mut author: Option<String> = None;
                     for attr in e.attributes().flatten() {
                         match attr.key.as_ref() {
-                            b"w:id" => id = String::from_utf8_lossy(&attr.value).to_string(),
-                            b"w:author" => {
-                                author = std::str::from_utf8(&attr.value)
-                                    .ok()
-                                    .map(String::from)
-                                    .filter(|s| !s.is_empty());
+                            "w:id" => id = attr.value.as_ref().to_string(),
+                            "w:author" => {
+                                author = Some(attr.value.to_string()).filter(|s| !s.is_empty());
                             }
                             _ => {}
                         }
                     }
-                    let out = self.parse_body_elements(&mut reader, Some(b"w:comment".as_slice()), budget, warnings)?;
+                    let out = self.parse_body_elements(&mut reader, Some("w:comment".to_string()), budget, warnings)?;
                     let mut paragraphs = out.paragraphs;
                     for table in out.tables {
                         for row in table.rows {
@@ -2851,7 +3175,7 @@ impl<R: Read + Seek> DocxParser<R> {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum DocxParseError {
+pub(crate) enum DocxParseError {
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -2881,9 +3205,18 @@ impl From<SecurityError> for DocxParseError {
 }
 
 /// Parse a DOCX document from bytes and return the structured document.
-pub(crate) fn parse_document(bytes: &[u8], budget: &mut SecurityBudget) -> crate::error::Result<Document> {
+///
+/// `limits` caps the archive's entry count, per-entry and total declared size, and
+/// compression ratio; callers read it from `ExtractionConfig.security_limits` (falling
+/// back to `SecurityLimits::default()`) so the limits are configurable rather than
+/// hardcoded ceilings baked into the parser.
+pub(crate) fn parse_document(
+    bytes: &[u8],
+    budget: &mut SecurityBudget,
+    limits: &SecurityLimits,
+) -> crate::error::Result<Document> {
     let cursor = Cursor::new(bytes);
-    let parser = DocxParser::new(cursor)
+    let parser = DocxParser::new(cursor, limits)
         .map_err(|e| crate::error::XbergError::parsing(format!("DOCX parsing failed: {}", e)))?;
     parser
         .parse(budget)
@@ -2894,7 +3227,8 @@ pub(crate) fn parse_document(bytes: &[u8], budget: &mut SecurityBudget) -> crate
 #[cfg(test)]
 pub(crate) fn extract_text_from_bytes(bytes: &[u8]) -> crate::error::Result<String> {
     let mut budget = SecurityBudget::with_defaults();
-    let doc = parse_document(bytes, &mut budget)?;
+    let limits = crate::extractors::security::SecurityLimits::default();
+    let doc = parse_document(bytes, &mut budget, &limits)?;
     Ok(doc.extract_text())
 }
 
@@ -2902,6 +3236,12 @@ pub(crate) fn extract_text_from_bytes(bytes: &[u8]) -> crate::error::Result<Stri
 mod tests {
     use super::*;
     use crate::extractors::security::SecurityBudget;
+
+    /// The default security limits `parse_document`/`validate_archive_security` enforce
+    /// when a test has no `ExtractionConfig` of its own to derive them from.
+    fn default_limits() -> SecurityLimits {
+        SecurityLimits::default()
+    }
 
     /// Runs are concatenated directly; whitespace comes from the XML text content.
     #[test]
@@ -3135,9 +3475,9 @@ mod tests {
     #[test]
     fn test_heading_level_from_style_name() {
         assert_eq!(heading_level_from_style_name("Title"), Some(1));
-        assert_eq!(heading_level_from_style_name("Heading1"), Some(2));
-        assert_eq!(heading_level_from_style_name("Heading2"), Some(3));
-        assert_eq!(heading_level_from_style_name("Heading3"), Some(4));
+        assert_eq!(heading_level_from_style_name("Heading1"), Some(1));
+        assert_eq!(heading_level_from_style_name("Heading2"), Some(2));
+        assert_eq!(heading_level_from_style_name("Heading3"), Some(3));
         assert_eq!(heading_level_from_style_name("Heading6"), Some(6));
         assert_eq!(heading_level_from_style_name("Normal"), None);
     }
@@ -3453,7 +3793,7 @@ mod tests {
             0x00, 0x00, 0x00, 0x00,
         ];
         let cursor = Cursor::new(zip_data);
-        let result = DocxParser::new(cursor);
+        let result = DocxParser::new(cursor, &default_limits());
         assert!(
             result.is_ok(),
             "Empty valid ZIP should pass security checks: {:?}",
@@ -3463,10 +3803,13 @@ mod tests {
 
     #[test]
     fn test_security_constants_are_reasonable() {
-        use super::super::{MAX_TOTAL_UNCOMPRESSED_SIZE, MAX_UNCOMPRESSED_FILE_SIZE, MAX_ZIP_ENTRIES};
+        use super::super::{MAX_TOTAL_UNCOMPRESSED_SIZE, MAX_UNCOMPRESSED_FILE_SIZE};
 
+        assert!(
+            crate::extractors::security::SecurityLimits::default().max_files_in_archive >= 1_000,
+            "Entry limit must be at least 1,000"
+        );
         const {
-            assert!(MAX_ZIP_ENTRIES >= 1_000, "Entry limit must be at least 1,000");
             assert!(
                 MAX_UNCOMPRESSED_FILE_SIZE >= 10 * 1024 * 1024,
                 "Per-file size limit must be at least 10 MB"
@@ -3497,7 +3840,7 @@ mod tests {
         let data = cursor.into_inner();
 
         let mut archive = zip::ZipArchive::new(Cursor::new(data)).unwrap();
-        let result = validate_archive_security(&mut archive);
+        let result = validate_archive_security(&mut archive, &default_limits());
         assert!(
             result.is_ok(),
             "A normal small archive must pass security validation: {:?}",
@@ -3523,7 +3866,7 @@ mod tests {
         let data = cursor.into_inner();
 
         let mut archive = zip::ZipArchive::new(Cursor::new(data)).unwrap();
-        let result = validate_archive_security(&mut archive);
+        let result = validate_archive_security(&mut archive, &default_limits());
         assert!(result.is_err(), "Archive with >10,000 entries must be rejected");
 
         let err_msg = format!("{}", result.unwrap_err());
@@ -3531,6 +3874,77 @@ mod tests {
             err_msg.contains("10001") && err_msg.contains("10000"),
             "Error should mention actual and limit counts, got: {}",
             err_msg
+        );
+    }
+
+    /// GH#639: `validate_archive_security` must honour a caller-supplied limit rather
+    /// than a hardcoded ceiling. A limit above 10,000 would pass under the old hardcoded
+    /// constant too, so this stays well under it - only reading `max_entries` catches it.
+    #[test]
+    fn test_security_rejects_too_many_entries_under_configured_limit() {
+        use std::io::{Cursor, Write};
+
+        let buffer = Vec::new();
+        let cursor = Cursor::new(buffer);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+
+        for i in 0..5 {
+            zip.start_file(format!("file_{}.txt", i), options).unwrap();
+            zip.write_all(b"").unwrap();
+        }
+
+        let cursor = zip.finish().unwrap();
+        let data = cursor.into_inner();
+
+        let mut archive = zip::ZipArchive::new(Cursor::new(data)).unwrap();
+        let limits = SecurityLimits {
+            max_files_in_archive: 3,
+            ..SecurityLimits::default()
+        };
+        let result = validate_archive_security(&mut archive, &limits);
+        assert!(
+            result.is_err(),
+            "5 entries must be rejected against a configured limit of 3"
+        );
+
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(
+            err_msg.contains('5') && err_msg.contains('3'),
+            "Error should mention actual and configured limit counts, got: {}",
+            err_msg
+        );
+    }
+
+    /// Sibling of the rejection test above: the same entry count under a configured
+    /// limit that comfortably fits it must pass.
+    #[test]
+    fn test_security_allows_entries_within_configured_limit() {
+        use std::io::{Cursor, Write};
+
+        let buffer = Vec::new();
+        let cursor = Cursor::new(buffer);
+        let mut zip = zip::ZipWriter::new(cursor);
+        let options = zip::write::FileOptions::<()>::default().compression_method(zip::CompressionMethod::Stored);
+
+        for i in 0..5 {
+            zip.start_file(format!("file_{}.txt", i), options).unwrap();
+            zip.write_all(b"").unwrap();
+        }
+
+        let cursor = zip.finish().unwrap();
+        let data = cursor.into_inner();
+
+        let mut archive = zip::ZipArchive::new(Cursor::new(data)).unwrap();
+        let limits = SecurityLimits {
+            max_files_in_archive: 10,
+            ..SecurityLimits::default()
+        };
+        let result = validate_archive_security(&mut archive, &limits);
+        assert!(
+            result.is_ok(),
+            "5 entries must pass against a configured limit of 10: {:?}",
+            result.err()
         );
     }
 
@@ -3550,7 +3964,7 @@ mod tests {
         let data = cursor.into_inner();
 
         let mut archive = zip::ZipArchive::new(Cursor::new(data)).unwrap();
-        let result = validate_archive_security(&mut archive);
+        let result = validate_archive_security(&mut archive, &default_limits());
         assert!(
             result.is_ok(),
             "A 1 KB file must pass size validation: {:?}",
@@ -3601,7 +4015,7 @@ mod tests {
 
         let bytes = create_test_docx(xml);
         let mut budget = SecurityBudget::with_defaults();
-        let doc = parse_document(&bytes, &mut budget).expect("parse_document should succeed");
+        let doc = parse_document(&bytes, &mut budget, &default_limits()).expect("parse_document should succeed");
 
         assert_eq!(doc.tables.len(), 1, "Expected exactly 1 (outer) table");
 
@@ -3672,7 +4086,7 @@ mod tests {
         let bytes = cursor.into_inner();
 
         let mut budget = SecurityBudget::with_defaults();
-        let doc = parse_document(&bytes, &mut budget).expect("should parse");
+        let doc = parse_document(&bytes, &mut budget, &default_limits()).expect("should parse");
 
         assert!(doc.style_catalog.is_some(), "Style catalog should be loaded");
         let catalog = doc.style_catalog.as_ref().unwrap();
@@ -3736,7 +4150,7 @@ mod tests {
 
         let bytes = create_test_docx(xml);
         let mut budget = SecurityBudget::with_defaults();
-        let doc = parse_document(&bytes, &mut budget).expect("parse should succeed");
+        let doc = parse_document(&bytes, &mut budget, &default_limits()).expect("parse should succeed");
 
         assert_eq!(doc.tables.len(), 1);
         let table = &doc.tables[0];
@@ -3798,7 +4212,7 @@ mod tests {
 
         let bytes = create_test_docx(xml);
         let mut budget = SecurityBudget::with_defaults();
-        let doc = parse_document(&bytes, &mut budget).expect("parse should succeed");
+        let doc = parse_document(&bytes, &mut budget, &default_limits()).expect("parse should succeed");
 
         assert_eq!(doc.tables.len(), 1);
         let table = &doc.tables[0];
@@ -3853,7 +4267,7 @@ mod tests {
 
         let bytes = create_test_docx(xml);
         let mut budget = SecurityBudget::with_defaults();
-        let doc = parse_document(&bytes, &mut budget).expect("parse should succeed");
+        let doc = parse_document(&bytes, &mut budget, &default_limits()).expect("parse should succeed");
 
         assert_eq!(doc.tables.len(), 1);
         let table = &doc.tables[0];
@@ -5319,7 +5733,7 @@ mod tests {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../test_documents/docx/textbox.docx");
         if let Ok(bytes) = std::fs::read(&path) {
             let mut budget = SecurityBudget::with_defaults();
-            let doc = super::parse_document(&bytes, &mut budget).unwrap();
+            let doc = super::parse_document(&bytes, &mut budget, &default_limits()).unwrap();
             let md = doc.to_markdown(true);
             assert!(
                 !md.contains("****"),
@@ -5404,5 +5818,35 @@ mod tests {
         let md = doc.to_markdown(false);
         assert!(!md.contains("!["), "Should NOT contain image placeholder, got: {md}");
         assert!(md.contains("Hello world"), "Text content must be preserved");
+    }
+
+    /// `w:ilvl` is a bare `.parse::<i64>()` of an attacker-controlled attribute, and the
+    /// value reaches `"  ".repeat(level as usize)`. `-1 as usize` is `usize::MAX`, so the
+    /// repeat's internal `len().checked_mul(n)` panics with "capacity overflow"; a large
+    /// positive value asks for an allocation big enough to abort the process outright.
+    /// These pin the clamp directly, because the end-to-end DOCX tests cannot: a list
+    /// starting at a non-zero level renders flat today, so every level above 0 produces
+    /// identical markdown there regardless of the cap.
+    #[test]
+    fn clamp_numbering_level_floors_a_negative_level_at_zero() {
+        assert_eq!(clamp_numbering_level(-1), 0);
+        assert_eq!(clamp_numbering_level(i64::MIN), 0);
+    }
+
+    #[test]
+    fn clamp_numbering_level_caps_an_oversized_level_at_the_nesting_ceiling() {
+        assert_eq!(clamp_numbering_level(10_000_000_000), MAX_LIST_NESTING_LEVEL);
+        assert_eq!(clamp_numbering_level(i64::MAX), MAX_LIST_NESTING_LEVEL);
+    }
+
+    #[test]
+    fn clamp_numbering_level_leaves_every_level_word_itself_permits_untouched() {
+        for level in 0..=MAX_LIST_NESTING_LEVEL {
+            assert_eq!(
+                clamp_numbering_level(level),
+                level,
+                "level {level} is within Word's own range"
+            );
+        }
     }
 }

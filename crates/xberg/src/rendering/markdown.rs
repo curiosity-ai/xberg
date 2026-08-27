@@ -198,7 +198,9 @@ pub(crate) fn render_markdown(doc: &InternalDocument) -> String {
         output = s;
     }
 
-    output = strip_arxiv_watermark_noise(output);
+    if !doc.include_watermarks {
+        output = strip_arxiv_watermark_noise(output);
+    }
 
     if let Some(annotations) = doc.annotations.as_deref() {
         let block = render_annotations_markdown(annotations);
@@ -319,6 +321,51 @@ pub(crate) fn comrak_options<'a>() -> Options<'a> {
 mod tests {
     use super::*;
     use crate::types::internal_builder::InternalDocumentBuilder;
+
+    /// #### FAILS against unfixed code
+    /// `InternalElement::set_list_item_source_label` does not exist on unfixed
+    /// code, so this test does not compile without the fix -- the compatibility
+    /// story an additive attribute (rather than a field on the `Copy`
+    /// `ElementKind` enum) is built around. Once compiled, it proves the
+    /// renderer half of the ordinal-discarding defect: a captured literal
+    /// source marker ("B.", from Exhibit B of the ground-truth ordinance) must
+    /// reach the rendered markdown verbatim, not get replaced by comrak's
+    /// synthesized sequential "1.". This constructs the element directly and
+    /// sets the label by hand because the PDF pipeline call site that would
+    /// capture it (`pdf::structure::assembly::push_paragraph_element`) is
+    /// outside this task's file scope -- see the task report for that half.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn render_markdown_preserves_a_literal_list_item_source_label() {
+        use crate::types::internal::{ElementKind, InternalElement};
+
+        let mut doc = InternalDocument::new("pdf");
+        doc.push_element(InternalElement::text(ElementKind::ListStart { ordered: true }, "", 0));
+        let mut item = InternalElement::text(
+            ElementKind::ListItem { ordered: true },
+            "General Provisions, Definitions, and Exhibits.",
+            1,
+        );
+        item.set_list_item_source_label("B.");
+        doc.push_element(item);
+        doc.push_element(InternalElement::text(ElementKind::ListEnd, "", 0));
+
+        let rendered = render_markdown(&doc);
+
+        // CommonMark's ordered marker is an auto-incrementing decimal and cannot express
+        // a lettered label like "B.", so an item carrying a source label is rendered as a
+        // bullet with the label as leading text. Two requirements, both non-negotiable:
+        // the label survives (unfixed code drops it), and no synthesized ordinal appears
+        // beside it (a "1." next to "B." renumbers a document cross-referenced by clause).
+        assert!(
+            rendered.contains("- B. General Provisions, Definitions, and Exhibits."),
+            "expected the literal source label \"B.\" on a bullet, got: {rendered}"
+        );
+        assert!(
+            !rendered.contains("1."),
+            "a synthesized ordinal must not compete with the document's own label, got: {rendered}"
+        );
+    }
 
     /// Issue #1292: by default, prose containing a leading `#06-18`-style token
     /// keeps its backslash escapes so the markdown round-trips safely through a
@@ -472,6 +519,39 @@ mod tests {
             !rendered.contains("[TABLE:"),
             "no anchor should appear without a table_id: {rendered}"
         );
+    }
+
+    #[test]
+    fn render_markdown_strips_arxiv_watermark_by_default() {
+        let mut builder = InternalDocumentBuilder::new("pdf");
+        builder.push_paragraph(
+            "Research title 7 arXiv:2401.12345v2 [cs.CL] 9 Jan 2024",
+            vec![],
+            None,
+            None,
+        );
+        let document = builder.build();
+
+        let rendered = render_markdown(&document);
+
+        assert!(!rendered.contains("arXiv:2401.12345v2"));
+    }
+
+    #[test]
+    fn render_markdown_preserves_arxiv_watermark_when_enabled() {
+        let mut builder = InternalDocumentBuilder::new("pdf");
+        builder.push_paragraph(
+            "Research title 7 arXiv:2401.12345v2 [cs.CL] 9 Jan 2024",
+            vec![],
+            None,
+            None,
+        );
+        let mut document = builder.build();
+        document.include_watermarks = true;
+
+        let rendered = render_markdown(&document);
+
+        assert!(rendered.contains("arXiv:2401.12345v2 [cs.CL] 9 Jan 2024"));
     }
 
     #[test]

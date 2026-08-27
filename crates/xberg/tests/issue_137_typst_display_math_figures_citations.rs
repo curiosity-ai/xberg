@@ -58,8 +58,8 @@ async fn should_not_lose_display_math_body_spanning_many_lines() {
         .expect("Typst extraction should succeed");
 
     assert_eq!(
-        extraction.content, "x = 1 \\\ny = 2 \\\nz = x + y",
-        "every line of a multi-line display math block must be preserved"
+        extraction.content, "x = 1 \\\\ y = 2 \\\\ z = x + y",
+        "every line of a multi-line display math block must survive, as LaTeX line breaks"
     );
 }
 

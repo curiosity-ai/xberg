@@ -50,27 +50,39 @@ default = ["tokio-runtime", "simd-utf8"]
 # `task rust:build:profiling` turns both on in one workspace build.
 profiling = []
 
-pool-metrics = []
-
 simd-utf8 = ["dep:simdutf8"]
 
 tokio-runtime = ["dep:tokio"]
 
-# PDF extraction is currently backed by pdf_oxide. Keep this as the canonical
-# `pdf` feature until/unless a second PDF backend is introduced.
-pdf = [
-    "dep:pdf_oxide",
+# PDF backend selection (#700). `pdf` is the umbrella feature every existing
+# build profile already lists; it now forwards to `pdf-native` so none of them
+# need to change. `pdf-native` carries the native engine dependency set,
+# unchanged from before this split.
+pdf = ["pdf-native"]
+pdf-native = [
+    "dep:xberg-native-pdf",
     "dep:lopdf",
     "dep:image",
     "dep:flate2",
     "html",
     "image-encode",
 ]
+# PdfConfig::backend and PdfBackend (core/config/pdf.rs) always compile under
+# `pdf`. This feature pulls in the `xberg-pdfium-render` crate (crates/xberg-pdfium-render)
+# and wires a real (if intentionally smaller-scope than pdf-native) extraction engine
+# behind `extractors::pdf::PdfExtractor::extract_core_pdfium` (#702) -- see
+# `crates/xberg/src/extractors/pdf/pdfium_engine.rs` for exactly what it extracts.
+# Without this feature, selecting `PdfBackend::Pdfium` still fails loudly with an
+# actionable error rather than silently falling back to `pdf-native`.
+# `tokio-runtime` is required because the pdfium FFI calls are synchronous and
+# CPU-bound and must run inside `tokio::task::spawn_blocking`, not inline on the
+# async runtime.
+pdf-pdfium = ["dep:pdfium-render", "tokio-runtime"]
 # `zip` and `quick-xml` are not optional extras here: an .xlsx *is* a zip, and the
 # parts calamine does not model — revision headers, cell comments — are read out of
 # it directly. Without them a bare `--features excel` build did not compile at all.
 excel = ["dep:calamine", "dep:roxmltree", "dep:zip", "dep:quick-xml", "tokio-runtime"]
-excel-wasm = ["dep:calamine", "dep:roxmltree"]
+excel-wasm = ["dep:calamine", "dep:roxmltree", "dep:zip"]
 office = [
     "dep:cfb",
     "dep:roxmltree",
@@ -82,6 +94,7 @@ office = [
     "dep:dbase",
     "dep:typst-syntax",
     "dep:mathemascii",
+    "dep:html-escape",
     "html",
     "notebook",
 ]
@@ -130,7 +143,7 @@ image-encode = ["dep:image"]
 # page rendering, multi-backend pipeline) usable without the Tesseract binary.
 # Implied by `liter-llm` so VLM-only OCR works without enabling the full `ocr` feature.
 # Also implied by `ocr` and `ocr-wasm` (see those feature definitions).
-ocr-pipeline = ["dep:image", "image-encode"]
+ocr-pipeline = ["dep:image", "image-encode", "dep:fast_image_resize"]
 
 tree-sitter = ["dep:tree-sitter-language-pack"]
 tree-sitter-wasm = ["tree-sitter"]
@@ -152,6 +165,12 @@ ocr = [
 # so the runtime tessdata resolver can materialize English OCR offline without a
 # network download. Forwarded to xberg-tesseract.
 bundle-tessdata-eng = ["xberg-tesseract/bundle-tessdata-eng"]
+# Link the host's Tesseract and Leptonica instead of downloading and building vendored copies.
+# The vendored path fetches sources over the network at build time, so it cannot run in a
+# network-isolated build such as a conda-forge recipe or a distro package. Additive: it takes
+# precedence inside xberg-tesseract's build script rather than needing the default switched off,
+# which a dependent cannot do. Forwarded to xberg-tesseract.
+tesseract-dynamic = ["xberg-tesseract?/system-linking"]
 # WASM OCR: Minimal Tesseract backend without html-to-markdown (which has WASI imports)
 # Includes only the core OCR processing dependencies needed for Tesseract on WASM
 ocr-wasm = [
@@ -515,7 +534,7 @@ quality = ["dep:unicode-normalization", "dep:chardetng", "stopwords"]
 
 # Cloud-upstreamed infrastructure (pure-Rust; see gap-closing plan). Generic overridable
 # defaults only — no domain knowledge. `heuristics` text-layer detection is gated separately
-# under `heuristics-pdf` (added when the pdf_oxide branch lands).
+# under `heuristics-pdf`.
 enrichment = []
 heuristics = []
 
@@ -542,9 +561,6 @@ ner-candle = ["ner-candle-backend", "tokio-runtime"]
 # natively too, for callers wanting candle NER without a runtime dependency.
 ner-candle-wasm = ["ner-candle-backend"]
 ner = [] # NER result types only; safe on every target.
-ner-llm-types = [
-    "ner",
-] # LlmBackend stub for targets without full ner-llm (Windows, Android x86_64, WASM).
 ner-llm = ["ner", "liter-llm"] # LLM-driven zero-shot NER (no ORT).
 ner-onnx = [
     # xberg-gliner ONNX backend with Hugging Face model download.
@@ -770,6 +786,19 @@ android-target = [
 # `ort-bundled` (downloaded at build time — no system ORT required), matching
 # the ML surface every other native (non-WASM/Android) target carries. `heic`
 # is the only capability still excluded, for the libheif runner reason above.
+# CAUTION (xberg-io/xberg#1456): "no system ORT required" describes what this
+# feature set alone controls, not the whole story. pyke's Windows download
+# strategy (the one this comment says needs no system ORT) always links
+# DirectML.dll unconditionally on every Windows build, regardless of which
+# execution provider is actually selected at runtime (ort_discovery.rs has no
+# DirectML arm at all -- nothing here ever uses it). That import is resolved
+# by the Windows loader before any code runs, so any release leg that takes
+# this default pyke strategy without shipping DirectML.dll fails to import on
+# a clean Windows host. The fix is CI-side (switch the affected legs in
+# .github/workflows/publish.yaml to ORT_STRATEGY=system via
+# ./.github/actions/setup-onnx-runtime, which skips DirectML entirely), not a
+# change to this feature set, but do not read the line above as "Windows
+# needs nothing extra" when reasoning about Windows release builds.
 # Mirrors the explicit Windows list that the xberg-ffi crate uses; binding
 # crates reach it via per-crate `[[crates.<x>.target_dep_overrides]]` blocks
 # in `alef.toml`.
@@ -834,7 +863,6 @@ windows-target = [
     "transcription",
     "ner-onnx",
     "ner",
-    "ner-llm-types",
     "presets",
     "redaction",
     # redaction-rehydrate = [redaction, dep:aes-gcm, dep:scrypt, dep:zeroize]: `redaction`
@@ -859,11 +887,8 @@ windows-target = [
     # The following five features each depend only on some combination of `liter-llm`,
     # `tokio-runtime`, `ner`, `redaction` and `summarization` — every one of them already
     # enabled above — so none of these adds a single new dependency on Windows (GH#1443).
-    # captioning = [liter-llm, tokio-runtime]; ner-llm = [ner, liter-llm] (note:
-    # `ner-llm-types` above only stubs `LlmBackend`/omits `NerBackend` — see
-    # `text::ner::mod.rs` and `lib.rs`'s `#[cfg(feature = "ner-llm")]` gate — so without
-    # this entry Windows silently got the non-functional stub even though its own
-    # dependencies were already present); redaction-ml = [redaction, ner];
+    # captioning = [liter-llm, tokio-runtime]; ner-llm = [ner, liter-llm];
+    # redaction-ml = [redaction, ner];
     # summarization-llm = [summarization, liter-llm]; translation = [liter-llm].
     "captioning",
     "ner-llm",
@@ -966,14 +991,26 @@ windows-gnu-target = [
     "layout-types",
     "paddle-ocr-types",
     "embedding-presets",
+    # static-embeddings = [embedding-presets, tokio-runtime, dep:model2vec-rs,
+    # dep:tokenizers-model2vec, dep:tokenizers, dep:ndarray, dep:hf-hub, dep:reqwest,
+    # dep:sha2, dep:fs2]: no `dep:ort`/`onnx-runtime`, so unlike `reranker` /
+    # `sparse-embeddings` / `late-interaction` / `transcription` / `ner-onnx` it is not
+    # part of the ORT-prebuilt-unavailable-on-gnu exclusion above. Every dep here is
+    # already pulled by `embedding-presets` (this list) or is pure Rust with no build
+    # script — see the identical rationale on `windows-target` (GH#1443 follow-up: this
+    # -gnu list was not updated when that fix landed, breaking the "mirrors
+    # windows-target 1:1" comment above for this and the other GH#1443 entries below).
+    "static-embeddings",
     "reranker-presets",
     "sparse-embedding-presets",
     "late-interaction-presets",
     "transcription-types",
     "ner",
-    "ner-llm-types",
     "presets",
     "redaction",
+    # redaction-rehydrate = [redaction, dep:aes-gcm, dep:scrypt, dep:zeroize]: RustCrypto,
+    # no native/system deps — same rationale as `windows-target` (GH#1443 follow-up).
+    "redaction-rehydrate",
     "diff",
     "qr-codes",
     "summarization",
@@ -982,14 +1019,29 @@ windows-gnu-target = [
     "mcp",
     "liter-llm",
     "classification",
+    # captioning/ner-llm/redaction-ml/summarization-llm/translation each resolve entirely
+    # through liter-llm/tokio-runtime/ner/redaction/summarization, all already enabled
+    # above — no `dep:ort`, so none of these belongs in the ORT exclusion (GH#1443
+    # follow-up; see `windows-target`'s identical entries for the per-feature deps).
+    "captioning",
+    "ner-llm",
+    "redaction-ml",
+    "summarization-llm",
+    "translation",
     "structured",
     "quality",
     "heuristics",
+    # enrichment = [] — no dependencies at all (GH#1443 follow-up; see `windows-target`).
+    "enrichment",
     "xml",
     "svg",
     "chunking-tokenizers",
     "url-ingestion",
     "markdown-footnotes",
+    # otel = [dep:opentelemetry, dep:opentelemetry_sdk, dep:tracing-opentelemetry,
+    # crawlberg?/otel, liter-llm?/otel] — pure Rust, no `dep:ort` (GH#1443 follow-up;
+    # see `windows-target`'s identical entry for the full per-crate verification).
+    "otel",
     "wordperfect",
 ]
 # macos-intel-target: native Intel macOS (x86_64-apple-darwin). FULL feature
@@ -1180,11 +1232,12 @@ biblib = { version = "0.8", default-features = false, features = ["ris", "pubmed
 bitvec = "1.1"
 blake3 = { workspace = true }
 bytes = { workspace = true }
-# Pinned to 0.35.x: calamine 0.36 requires quick-xml 0.41 with the `encoding`
-# feature, which unifies with our office_oxide (via pdf_oxide) quick-xml 0.41
-# and compiles out `Attribute::unescape_value` (it is `cfg(not(encoding))`),
-# breaking office_oxide 0.1.3. calamine 0.35 needs quick-xml 0.39, keeping the
-# versions split. Revert this pin only once office_oxide drops unescape_value.
+# calamine carries quick-xml 0.41 with the `encoding` feature, as do biblib,
+# crawlberg and unhwp. Our own quick-xml (here and in xberg-native-pdf) is
+# 0.42; the two are semver-incompatible, so Cargo keeps both in the lock rather
+# than unifying them and `encoding` never reaches our copy. Do not collapse
+# them onto one version without checking what `encoding` gates out — it
+# compiles away `Attribute::unescape_value`, among others.
 calamine = { version = "0.36.1", features = ["dates"], optional = true }
 cfb = { workspace = true, optional = true }
 chardetng = { version = "1.0.0", optional = true }
@@ -1199,8 +1252,9 @@ encoding_rs = { version = "0.8.35" }
 fast_image_resize = { version = "6.1.0", optional = true }
 flate2 = { version = "1.1", optional = true }
 hayro-jbig2 = { version = "0.3", default-features = false, features = ["std"], optional = true }
-hayro-jpeg2000 = { version = "0.3", default-features = false, features = ["std", "simd"], optional = true }
+hayro-jpeg2000 = { version = "0.4", default-features = false, features = ["std", "simd"], optional = true }
 hex = { workspace = true }
+html-escape = { version = "0.2.15", optional = true }
 html-to-markdown-rs = { workspace = true, features = ["inline-images", "metadata"], optional = true }
 icu_provider = { version = "2", features = ["sync"], optional = true }
 icu_segmenter = { version = "2", optional = true }
@@ -1219,7 +1273,7 @@ indexmap = "2.14.0"
 infer = "0.22.0"
 itertools = { workspace = true, optional = true }
 jotdown = "0.10"
-jsonschema = { version = "0.49", optional = true, default-features = false }
+jsonschema = { version = "0.51", optional = true, default-features = false }
 libc = { workspace = true }
 # lofty: pure-Rust audio tag reader (ID3v1/v2, MP4 atoms, Vorbis comments, FLAC, etc.)
 # MIT license. Used for metadata extraction independent of the inference backend.
@@ -1229,7 +1283,9 @@ lofty = { version = "0.25", optional = true }
 # xberg-io/liter-llm). hf-hub 1.0 now rides the same reqwest/aws-lc-rs stack.
 log = { workspace = true }
 lopdf = { version = "0.44.0", optional = true, default-features = false }
-mail-parser = { version = "0.11.6", features = ["full_encoding"], optional = true }
+mail-parser = { version = "0.11.8", features = ["full_encoding"], optional = true }
+# AsciiMath parser, used to reach LaTeX through the shared MathML converter.
+mathemascii = { version = "0.4.0", optional = true }
 mel_spec = { version = "0.4", optional = true }
 memchr = "2.8.3"
 memmap2 = { workspace = true }
@@ -1266,17 +1322,17 @@ ort = { version = "2.0.0-rc.13", default-features = false, features = ["std", "n
 outlook-pst = { version = "1.2.0", optional = true }
 parking_lot = { workspace = true }
 pastey = "0.2"
-pdf_oxide = { workspace = true, features = ["rendering"], optional = true }
+pdfium-render = { workspace = true, optional = true }
 # Registry + text-exposition-format encoder backing the `/metrics` endpoint (#1391).
 # `default-features = false` drops the `protobuf` dependency, which nothing here needs.
 prometheus = { version = "0.14", default-features = false, optional = true }
 pulldown-cmark = { version = "0.13" }
-quick-xml = { version = "0.41.0", features = ["serialize"], optional = true }
+quick-xml = { version = "0.42.0", features = ["serialize"], optional = true }
 rake = { version = "0.3.6", optional = true }
 rayon = { workspace = true }
 regex = "1.13.1"
 resvg = { workspace = true, optional = true }
-rmcp = { version = "3.1.2", features = [
+rmcp = { version = "3.1.4", features = [
     "server",
     "macros",
     "base64",
@@ -1287,10 +1343,6 @@ rmcp = { version = "3.1.2", features = [
 rmp-serde = "1.3"
 
 roxmltree = { version = "0.21.1", optional = true }
-# Typst's own parser, used to convert Typst math to LaTeX.
-typst-syntax = { version = "0.15.1", optional = true }
-# AsciiMath parser, used to reach LaTeX through the shared MathML converter.
-mathemascii = { version = "0.4.0", optional = true }
 rqrr = { version = "0.10", optional = true }
 sceptre = { workspace = true, optional = true }
 scrypt = { version = "0.12", optional = true, default-features = false, features = ["kdf"] }
@@ -1344,10 +1396,19 @@ tower-http = { version = "0.7", features = [
 ], optional = true }
 tracing = { workspace = true }
 tracing-opentelemetry = { version = "0.33", optional = true }
+# Needed in the LIBRARY (not just dev) so the PDF glyph-drop capture can be exposed as a
+# composable `Layer` rather than seizing the process's single global `tracing` dispatcher.
+# `xberg-cli` already installs its own `fmt()` subscriber in `main()`, so a capture that
+# called `set_global_default` would simply lose the race and go dark in the CLI while every
+# test binary — which has no `fmt` subscriber — still passed. See `pdf::render`.
+# Trimmed to what the layer needs: no `fmt`, `ansi` or `tracing-log` in the core crate.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
 # Pure-Rust ONNX engine — the inference-seam backend on no-ORT targets (WASM,
 # Android x86_64). `tract-onnx` (not the `tract` facade) is CPU-only + wasm-safe.
 tract-onnx = { workspace = true, optional = true }
-unhwp = { version = "0.8.0", default-features = false, features = ["hwpx"], optional = true }
+# Typst's own parser, used to convert Typst math to LaTeX.
+typst-syntax = { version = "0.15.1", optional = true }
+unhwp = { version = "0.9.1", default-features = false, features = ["hwpx"], optional = true }
 unicode-normalization = { version = "0.1.25", optional = true }
 url = { workspace = true }
 urlencoding = "2"
@@ -1359,6 +1420,7 @@ whatlang = { version = "0.18.0", optional = true }
 xberg-gliner = { workspace = true, optional = true }
 xberg-libheif = { path = "../xberg-libheif", version = "1.1.0", optional = true }
 xberg-libwpd = { path = "../xberg-libwpd", version = "1.1.0", optional = true }
+xberg-native-pdf = { workspace = true, optional = true }
 # No `version` on this path-dep: xberg-tesseract carries `links =
 # "xberg_tesseract"`, and a versioned path-dep makes the maturin sdist
 # resolve two copies (path + registry) of a `links` crate, which cargo rejects
@@ -1592,7 +1654,7 @@ filetime = "0.2"
 image = { workspace = true, default-features = false, features = ["png"] }
 # default-features=false drops jsonschema's `resolve-http` (reqwest→native-tls→openssl-sys);
 # tests validate local schemas only. Keeps the test build openssl-free.
-jsonschema = { version = "0.49", default-features = false }
+jsonschema = { version = "0.51", default-features = false }
 qrcode = { version = "0.14", default-features = false, features = ["image"] }
 # Test-only: builds an in-memory model2vec fixture (safetensors bytes) for the
 # static_engine unit tests, without a network fetch.

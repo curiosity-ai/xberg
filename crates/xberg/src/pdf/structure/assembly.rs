@@ -3,6 +3,8 @@
 //! Produces an `InternalDocument` from per-page `PdfParagraph` data with tables
 //! interleaved at their correct reading-order positions.
 
+use std::borrow::Cow;
+
 use super::lines::{needs_space_between, segments_need_space};
 use super::text_repair::finalize_hyphens;
 use super::types::{LayoutHintClass, LayoutRegionPath, LayoutRegionTag, PdfParagraph};
@@ -652,7 +654,7 @@ fn push_paragraph_element(builder: &mut InternalDocumentBuilder, para: &PdfParag
                 .iter()
                 .map(|l| {
                     let line_text = l.segments.iter().map(|s| s.text.as_str()).collect::<Vec<_>>().join(" ");
-                    collapse_inner_spaces(&line_text)
+                    collapse_inner_spaces(&line_text).into_owned()
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -687,7 +689,14 @@ fn push_paragraph_element(builder: &mut InternalDocumentBuilder, para: &PdfParag
         };
         let (normalized, removed_prefix_len) = normalize_list_text(&text);
         let annotations = shift_annotations_after_prefix_removal(annotations, removed_prefix_len, normalized.len());
-        return builder.push_list_item(normalized, ordered, annotations, page, bbox);
+        let element_id = builder.push_list_item(normalized, ordered, annotations, page, bbox);
+        // The marker just stripped off `text` is the document's own label. Keep it:
+        // an ordinance is cross-referenced by printed clause number, so a
+        // synthesized sequence position is not an acceptable substitute.
+        if ordered && removed_prefix_len > 0 {
+            builder.set_list_item_source_label(element_id, text[..removed_prefix_len].trim());
+        }
+        return element_id;
     }
 
     if para.is_page_furniture {
@@ -923,12 +932,12 @@ fn should_dehyphenate(prev: &str, next: &str) -> bool {
 }
 
 /// Collapse runs of 2+ spaces inside a line while preserving leading indentation.
-fn collapse_inner_spaces(line: &str) -> String {
+fn collapse_inner_spaces(line: &str) -> Cow<'_, str> {
     let leading = line.len() - line.trim_start_matches(' ').len();
     let prefix = &line[..leading];
     let rest = &line[leading..];
     if !rest.contains("  ") {
-        return line.to_string();
+        return Cow::Borrowed(line);
     }
     let mut result = String::with_capacity(line.len());
     result.push_str(prefix);
@@ -944,7 +953,7 @@ fn collapse_inner_spaces(line: &str) -> String {
             result.push(ch);
         }
     }
-    result
+    Cow::Owned(result)
 }
 
 /// True when a list-item paragraph carries a numbered marker ("1." / "3)").
@@ -1730,7 +1739,7 @@ mod tests {
 
     #[test]
     fn test_image_without_bbox_falls_back_to_append_after_text() {
-        // No bounding_box on the image (as when pdf_oxide's capped fast path is used, or on
+        // No bounding_box on the image (as when xberg_native_pdf's capped fast path is used, or on
         // the pure-heuristic path with no spatial data) must reproduce the pre-existing
         // append-after-text behavior exactly, and must never panic.
         let pages = vec![vec![
@@ -2124,6 +2133,38 @@ mod tests {
         );
     }
 
+    /// The producer half of the literal-list-label fix. `normalize_list_text`
+    /// strips `"B."` off the item text so the text reads as content; without
+    /// the `set_list_item_source_label` call in `push_paragraph_element` the
+    /// label is gone for good and a renderer can only synthesize a position,
+    /// silently renumbering clauses that the document cross-references by their
+    /// printed label. Neutralise that call and this fails with `None`.
+    #[test]
+    fn ordered_list_item_keeps_its_literal_source_marker() {
+        let mut para = make_paragraph("B. The Property shall be developed in substantial conformance.", None);
+        para.is_list_item = true;
+
+        let doc = assemble_internal_document(vec![vec![para]], &[], None, &[]);
+
+        let item = doc
+            .elements
+            .iter()
+            .find(|element| matches!(element.kind, ElementKind::ListItem { .. }))
+            .expect("the paragraph should assemble into a ListItem element");
+
+        assert_eq!(
+            item.list_item_source_label(),
+            Some("B."),
+            "the stripped marker must be recorded, not discarded; text is {:?}",
+            item.text
+        );
+        assert!(
+            !item.text.starts_with("B."),
+            "the marker must still be stripped from the item text; got {:?}",
+            item.text
+        );
+    }
+
     #[test]
     fn test_w2a_consecutive_bold_segments_grouped() {
         let segments = vec![bold_segment("This"), bold_segment(" is"), bold_segment(" bold")];
@@ -2278,5 +2319,24 @@ mod tests {
         assert!(texts.contains(&"HR 28"), "HR 28 missing; headings: {texts:?}");
         assert!(texts.contains(&"HR 28/24"), "HR 28/24 missing; headings: {texts:?}");
         assert!(texts.contains(&"HR 36/30"), "HR 36/30 missing; headings: {texts:?}");
+    }
+
+    #[test]
+    fn collapse_inner_spaces_borrows_when_no_double_space() {
+        let line = "  no double spaces here";
+        let result = collapse_inner_spaces(line);
+        assert!(matches!(result, Cow::Borrowed(_)), "should not allocate when unchanged");
+        assert_eq!(result, line);
+    }
+
+    #[test]
+    fn collapse_inner_spaces_allocates_and_collapses_when_double_space_present() {
+        let line = "  has   extra    spaces";
+        let result = collapse_inner_spaces(line);
+        assert!(
+            matches!(result, Cow::Owned(_)),
+            "should allocate when spaces are collapsed"
+        );
+        assert_eq!(result, "  has extra spaces");
     }
 }

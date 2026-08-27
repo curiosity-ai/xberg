@@ -32,7 +32,7 @@ EXCLUDE_PREFIXES = (
     "alloc::",
     "_$LT$std",
     "image::",
-    "pdf_oxide::",
+    "xberg_native_pdf::",
     "memchr::",
     "regex::",
     "serde::",

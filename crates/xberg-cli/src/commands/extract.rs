@@ -270,10 +270,14 @@ fn extract_input_sync(
 ) -> Result<ExtractedDocument> {
     let output = match input {
         ExtractInputSource::Uri(uri) => {
-            let mut input = ExtractInput::from_uri(uri);
+            let mut input = ExtractInput::from_uri(uri.clone());
             input.mime_type = mime_type.map(str::to_string);
-            block_on_extract(input, config)
-                .context("Failed to extract URI input. Ensure the resource is readable and the format is supported.")?
+            // Describe what was attempted, not why it failed: `.context()` preserves the
+            // underlying error as this error's source (anyhow's `{:?}` rendering walks it via
+            // "Caused by:"), so asserting a specific diagnosis here ("ensure the resource is
+            // readable and the format is supported") would misreport failures that have nothing
+            // to do with readability or format support — an OCR backend crash, for example.
+            block_on_extract(input, config).with_context(|| format!("Failed to extract input '{uri}'"))?
         }
         ExtractInputSource::Stdin => {
             let mime_type = mime_type.unwrap_or("text/plain");
@@ -284,9 +288,10 @@ fn extract_input_sync(
             if data.is_empty() {
                 anyhow::bail!("No input received from stdin.");
             }
-            block_on_extract(ExtractInput::from_bytes(data, mime_type, None), config).with_context(|| {
-                format!("Failed to extract stdin input as MIME type '{mime_type}'. Ensure --mime-type is correct.")
-            })?
+            // See the URI branch above: describe the attempted operation only. The real cause
+            // (e.g. a genuinely wrong --mime-type) still surfaces via the preserved error chain.
+            block_on_extract(ExtractInput::from_bytes(data, mime_type, None), config)
+                .with_context(|| format!("Failed to extract stdin input as MIME type '{mime_type}'"))?
         }
     };
     single_result_from_output(output)
@@ -351,9 +356,13 @@ fn run_batch_sync(
     config: &ExtractionConfig,
 ) -> Result<Vec<ExtractedDocument>> {
     let inputs = build_batch_inputs(uris, file_configs_map)?;
-    let output = block_on_extract_batch(inputs, config).context(
-        "Failed to batch extract documents. Check that all resources are readable and formats are supported.",
-    )?;
+    let input_count = inputs.len();
+    // Describe the attempted operation only; see the URI branch of `extract_input_sync` for why
+    // asserting a diagnosis here would misreport failures unrelated to readability or format
+    // support. The real per-input cause is preserved both in this error's source chain and, for
+    // partial batch failures, in `output.errors` via `fail_if_errors` below.
+    let output = block_on_extract_batch(inputs, config)
+        .with_context(|| format!("Failed to batch extract {input_count} inputs"))?;
     fail_if_errors(&output.errors)?;
     Ok(output.results)
 }
@@ -399,9 +408,9 @@ fn run_json_batch_sync(
     config: &ExtractionConfig,
 ) -> Result<(Vec<ExtractedDocument>, Vec<f64>)> {
     let input_count = inputs.len();
-    let output = block_on_extract_batch(inputs, config).context(
-        "Failed to batch extract documents. Check that all resources are readable and formats are supported.",
-    )?;
+    // See `run_batch_sync` above: describe the attempted operation, not a guessed diagnosis.
+    let output = block_on_extract_batch(inputs, config)
+        .with_context(|| format!("Failed to batch extract {input_count} inputs"))?;
     fail_if_errors(&output.errors)?;
     let per_file_ms = batch_per_file_timings(&output.results, input_count)?;
     Ok((output.results, per_file_ms))
@@ -436,10 +445,20 @@ fn batch_runtime_worker_threads(config: &ExtractionConfig, input_count: usize) -
     total_cpu_budget.min(document_workers).min(available_inputs)
 }
 
+/// Worker-thread stack size for every runtime this crate builds.
+///
+/// The extraction future is deep: a multi-stage OCR or PDF pipeline overflows tokio's
+/// default ~2 MB worker stack and aborts the process with SIGBUS rather than a catchable
+/// panic. `crates/xberg-node/src/lib.rs:62-64` hit this first and raised its pool to 16 MB;
+/// the CLI's own runtimes were never given the same budget, so the API and MCP servers ran
+/// every request on a 2 MB worker.
+pub(crate) const RUNTIME_WORKER_STACK_SIZE_BYTES: usize = 16 * 1024 * 1024;
+
 fn build_runtime(config: &ExtractionConfig) -> std::io::Result<tokio::runtime::Runtime> {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(runtime_worker_threads(config))
         .enable_all()
+        .thread_stack_size(RUNTIME_WORKER_STACK_SIZE_BYTES)
         .build()
 }
 
@@ -452,6 +471,7 @@ fn block_on_extract_batch(inputs: Vec<ExtractInput>, config: &ExtractionConfig) 
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .enable_all()
+        .thread_stack_size(RUNTIME_WORKER_STACK_SIZE_BYTES)
         .build()?
         .block_on(extract_batch(inputs, config))
 }
@@ -694,6 +714,39 @@ mod tests {
         assert_eq!(
             uri_to_local_path("file:///tmp/doc.txt").unwrap(),
             PathBuf::from("/tmp/doc.txt")
+        );
+    }
+
+    /// Regression test for a real reported bug: extraction failures were wrapped in a context
+    /// message ("Ensure the resource is readable and the format is supported.") that confidently
+    /// diagnoses the wrong cause whenever the actual failure has nothing to do with readability
+    /// or format support (e.g. an OCR backend crash on a file three other backends had just
+    /// extracted successfully in the same session). anyhow's `.context()`/`.with_context()`
+    /// preserve the underlying error as this error's `source()`, so the real cause was always
+    /// present in the chain -- but the outermost line a user reads asserted a specific, false
+    /// diagnosis instead of describing what was attempted. This exercises the real (unmocked)
+    /// `extract_input_sync` failure path with a nonexistent file, which `xberg::extract` reports
+    /// as `XbergError::Io` or `XbergError::Validation` (see
+    /// `crates/xberg/tests/error_handling.rs::test_nonexistent_file`), to confirm the CLI's own
+    /// wrapping context no longer asserts that false diagnosis.
+    #[test]
+    fn uri_extraction_failure_does_not_assert_a_false_readability_diagnosis() {
+        let config = ExtractionConfig::default();
+        let missing_uri = "test_documents_definitely_missing/does-not-exist-9f3c2a11.txt";
+
+        let err = extract_input_sync(ExtractInputSource::Uri(missing_uri.to_string()), None, &config)
+            .expect_err("extracting a nonexistent file must fail");
+        let rendered = format!("{err:?}");
+
+        assert!(
+            !rendered.contains("Ensure the resource is readable and the format is supported"),
+            "context must describe the attempted operation, not assert a (possibly false) \
+             diagnosis; got: {rendered}"
+        );
+        assert!(
+            rendered.contains(missing_uri),
+            "context must name the input that failed to extract so the user knows what was \
+             attempted; got: {rendered}"
         );
     }
 

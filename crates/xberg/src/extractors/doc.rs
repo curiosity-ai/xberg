@@ -227,6 +227,60 @@ mod tests {
         assert!(!doc.nodes.is_empty(), "Document structure should have nodes");
     }
 
+    /// GH#1460: the field result text must survive extraction while the field
+    /// instruction is dropped, when run through the real `.doc` binary parser end
+    /// to end.
+    ///
+    /// The nine unit tests for `normalize_doc_text` in
+    /// `crate::extraction::doc::mod` only ever feed it a synthetic `&str` built
+    /// from escape literals (`"\x13 HYPERLINK ... \x14 ... \x15"`). They prove the
+    /// normalization function is correct in isolation, but they cannot catch a
+    /// regression in the OLE/CFB parsing or piece-table walk that sits upstream of
+    /// it — e.g. if the parser stopped delivering `0x13`/`0x14`/`0x15` bytes at
+    /// all, or if extraction routed around `normalize_doc_text` entirely, every
+    /// one of those tests would still pass. This test exercises a real vendored
+    /// `.doc` file whose stream is known (via `grep -a`) to contain a literal
+    /// `HYPERLINK "http://github.com/"` field instruction followed by the result
+    /// text `A Link example`.
+    ///
+    /// The DOC extractor has no URI-extraction feature (no metadata field or
+    /// extracted-links list surfaces hyperlink targets separately), so the
+    /// instruction's URL is not expected to legitimately appear anywhere else in
+    /// the output; asserting its absence from the text is safe.
+    #[tokio::test]
+    async fn should_drop_hyperlink_instruction_but_keep_result_text_when_extracting_real_doc() {
+        let test_file = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../test_documents/vendored/unstructured/doc/fake-doc-emphasized-text.doc");
+        if !test_file.exists() {
+            return;
+        }
+        let content = std::fs::read(&test_file).expect("Failed to read test DOC");
+        let extractor = DocExtractor::new();
+        let config = ExtractionConfig::default();
+        let result = extractor
+            .extract_content(&content, "application/msword", &config)
+            .await
+            .expect("DOC extraction failed");
+        let result =
+            crate::extraction::derive::derive_extraction_result(result, true, crate::core::config::OutputFormat::Plain);
+
+        assert!(
+            result.content.contains("A Link example"),
+            "field result text must be kept: {:?}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("HYPERLINK"),
+            "field instruction keyword must be dropped: {:?}",
+            result.content
+        );
+        assert!(
+            !result.content.contains("http://github.com/"),
+            "field instruction URL must be dropped: {:?}",
+            result.content
+        );
+    }
+
     #[tokio::test]
     async fn test_doc_paragraph_mapping() {
         let test_file =

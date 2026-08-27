@@ -1,5 +1,27 @@
 //! Shared utilities for resolving and verifying model artifacts from Hugging Face Hub.
 
+// Every `Duration` use in this file (the two timeout constants and `model_download_timeout`)
+// sits behind the model-download feature set, so a default build has none and the bare import
+// warns as unused. Gate the import with the superset of those gates -- the `test` arm is
+// included because `DEFAULT_MODEL_DOWNLOAD_TIMEOUT` and `model_download_timeout` carry it for
+// the always-compiled `download_deadline_tests` watchdog.
+#[cfg(any(
+    all(
+        not(target_arch = "wasm32"),
+        any(
+            feature = "candle-paddleocr-vl",
+            paddle_ocr,
+            auto_rotate,
+            layout_detection,
+            feature = "transcription",
+            feature = "chunking-tokenizers",
+            feature = "onnx-runtime",
+            feature = "ner-onnx",
+            feature = "static-embeddings"
+        )
+    ),
+    test
+))]
 use std::time::Duration;
 
 #[cfg(any(
@@ -57,7 +79,26 @@ use std::path::PathBuf;
 /// on a dead/blackholed network comes instead from the bounded `connect_timeout` and lowered retry
 /// count on the client built by [`hf_client_builder`], not from shortening this deadline (which would
 /// break legitimate slow downloads).
-#[allow(dead_code)]
+///
+/// Gate mirrors [`model_download_timeout`], its only reader: the model-download feature set, plus
+/// `test` for the always-compiled `download_deadline_tests` watchdog below.
+#[cfg(any(
+    all(
+        not(target_arch = "wasm32"),
+        any(
+            feature = "candle-paddleocr-vl",
+            paddle_ocr,
+            auto_rotate,
+            layout_detection,
+            feature = "transcription",
+            feature = "chunking-tokenizers",
+            feature = "onnx-runtime",
+            feature = "ner-onnx",
+            feature = "static-embeddings"
+        )
+    ),
+    test
+))]
 const DEFAULT_MODEL_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[cfg(all(
@@ -238,7 +279,27 @@ pub(crate) fn hf_client_builder() -> hf_hub::HFClientBuilder {
 
 /// Resolve the model-download deadline, honoring `XBERG_MODEL_DOWNLOAD_TIMEOUT_SECS` (seconds; a
 /// value of 0 or unparseable falls back to the default).
-#[allow(dead_code)]
+///
+/// Callers are [`with_download_deadline`] (same gate) and [`acquire_artifact_file_lock`] (a strict
+/// subset of it), plus the always-compiled `download_deadline_tests` module — hence `test` in the
+/// gate below rather than the bare feature disjunction most siblings in this file use.
+#[cfg(any(
+    all(
+        not(target_arch = "wasm32"),
+        any(
+            feature = "candle-paddleocr-vl",
+            paddle_ocr,
+            auto_rotate,
+            layout_detection,
+            feature = "transcription",
+            feature = "chunking-tokenizers",
+            feature = "onnx-runtime",
+            feature = "ner-onnx",
+            feature = "static-embeddings"
+        )
+    ),
+    test
+))]
 pub(crate) fn model_download_timeout() -> Duration {
     std::env::var("XBERG_MODEL_DOWNLOAD_TIMEOUT_SECS")
         .ok()
@@ -311,7 +372,28 @@ fn offline_cache_miss(repo_id: &str, remote_filename: &str, revision: Option<&st
 /// degrade (skip the model-backed backend) rather than hang. The worker thread cannot be
 /// force-killed — it stays parked on the socket until the OS tears the connection down — but it
 /// holds no lock the pipeline needs, so progress resumes. `label` names the fetch in the log/error.
-#[allow(dead_code)]
+///
+/// Feature-gated callers (`hf_resolve_file_with_progress`, `hf_download_at_revision`,
+/// `hf_force_download_revision`) all fall within the model-download feature set below; the
+/// always-compiled `download_deadline_tests` module below exercises this watchdog directly under
+/// plain `#[cfg(test)]`, hence `test` in the gate rather than the bare feature disjunction.
+#[cfg(any(
+    all(
+        not(target_arch = "wasm32"),
+        any(
+            feature = "candle-paddleocr-vl",
+            paddle_ocr,
+            auto_rotate,
+            layout_detection,
+            feature = "transcription",
+            feature = "chunking-tokenizers",
+            feature = "onnx-runtime",
+            feature = "ner-onnx",
+            feature = "static-embeddings"
+        )
+    ),
+    test
+))]
 pub(crate) fn with_download_deadline<T, F>(label: &str, f: F) -> Result<T, String>
 where
     F: FnOnce() -> Result<T, String> + Send + 'static,

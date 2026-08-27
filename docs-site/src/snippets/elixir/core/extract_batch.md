@@ -1,17 +1,11 @@
 ```elixir title="Elixir"
 inputs = [
-  %Xberg.ExtractInput{kind: :uri, uri: "document.pdf"},
-  %Xberg.ExtractInput{
-    kind: :bytes,
-    bytes: "Hello from memory",
-    mime_type: "text/plain",
-    filename: "note.txt"
-  }
+  %{"kind" => "uri", "uri" => "report.pdf"},
+  %{"kind" => "uri", "uri" => "notes.txt"}
 ]
 
-{:ok, output} = Xberg.extract_batch(inputs: inputs, config: nil)
-
-Enum.each(output.results, fn result ->
-  IO.puts(result.content)
-end)
+case Xberg.extract_batch(inputs: inputs) do
+  {:ok, output} -> Enum.each(output.results, &IO.puts(&1.content))
+  {:error, reason} -> IO.puts(:stderr, "Extraction failed: #{inspect(reason)}")
+end
 ```

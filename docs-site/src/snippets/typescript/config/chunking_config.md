@@ -1,5 +1,5 @@
 ```typescript title="TypeScript"
-import { extract } from "@xberg-io/xberg";
+import { ExtractInputKind, extract } from "@xberg-io/xberg";
 
 const config = {
   chunking: {
@@ -8,24 +8,25 @@ const config = {
   },
 };
 
-const output = await extract({ kind: "uri", uri: "document.pdf" }, config);
-console.log(`Total chunks: ${output.results[0].chunks?.length ?? 0}`);
+const output = await extract({ kind: ExtractInputKind.Uri, uri: "document.pdf" }, config);
+console.log(`Total chunks: ${output.results?.[0]?.chunks?.length ?? 0}`);
 ```
 
 ```typescript title="TypeScript - Markdown with Heading Context"
-import { extract } from "@xberg-io/xberg";
+import { ChunkerType, ExtractInputKind, extract, type ExtractionConfig } from "@xberg-io/xberg";
 
-const config = {
+const config: ExtractionConfig = {
   chunking: {
-    chunkerType: "markdown",
+    chunkerType: ChunkerType.Markdown,
     maxCharacters: 500,
     overlap: 50,
     sizing: { type: "tokenizer", model: "Xenova/gpt-4o", cacheDir: "~/.cache/xberg/tokenizers" },
   },
 };
 
-const output = await extract({ kind: "uri", uri: "document.md" }, config);
-for (const chunk of output.results[0].chunks ?? []) {
+const output = await extract({ kind: ExtractInputKind.Uri, uri: "document.md" }, config);
+const [first] = output.results ?? [];
+for (const chunk of first?.chunks ?? []) {
   const headings = chunk.metadata?.headingContext?.headings ?? [];
   for (const heading of headings) {
     console.log(`Heading L${heading.level}: ${heading.text}`);
@@ -35,35 +36,17 @@ for (const chunk of output.results[0].chunks ?? []) {
 ```
 
 ```typescript title="TypeScript - Semantic"
-import { extract } from "@xberg-io/xberg";
+import { ChunkerType, ExtractInputKind, extract } from "@xberg-io/xberg";
 
 const config = {
   chunking: {
-    chunkerType: "semantic",
+    chunkerType: ChunkerType.Semantic,
   },
 };
 
-const output = await extract({ kind: "uri", uri: "document.pdf" }, config);
-for (const chunk of output.results[0].chunks ?? []) {
-  console.log(`Content: ${chunk.content.slice(0, 100)}...`);
-}
-```
-
-```typescript title="TypeScript - Prepend Heading Context"
-import { extract } from "@xberg-io/xberg";
-
-const config = {
-  chunking: {
-    chunkerType: "markdown",
-    maxCharacters: 500,
-    overlap: 50,
-    prependHeadingContext: true,
-  },
-};
-
-const output = await extract({ kind: "uri", uri: "document.md" }, config);
-for (const chunk of output.results[0].chunks ?? []) {
-  // Each chunk's content is prefixed with its heading breadcrumb
+const output = await extract({ kind: ExtractInputKind.Uri, uri: "document.pdf" }, config);
+const [first] = output.results ?? [];
+for (const chunk of first?.chunks ?? []) {
   console.log(`Content: ${chunk.content.slice(0, 100)}...`);
 }
 ```

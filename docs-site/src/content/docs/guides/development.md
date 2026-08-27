@@ -259,7 +259,22 @@ task docs:serve         # pnpm install + astro dev (live reload)
 
 ### How Snippets Work
 
-Code examples in the docs aren't inline — they're pulled from `docs-site/src/snippets/` and imported into each `.mdx` page as Astro components (`import { Content as Snip_... } from "../../../snippets/.../file.md"`, rendered inside `<TabItem>`). This keeps examples testable and reusable across pages.
+Documentation examples have two source paths:
+
+- Prefer fixture-backed examples for public APIs shared across languages. Add or update the JSON fixture under `fixtures/`, run `task e2e:generate`, and render its generated snippets with `ApiSnippetGroup`. The generated files under `docs-site/src/snippets-generated/` are Alef output; never edit them directly.
+- Use maintained snippets under `docs-site/src/snippets/` only for examples that do not map to an E2E fixture, such as deployment, server, or language-specific workflows. Import these Markdown files into the relevant `.mdx` page as Astro components.
+
+A fixture-backed example renders every available language without one import per binding:
+
+```mdx
+import ApiSnippetGroup from "../../../components/ApiSnippetGroup.astro";
+
+<ApiSnippetGroup topic="batch/extract_batch_uri_basic" />
+```
+
+The `topic` is the generated path after the language directory, without the `.md` extension. For example, `docs-site/src/snippets-generated/rust/batch/extract_batch_uri_basic.md` maps to `batch/extract_batch_uri_basic`.
+
+Maintained snippets remain organized by language and capability:
 
 ```text
 docs-site/src/snippets/
@@ -278,7 +293,7 @@ docs-site/src/snippets/
 └── cli/              # CLI usage
 ```
 
-When you change a user-facing API, update the matching snippet. When you add a new feature, create a snippet and import it from the relevant doc page. Use `task docs:snippets:gaps` to find unreferenced snippets or missing language variants, and `task docs:snippets:validate` to syntax-check them.
+When you change a user-facing API, update its fixture and regenerate. When no fixture-backed example is appropriate, update the maintained snippet instead. Use `task docs:snippets:gaps` to find unreferenced snippets or missing language variants, and `task docs:snippets:validate` to syntax-check both generated and maintained snippets.
 
 ## Debugging
 
@@ -336,7 +351,7 @@ changing a binding fires `ci-e2e` and, for mobile, `ci-mobile`.
 | Workflow            | Scope                                                     |
 | ------------------- | -------------------------------------------------------- |
 | `ci-lint.yaml`      | Format + lint validation via poly, plus commit/PR checks |
-| `ci-rust.yaml`      | Rust core build and tests (Linux, macOS, Windows)        |
+| `ci-rust.yaml`      | Rust core build and tests (Linux x86_64/arm64 and macOS) |
 | `ci-e2e.yaml`       | Cross-language binding build and e2e suites              |
 | `ci-mobile.yaml`    | Android + iOS binding checks                             |
 | `ci-docker.yaml`    | Docker build and smoke tests                             |
@@ -358,7 +373,7 @@ task test:cov           # All tests with coverage
 
 | Workflow              | When it runs                          | What it does                       |
 | --------------------- | ------------------------------------- | ---------------------------------- |
-| `ci-docs.yaml`        | Changes to `docs/` or `zensical.toml` | Builds and validates documentation |
+| `ci-docs.yaml`        | Changes to `docs-site/**` or `alef.toml` | Builds, validates, and deploys documentation |
 | `validate-pr.yml`     | Every PR                              | Conventional-commit and PR checks  |
 | `benchmarks.yaml`     | Manual trigger                        | Runs the full benchmark suite      |
 | `profiling.yaml`      | Manual trigger                        | Generates flamegraphs              |

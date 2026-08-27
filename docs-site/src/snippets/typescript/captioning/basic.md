@@ -1,8 +1,8 @@
 ```typescript title="TypeScript"
-import { extract } from "@xberg-io/xberg";
+import { ExtractInputKind, extract } from "@xberg-io/xberg";
 
 const output = await extract({
-    kind: "uri",
+    kind: ExtractInputKind.Uri,
     uri: "report.pdf",
 }, {
     captioning: {
@@ -11,7 +11,8 @@ const output = await extract({
     },
 });
 
-for (const image of output.results[0].images ?? []) {
+const [first] = output.results ?? [];
+for (const image of first?.images ?? []) {
     if (image.caption) {
         console.log(image.caption);
     }

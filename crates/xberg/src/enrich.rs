@@ -1,5 +1,4 @@
-//! Unified enrichment chokepoint composing captioning, NER, classification,
-//! and (future) transcription on top of an [`ExtractedDocument`].
+//! Active post-extraction enrichment pipeline for an [`ExtractedDocument`].
 //!
 //! # Design
 //!
@@ -20,13 +19,8 @@
 //!
 //! ## Results live on the document
 //!
-//! Every stage writes its output onto the [`ExtractedDocument`] field that already exists
-//! for it, not only into [`EnrichedResult`]. The document is the only thing downstream
-//! consumers see — it is what serializes to JSON, what the REST schema and the language
-//! bindings expose, and what `split_and_extract` and the post-processors operate on — so
-//! results returned solely in the side struct were invisible to all of them, and the LLM
-//! token / cost records for the classification and captioning calls were discarded
-//! outright (#263).
+//! Every stage writes its output onto the corresponding [`ExtractedDocument`]
+//! field. [`EnrichedResult`] also provides direct access to stage outputs.
 //!
 //! ## Transcription is not an enrichment stage
 //!
@@ -34,12 +28,6 @@
 //! work — it is implemented by `TranscriptionExtractor` and driven by
 //! `ExtractionConfig::transcription`. By the time a document reaches `enrich` the source
 //! bytes are gone, so there is nothing here to transcribe.
-//!
-//! `EnrichmentConfig::transcription` is kept on the config surface because it is
-//! reproduced across the generated binding packages, where removing it would be a
-//! breaking change. Setting it makes `enrich` append a
-//! [`ProcessingWarning`](crate::types::ProcessingWarning) pointing at the extraction-time
-//! path and carry on; it never fails the call and never blocks the other stages.
 //!
 //! # Example
 //!
@@ -145,22 +133,6 @@ pub struct EnrichmentConfig {
     /// Image-captioning stage.  `None` skips captioning.
     #[cfg(feature = "captioning")]
     pub captioning: Option<CaptioningEnrichmentConfig>,
-
-    /// Transcription stage — **inert here by design**; `None` and `Some(...)` both leave
-    /// the document unchanged apart from a warning.
-    ///
-    /// Transcription converts audio/video bytes to text, so it belongs to extraction, not
-    /// enrichment: by the time a document reaches [`enrich`] the source bytes are gone. To
-    /// actually transcribe, set `ExtractionConfig::transcription` and run `extract` on the
-    /// audio/video file with the `transcription` feature enabled.
-    ///
-    /// A `Some(...)` value makes [`enrich`] append a
-    /// [`ProcessingWarning`](crate::types::ProcessingWarning) with source `"transcription"`
-    /// to the returned document and continue; every other configured stage still runs.
-    /// The field is retained rather than removed because it is reproduced across the
-    /// generated binding packages, where removing it would be a breaking change.
-    #[cfg(feature = "transcription-types")]
-    pub transcription: Option<crate::core::config::TranscriptionConfig>,
 }
 
 /// Extraction result with optional enrichment layers applied.
@@ -212,10 +184,6 @@ pub struct EnrichedResult {
 /// On any error the partial result is dropped and the error is returned
 /// immediately.
 ///
-/// A configured `transcription` stage is not run — see
-/// [`EnrichmentConfig`] — it only records a
-/// [`ProcessingWarning`](crate::types::ProcessingWarning) and does not affect the others.
-///
 /// # Example
 ///
 /// ```ignore
@@ -241,47 +209,12 @@ pub struct EnrichedResult {
 /// - [`crate::XbergError::Other`] when the NER or captioning backends fail. A captioning
 ///   failure still leaves `extraction.images` intact and records the usage for the calls
 ///   that already succeeded before the error propagates.
-///
-/// A `Some` `config.transcription` is **not** an error: it appends a
-/// [`ProcessingWarning`](crate::types::ProcessingWarning) to the returned document and the
-/// remaining stages run normally.
 #[cfg_attr(alef, alef(skip))]
 #[cfg_attr(not(feature = "classification"), allow(unused_mut))]
 pub async fn enrich(mut extraction: ExtractedDocument, config: &EnrichmentConfig) -> crate::Result<EnrichedResult> {
     // read inside `#[cfg(...)]` branches that are all compiled out — silence
-    #[cfg(not(any(
-        feature = "transcription-types",
-        feature = "classification",
-        feature = "ner",
-        feature = "captioning",
-    )))]
+    #[cfg(not(any(feature = "classification", feature = "ner", feature = "captioning",)))]
     let _ = config;
-
-    // Requesting transcription here used to `return Err(...)`, which failed the whole call
-    // and took the classification, NER and captioning stages down with it. Transcription is
-    // extraction-time work and there is nothing for `enrich` to run, so the request is
-    // reported the way the pipeline reports every other requested-but-unavailable stage —
-    // a non-fatal `ProcessingWarning`, partial results preserved (see the captioning and
-    // structured-extraction warnings in `core::pipeline`). ~keep
-    #[cfg(feature = "transcription-types")]
-    if let Some(ref transcription) = config.transcription {
-        extraction.processing_warnings.push(crate::types::ProcessingWarning {
-            source: std::borrow::Cow::Borrowed("transcription"),
-            message: std::borrow::Cow::Owned(format!(
-                "enrich() skipped the requested transcription stage (model {:?}, language {}): \
-                 enrich() runs on an already-extracted document and no longer has the source \
-                 audio/video bytes, so it cannot transcribe. Transcribe during extraction \
-                 instead — set `ExtractionConfig::transcription` and run `extract` on the \
-                 audio/video file in a build with the `transcription` feature enabled. All \
-                 other configured enrichment stages ran normally.",
-                transcription.model,
-                transcription
-                    .language
-                    .as_deref()
-                    .unwrap_or("unset (engine defaults to en)"),
-            )),
-        });
-    }
 
     #[cfg(feature = "classification")]
     let classification = if let Some(ref cfg) = config.classification {

@@ -2,12 +2,8 @@
 title: "Document Summarisation"
 ---
 
-import { Tabs, TabItem } from "@astrojs/starlight/components";
-import { Content as Snip_python_summarization_extractive } from "../../../snippets/python/summarization/extractive.md";
-import { Content as Snip_typescript_summarization_extractive } from "../../../snippets/typescript/summarization/extractive.md";
-import { Content as Snip_rust_summarization_extractive } from "../../../snippets/rust/summarization/extractive.md";
+import ApiSnippetGroup from "../../../components/ApiSnippetGroup.astro";
 import { Content as Snip_cli_summarization_toml } from "../../../snippets/cli/summarization_toml.md";
-import { Content as Snip_python_summarization_abstractive } from "../../../snippets/python/summarization/abstractive.md";
 
 Generate a one-paragraph summary of extracted documents for search snippets, indexing, or quick reviews. Choose extractive summarization for deterministic, network-free local processing, or abstractive for fluent, AI-generated prose.
 
@@ -35,40 +31,17 @@ The `summarization` feature ships the TextRank backend (no LLM required) — inc
 
 ## Configuration
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
+<ApiSnippetGroup topic="summarization/summarization_extractive_smoke" />
 
-<Snip_python_summarization_extractive />
-
-</TabItem>
-<TabItem label="TypeScript">
-
-<Snip_typescript_summarization_extractive />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_summarization_extractive />
-
-</TabItem>
-<TabItem label="TOML">
+For CLI and server configuration, add the same settings to `xberg.toml`:
 
 <Snip_cli_summarization_toml />
-
-</TabItem>
-</Tabs>
 
 ## Abstractive Backend
 
 Switch the strategy and attach an `LlmConfig`:
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
-
-<Snip_python_summarization_abstractive />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="summarization/summarization_abstractive_smoke" />
 
 The model receives the extracted content and returns the summary verbatim. Token usage records in `ExtractedDocument.llm_usage` with `source = "summarisation_abstractive"`.
 

@@ -12,11 +12,6 @@ use std::str::FromStr;
 /// Controls the format of the `content` field in `ExtractedDocument`.
 /// When set to `Markdown`, `Djot`, or `Html`, the output uses that format.
 /// `Plain` returns the raw extracted text.
-/// `Structured` is currently a metadata-only label: `derive_extraction_result`
-/// returns `None` for it (see `extraction/derive.rs`), so no renderer runs and
-/// the content is left exactly as `Plain` would leave it. Only
-/// `metadata.output_format` differs. It does NOT attach OCR element data,
-/// bounding boxes or confidence scores.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum OutputFormat {
@@ -31,10 +26,6 @@ pub enum OutputFormat {
     Html,
     /// JSON tree format with heading-driven sections.
     Json,
-    /// Metadata-only label; content is identical to [`OutputFormat::Plain`].
-    /// No dedicated renderer exists yet, so this attaches no OCR element
-    /// metadata. See the enum-level docs above.
-    Structured,
     /// Docling DocTags format (tables rendered as OTSL).
     DocTags,
     /// Custom renderer registered via the RendererRegistry.
@@ -47,10 +38,10 @@ pub enum OutputFormat {
 impl OutputFormat {
     /// Get the renderer name for this format.
     /// Returns `None` for formats that don't use the renderer registry
-    /// (Plain, Json, Structured — these are handled differently).
+    /// (Plain and Json are handled differently).
     pub(crate) fn renderer_name(&self) -> Option<&str> {
         match self {
-            OutputFormat::Plain | OutputFormat::Json | OutputFormat::Structured => None,
+            OutputFormat::Plain | OutputFormat::Json => None,
             OutputFormat::Markdown => Some("markdown"),
             OutputFormat::Djot => Some("djot"),
             OutputFormat::Html => Some("html"),
@@ -68,7 +59,6 @@ impl std::fmt::Display for OutputFormat {
             OutputFormat::Djot => write!(f, "djot"),
             OutputFormat::Html => write!(f, "html"),
             OutputFormat::Json => write!(f, "json"),
-            OutputFormat::Structured => write!(f, "structured"),
             OutputFormat::DocTags => write!(f, "doctags"),
             OutputFormat::Custom(name) => write!(f, "{}", name),
         }
@@ -85,7 +75,6 @@ impl FromStr for OutputFormat {
             "djot" => Ok(OutputFormat::Djot),
             "html" => Ok(OutputFormat::Html),
             "json" => Ok(OutputFormat::Json),
-            "structured" | "structured-ocr" => Ok(OutputFormat::Structured),
             "doctags" => Ok(OutputFormat::DocTags),
             other => Ok(OutputFormat::Custom(other.to_string())),
         }
@@ -232,16 +221,18 @@ mod tests {
     }
 
     #[test]
-    fn test_output_format_from_str_structured() {
-        assert_eq!("structured".parse::<OutputFormat>().unwrap(), OutputFormat::Structured);
-        assert_eq!("STRUCTURED".parse::<OutputFormat>().unwrap(), OutputFormat::Structured);
+    fn removed_structured_names_are_not_builtin_output_formats() {
         assert_eq!(
-            "structured-ocr".parse::<OutputFormat>().unwrap(),
-            OutputFormat::Structured
+            "structured".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Custom("structured".to_string())
         );
         assert_eq!(
-            "STRUCTURED-OCR".parse::<OutputFormat>().unwrap(),
-            OutputFormat::Structured
+            "structured-ocr".parse::<OutputFormat>().unwrap(),
+            OutputFormat::Custom("structured-ocr".to_string())
+        );
+        assert_eq!(
+            serde_json::from_str::<OutputFormat>(r#""structured""#).unwrap(),
+            OutputFormat::Custom("structured".to_string())
         );
     }
 
@@ -291,7 +282,6 @@ mod tests {
         assert_eq!(OutputFormat::Djot.to_string(), "djot");
         assert_eq!(OutputFormat::Html.to_string(), "html");
         assert_eq!(OutputFormat::Json.to_string(), "json");
-        assert_eq!(OutputFormat::Structured.to_string(), "structured");
         assert_eq!(OutputFormat::DocTags.to_string(), "doctags");
         assert_eq!(OutputFormat::Custom("docx".to_string()).to_string(), "docx");
     }
@@ -310,7 +300,6 @@ mod tests {
             OutputFormat::Djot,
             OutputFormat::Html,
             OutputFormat::Json,
-            OutputFormat::Structured,
             OutputFormat::DocTags,
         ] {
             let json = serde_json::to_string(&format).unwrap();
@@ -326,10 +315,6 @@ mod tests {
         assert_eq!(serde_json::to_string(&OutputFormat::Djot).unwrap(), "\"djot\"");
         assert_eq!(serde_json::to_string(&OutputFormat::Html).unwrap(), "\"html\"");
         assert_eq!(serde_json::to_string(&OutputFormat::Json).unwrap(), "\"json\"");
-        assert_eq!(
-            serde_json::to_string(&OutputFormat::Structured).unwrap(),
-            "\"structured\""
-        );
         assert_eq!(serde_json::to_string(&OutputFormat::DocTags).unwrap(), "\"doctags\"");
     }
 
@@ -340,7 +325,6 @@ mod tests {
         assert_eq!(OutputFormat::Html.renderer_name(), Some("html"));
         assert_eq!(OutputFormat::Djot.renderer_name(), Some("djot"));
         assert_eq!(OutputFormat::Json.renderer_name(), None);
-        assert_eq!(OutputFormat::Structured.renderer_name(), None);
         assert_eq!(OutputFormat::DocTags.renderer_name(), Some("doctags"));
         assert_eq!(OutputFormat::Custom("docx".to_string()).renderer_name(), Some("docx"));
     }

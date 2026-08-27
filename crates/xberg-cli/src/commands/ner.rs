@@ -5,62 +5,7 @@
 //! call at inference time.
 
 use anyhow::{Context, Result};
-use serde_json::json;
 use std::path::PathBuf;
-
-use crate::{WireFormat, style};
-
-/// Execute `xberg cache warm --ner` / `--ner-model` / `--all-ner-models`.
-///
-/// `ner` is a "download the pinned default" flag. `models` is an explicit
-/// list of xberg GLiNER aliases or catalog ids. `all` downloads every variant
-/// xberg knows about.
-#[allow(dead_code)]
-#[expect(
-    clippy::print_stdout,
-    reason = "NER download summary is the command's stdout result output"
-)]
-pub fn download_command(
-    ner: bool,
-    models: Vec<String>,
-    all: bool,
-    cache_dir: Option<PathBuf>,
-    format: WireFormat,
-) -> Result<()> {
-    let to_download = select_models(ner, models, all)?;
-    let downloaded = download_models(&to_download, cache_dir)?;
-
-    match format {
-        WireFormat::Text => {
-            println!("{}", style::header("NER Model Download"));
-            println!("{}", style::dim("=================="));
-            for d in &downloaded {
-                println!("  {}", style::success(d));
-            }
-            println!("{}", style::success("Done"));
-        }
-        WireFormat::Json => {
-            let output = json!({
-                "downloaded": downloaded,
-            });
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&output).context("Failed to serialize NER download results to JSON")?
-            );
-        }
-        WireFormat::Toon => {
-            let output = json!({
-                "downloaded": downloaded,
-            });
-            println!(
-                "{}",
-                serde_toon::to_string(&output).context("Failed to serialize NER download results to TOON")?
-            );
-        }
-    }
-
-    Ok(())
-}
 
 /// Resolve the set of GLiNER NER models requested by cache-warm flags.
 pub fn select_models(ner: bool, models: Vec<String>, all: bool) -> Result<Vec<String>> {

@@ -154,8 +154,8 @@ Apple Silicon (arm64) macOS is fully supported across every package. On **Intel 
 
   ***
 
-  ```gradle
-  implementation 'io.xberg:xberg:1.0.0-rc.14'
+  ```groovy
+  implementation 'io.xberg:xberg:1.0.14'
   ```
 
   [API Reference](/reference/api-java/)
@@ -166,7 +166,7 @@ Apple Silicon (arm64) macOS is fully supported across every package. On **Intel 
   ***
 
   ```kotlin
-  implementation("io.xberg:xberg-android:1.0.0-rc.14")
+  implementation("io.xberg:xberg-android:1.0.14")
   ```
 
   [API Reference](/reference/api-kotlin-android/)
@@ -188,7 +188,7 @@ Apple Silicon (arm64) macOS is fully supported across every package. On **Intel 
   ***
 
   ```swift
-  .package(url: "https://github.com/xberg-io/xberg.git", from: "1.0.0-rc.14")
+  .package(url: "https://github.com/xberg-io/xberg.git", from: "1.0.14")
   ```
 
   [API Reference](/reference/api-swift/)
@@ -221,7 +221,7 @@ Apple Silicon (arm64) macOS is fully supported across every package. On **Intel 
   ***
 
   ```elixir
-  {:xberg, "~> 1.0.0-rc.14"}
+  {:xberg, "~> 1.0"}
   ```
 
   [API Reference](/reference/api-elixir/)
@@ -254,7 +254,7 @@ Apple Silicon (arm64) macOS is fully supported across every package. On **Intel 
   ***
 
   ```bash
-  zig fetch --save https://github.com/xberg-io/xberg/archive/refs/tags/v1.0.0-rc.14.tar.gz
+  zig fetch --save https://github.com/xberg-io/xberg/archive/refs/tags/v1.0.14.tar.gz
   ```
 
   [API Reference](/reference/api-zig/)
@@ -330,7 +330,7 @@ Only relevant if building from source or enabling OCR:
 | Tesseract OCR             | Optional — `brew install tesseract` / `apt install tesseract-ocr`                      |
 | libheif (HEIC / HEIF / AVIF) | Optional — `brew install libheif` / `apt install libheif-dev` / `dnf install libheif-devel` |
 
-PDF extraction uses pdf_oxide and has no external PDF runtime dependency.
+PDF extraction uses xberg-native-pdf and has no external PDF runtime dependency.
 
 The Wasm package (`@xberg-io/xberg-wasm`) has **zero** system dependencies.
 
@@ -500,15 +500,15 @@ Layout detection (RT-DETR) and document-orientation detection **do** run in Wasm
 <dependency>
     <groupId>io.xberg</groupId>
     <artifactId>xberg</artifactId>
-    <version>1.0.0-rc.14</version>
+    <version>1.0.14</version>
 </dependency>
 ```
 
 </TabItem>
 <TabItem label="Gradle">
 
-```gradle
-implementation 'io.xberg:xberg:1.0.0-rc.14'
+```groovy
+implementation 'io.xberg:xberg:1.0.14'
 ```
 
 </TabItem>
@@ -523,7 +523,7 @@ Add to `mix.exs`:
 ```elixir
 def deps do
   [
-    {:xberg, "~> 1.0.0-rc.14"}
+    {:xberg, "~> 1.0"}
   ]
 end
 ```

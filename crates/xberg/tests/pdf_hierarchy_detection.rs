@@ -10,6 +10,7 @@ mod helpers;
 use helpers::extract_bytes_document;
 
 use std::path::Path;
+use xberg::HierarchicalBoundingBox;
 use xberg::core::config::{ExtractionConfig, HierarchyConfig, PageConfig, PdfConfig};
 
 /// Test full hierarchy extraction from a real PDF.
@@ -87,7 +88,13 @@ async fn test_full_hierarchy_extraction() {
         let is_valid_level = matches!(block.level.as_str(), "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "body");
         assert!(is_valid_level, "Invalid hierarchy level: {}", block.level);
 
-        if let Some((left, top, right, bottom)) = block.bbox {
+        if let Some(HierarchicalBoundingBox {
+            left,
+            top,
+            right,
+            bottom,
+        }) = block.bbox
+        {
             assert!(left < right, "Bounding box left should be less than right");
             assert!(top < bottom, "Bounding box top should be less than bottom");
             assert!(

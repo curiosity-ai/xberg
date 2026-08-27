@@ -3,7 +3,7 @@
 //! This module provides functions for detecting semantic elements in text,
 //! including list items, and generating unique element IDs.
 
-use crate::types::{Element, ElementId, ElementMetadata, ElementType};
+use crate::types::{Element, ElementMetadata, ElementType};
 use std::collections::HashMap;
 
 use super::types::{ListItemMetadata, ListType};
@@ -162,8 +162,8 @@ pub(crate) fn detect_list_items(text: &str) -> Vec<ListItemMetadata> {
 ///
 /// # Returns
 ///
-/// An ElementId suitable for referencing this semantic element
-pub(crate) fn generate_element_id(text: &str, element_type: ElementType, page_number: Option<u32>) -> ElementId {
+/// A stable string suitable for referencing this semantic element.
+pub(crate) fn generate_element_id(text: &str, element_type: ElementType, page_number: Option<u32>) -> String {
     let type_hash = format!("{:?}", element_type)
         .bytes()
         .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
@@ -184,7 +184,7 @@ pub(crate) fn generate_element_id(text: &str, element_type: ElementType, page_nu
         .wrapping_mul(65599)
         .wrapping_add(page_hash);
 
-    ElementId::new(format!("elem-{:x}", combined)).expect("ElementId creation failed")
+    format!("elem-{combined:x}")
 }
 
 /// True when `trimmed` matches the numbered-list pattern `\d{1,2}\. `.

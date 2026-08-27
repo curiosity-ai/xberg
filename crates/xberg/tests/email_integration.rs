@@ -362,10 +362,22 @@ async fn test_malformed_email() {
 
     let result = extract_bytes_document(malformed_eml, "message/rfc822", &config).await;
 
-    assert!(
-        result.is_ok() || result.is_err(),
-        "Should handle malformed email gracefully"
-    );
+    // `mail_parser::MessageParser::parse` (crates/xberg/src/extraction/email.rs) only
+    // returns `None` when it finds *no* header tokens at all. This input has no `:`
+    // anywhere, so `parse_header_name` runs to EOF treating the whole line as one
+    // (unrecognized) header name; the "message without a body" fallback then still
+    // returns `Some(Message)`. So this must always succeed, with every structured
+    // field absent -- not merely "not panic".
+    let extraction = result.expect("a headerless line is still parsed as a single unrecognized header, never rejected");
+    assert_eq!(extraction.content, "", "there is no genuine text/html body to extract");
+    let email_meta = match extraction.metadata.format.as_ref() {
+        Some(xberg::FormatMetadata::Email(meta)) => meta,
+        other => panic!("expected FormatMetadata::Email, got: {other:?}"),
+    };
+    assert_eq!(email_meta.from_email, None);
+    assert!(email_meta.to_emails.is_empty());
+    assert!(email_meta.cc_emails.is_empty());
+    assert_eq!(extraction.metadata.subject, None);
 }
 
 /// Test MSG extraction with subject, sender, recipients, and body.

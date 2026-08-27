@@ -53,6 +53,7 @@ pub(crate) fn decompress_gzip(bytes: &[u8], limits: &SecurityLimits) -> Result<V
 /// metadata and text content are needed.
 ///
 /// If the decompressed data is a TAR archive, delegates to TAR extraction functions.
+#[cfg(test)]
 pub(crate) fn extract_gzip(
     bytes: &[u8],
     limits: &SecurityLimits,

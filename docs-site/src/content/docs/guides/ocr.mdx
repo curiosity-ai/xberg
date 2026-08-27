@@ -1230,7 +1230,7 @@ min_undecodable_ratio = 0.3
 </Tabs>
 
 :::note[Known limitation]
-This only covers glyph indices that decode into the PUA/replacement/control range. The related case where a broken CID-to-Unicode mapping resolves onto *plausible* ASCII (so the text layer "looks" readable but is actually wrong) is not detected — it requires upstream support in `pdf_oxide` and is blocked on [pdf_oxide#876](https://github.com/xberg-io/pdf_oxide/issues/876).
+This only covers glyph indices that decode into the PUA/replacement/control range. The related case where a broken CID-to-Unicode mapping resolves onto *plausible* ASCII (so the text layer "looks" readable but is actually wrong) is not detected — detecting it requires new support in xberg's native PDF engine (`crates/xberg-native-pdf`), which is not implemented yet.
 :::
 
 ### Multi-Backend Pipeline

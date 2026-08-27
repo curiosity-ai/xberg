@@ -116,7 +116,10 @@ pub fn extract_bytes_documents_blocking(
 }
 
 fn runtime() -> Result<tokio::runtime::Runtime> {
-    tokio::runtime::Runtime::new().map_err(XbergError::from)
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(XbergError::from)
 }
 
 fn single_result(output: Result<xberg::ExtractionResult>) -> Result<ExtractedDocument> {

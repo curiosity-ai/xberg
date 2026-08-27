@@ -1,6 +1,6 @@
 {
   "document": "../../../test_documents/images/textocr_scene_03.jpg",
-  "file_type": "jpeg",
+  "file_type": "jpg",
   "file_size": 255423,
   "expected_frameworks": [
     "xberg"

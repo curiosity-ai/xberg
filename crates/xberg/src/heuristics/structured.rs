@@ -38,22 +38,26 @@ pub enum StructuredCallMode {
     TextOnlyWithVisionFallback,
 }
 
-/// Signals consumed by the call-mode heuristic.
+/// Signals available to structured call-mode policies.
 ///
 /// All fields derive from a prior xberg extraction — no double-work.
 /// This is a plain DTO; it intentionally has no dependency on internal
 /// xberg extraction types so it can be constructed from any source.
+/// The built-in [`choose_call_mode`] policy intentionally uses only the MIME
+/// type, average characters per page, and explicit vision override. Custom
+/// [`StructuredPolicy`](crate::engine::seams::StructuredPolicy)
+/// implementations may use the remaining signals.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StructuredInput {
     /// MIME type, canonicalised to lowercase by the caller.
     pub mime_type: String,
-    /// Number of pages in the document.
+    /// Number of pages available to custom policies.
     pub page_count: u32,
-    /// Fraction of pages with a real text layer (0.0..=1.0).
+    /// Fraction of pages with a real text layer (0.0..=1.0), available to custom policies.
     pub text_coverage: f64,
     /// Average extracted characters per page.
     pub avg_chars_per_page: f64,
-    /// Count of embedded images (figures, photos, signatures) discovered.
+    /// Count of embedded images available to custom policies.
     pub embedded_image_count: u32,
     /// When `true`, promote the result to at least [`StructuredCallMode::TextPlusVision`].
     pub user_force_vision: bool,
@@ -77,16 +81,13 @@ pub struct StructuredInput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StructuredThresholds {
-    /// PDFs with `text_coverage` strictly below this are treated as scanned.
+    /// Scan-coverage boundary available to custom policies.
     ///
-    /// **Conservative default: 0.10** — deployments override via their own
-    /// config after measuring their document corpus.
+    /// The built-in policy intentionally starts PDFs text-first and does not use this value.
     pub scan_max_coverage: f64,
-    /// PDFs with `text_coverage` at or above this AND zero embedded images
-    /// route to [`StructuredCallMode::TextOnly`].
+    /// Digital-PDF coverage boundary available to custom policies.
     ///
-    /// **Conservative default: 0.90** — deployments override via their own
-    /// config after measuring their document corpus.
+    /// The built-in policy intentionally starts PDFs text-first and does not use this value.
     pub digital_min_coverage: f64,
     /// DOCX / HTML / text documents with `avg_chars_per_page` above this
     /// route to [`StructuredCallMode::TextOnly`].
@@ -236,6 +237,32 @@ mod tests {
         let mut i = input("application/pdf");
         i.text_coverage = 0.5;
         assert_eq!(choose_call_mode(&i, &t()), StructuredCallMode::TextOnly);
+    }
+
+    #[test]
+    fn custom_policy_pdf_signals_do_not_change_builtin_policy() {
+        let mut low = input("application/pdf");
+        low.page_count = 1;
+        low.text_coverage = 0.0;
+        low.embedded_image_count = 0;
+        let mut high = input("application/pdf");
+        high.page_count = u32::MAX;
+        high.text_coverage = 1.0;
+        high.embedded_image_count = u32::MAX;
+
+        let low_thresholds = StructuredThresholds {
+            scan_max_coverage: 0.0,
+            digital_min_coverage: 0.0,
+            ..StructuredThresholds::default()
+        };
+        let high_thresholds = StructuredThresholds {
+            scan_max_coverage: 1.0,
+            digital_min_coverage: 1.0,
+            ..StructuredThresholds::default()
+        };
+
+        assert_eq!(choose_call_mode(&low, &low_thresholds), StructuredCallMode::TextOnly);
+        assert_eq!(choose_call_mode(&high, &high_thresholds), StructuredCallMode::TextOnly);
     }
 
     #[test]

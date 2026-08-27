@@ -1,17 +1,17 @@
 ```typescript title="Element-Based Output (TypeScript)"
-import { extract, ElementType, type ExtractionConfig } from "@xberg-io/xberg";
+import { ExtractInputKind, ResultFormat, extract, ElementType, type ExtractionConfig } from "@xberg-io/xberg";
 
 // Configure element-based output
 const config: ExtractionConfig = {
-  resultFormat: "element_based",
+  resultFormat: ResultFormat.ElementBased,
 };
 
 // Extract document
-const output = await extract({ kind: "uri", uri: "document.pdf" }, config);
-const result = output.results[0];
+const output = await extract({ kind: ExtractInputKind.Uri, uri: "document.pdf" }, config);
+const [result] = output.results ?? [];
 
 // Access elements
-for (const element of result.elements ?? []) {
+for (const element of result?.elements ?? []) {
   console.log(`Type: ${element.elementType}`);
   console.log(`Text: ${element.text.slice(0, 100)}`);
 
@@ -28,7 +28,7 @@ for (const element of result.elements ?? []) {
 }
 
 // Filter by element type
-const titles = (result.elements ?? []).filter((e) => e.elementType === ElementType.Title);
+const titles = (result?.elements ?? []).filter((e) => e.elementType === ElementType.Title);
 for (const title of titles) {
   const level = title.metadata.additional?.level || "unknown";
   console.log(`[${level}] ${title.text}`);

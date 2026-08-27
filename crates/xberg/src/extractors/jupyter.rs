@@ -656,7 +656,7 @@ impl JupyterExtractor {
     ///
     /// Markdown cells are split into headings and paragraphs. Code cells
     /// become code blocks followed by any output paragraphs. `plain`
-    /// mirrors `ExtractionConfig::output_format` being `Plain`/`Structured`
+    /// mirrors `ExtractionConfig::output_format` being `Plain`
     /// and suppresses richer (markdown/html) output representations in
     /// favor of `text/plain` only.
     fn build_internal_document(
@@ -840,10 +840,7 @@ impl InternalDocumentExtractor for JupyterExtractor {
     ) -> Result<InternalDocument> {
         let mut budget = SecurityBudget::from_config(config);
         budget.account_text(content.len())?;
-        let plain = matches!(
-            config.output_format,
-            crate::core::config::OutputFormat::Plain | crate::core::config::OutputFormat::Structured
-        );
+        let plain = matches!(config.output_format, crate::core::config::OutputFormat::Plain);
         let (_extracted_content, additional_metadata, extracted_images, notebook_json, warnings, attachment_images) =
             Self::extract_notebook(content, plain)?;
 
@@ -1146,7 +1143,11 @@ mod tests {
             .filter(|e| matches!(e.kind, ElementKind::Formula))
             .map(|e| e.text.as_str())
             .collect();
-        assert_eq!(formulas, vec!["E = mc^2"], "display math only; inline math stays in the text");
+        assert_eq!(
+            formulas,
+            vec!["E = mc^2"],
+            "display math only; inline math stays in the text"
+        );
         assert!(doc.elements.iter().any(|e| e.text.contains("$x^2$")));
     }
 

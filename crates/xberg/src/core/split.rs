@@ -457,6 +457,7 @@ mod tests {
             content: content.to_string(),
             tables: Vec::new(),
             image_indices: Vec::new(),
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,
@@ -608,8 +609,8 @@ mod enrichment_preservation_tests {
     use crate::types::document_structure::DocumentStructure;
     use crate::types::entity::{Entity, EntityCategory};
     use crate::types::extraction::{
-        ArchiveEntry, Chunk, ChunkMetadata, ChunkType, Element, ElementId, ElementMetadata, ElementType,
-        ExtractionMethod, LlmUsage, PageSpan,
+        ArchiveEntry, Chunk, ChunkMetadata, ChunkType, Element, ElementMetadata, ElementType, ExtractionMethod,
+        LlmUsage, PageSpan,
     };
     use crate::types::form_field::{FormFieldType, PdfFormField};
     use crate::types::formula::Formula;
@@ -628,6 +629,7 @@ mod enrichment_preservation_tests {
             content: format!("page {page_number} text"),
             tables: Vec::new(),
             image_indices: Vec::new(),
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,
@@ -654,7 +656,7 @@ mod enrichment_preservation_tests {
 
     fn element(text: &str, page_number: Option<u32>) -> Element {
         Element {
-            element_id: ElementId::default(),
+            element_id: String::new(),
             element_type: ElementType::NarrativeText,
             text: text.to_string(),
             metadata: ElementMetadata {

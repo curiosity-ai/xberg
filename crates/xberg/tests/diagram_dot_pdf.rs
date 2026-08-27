@@ -25,7 +25,7 @@ fn two_boxes_and_an_arrow() -> Vec<u8> {
     use lopdf::{Document, Object, Stream, dictionary};
 
     // Boxes are stroked with `S` and the arrowhead filled with `f`. `B`
-    // (fill-and-stroke) is deliberately avoided: pdf_oxide 0.3.77 does not
+    // (fill-and-stroke) is deliberately avoided: xberg_native_pdf 0.3.77 does not
     // finalize a path on `B`, so its geometry leaks into the next painted path
     // and the fixture would be testing that bug rather than this recogniser.
     let content = b"1 w 0 0 0 RG

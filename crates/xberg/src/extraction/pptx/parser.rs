@@ -478,6 +478,17 @@ fn parse_list(tx_body_node: &Node, xml_str: &str) -> Result<ListElement> {
     Ok(ListElement { items })
 }
 
+/// Maximum PowerPoint list nesting level (`<a:pPr lvl="…">`) honoured for indentation.
+///
+/// PowerPoint's own list UI caps nesting at 9 levels (`lvl` 0-8), mirroring the
+/// `w:ilvl` ceiling DOCX enforces for the same reason
+/// (`extraction::docx::parser::MAX_LIST_NESTING_LEVEL`). `lvl` is document-controlled
+/// text parsed with no upper bound: without this clamp, a crafted `lvl="4294967294"`
+/// turns `ContentBuilder::add_list_item`'s per-level `"  "` indent loop
+/// (`content_builder.rs`) into ~4.29 billion pushes -- several GB of string growth --
+/// instead of a bounded few.
+const MAX_LIST_NESTING_LEVEL: u32 = 8;
+
 /// Returns (level, is_ordered, has_bullet).
 fn parse_list_properties(p_node: &Node) -> Result<(u32, bool, bool)> {
     let mut level = 1;
@@ -488,7 +499,8 @@ fn parse_list_properties(p_node: &Node) -> Result<(u32, bool, bool)> {
         n.is_element() && n.tag_name().name() == "pPr" && n.tag_name().namespace() == Some(DRAWINGML_NAMESPACE)
     }) {
         if let Some(lvl_attr) = p_pr_node.attribute("lvl") {
-            level = lvl_attr.parse::<u32>().unwrap_or(0) + 1;
+            let raw_level = lvl_attr.parse::<u32>().unwrap_or(0);
+            level = raw_level.min(MAX_LIST_NESTING_LEVEL) + 1;
         }
 
         is_ordered = p_pr_node.children().any(|n| {
@@ -682,7 +694,7 @@ fn omml_node_to_run(container: &Node, xml_str: &str) -> Option<Run> {
     };
 
     let raw_xml = xml_str.get(math_node.range())?;
-    let expected_tag: &[u8] = if is_display { b"m:oMathPara" } else { b"m:oMath" };
+    let expected_tag: &str = if is_display { "m:oMathPara" } else { "m:oMath" };
 
     let mut reader = quick_xml::Reader::from_str(raw_xml);
     reader.config_mut().trim_text(false);

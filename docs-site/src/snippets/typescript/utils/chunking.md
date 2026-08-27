@@ -1,7 +1,7 @@
 ```typescript title="TypeScript"
-import { extract } from "@xberg-io/xberg";
+import { ExtractInputKind, extract, type ExtractionConfig } from "@xberg-io/xberg";
 
-const config = {
+const config: ExtractionConfig = {
   chunking: {
     maxCharacters: 1500,
     overlap: 200,
@@ -11,6 +11,6 @@ const config = {
   },
 };
 
-const output = await extract({ kind: "uri", uri: "document.pdf" }, config);
-console.log(`Chunks created: ${output.results[0].chunks?.length ?? 0}`);
+const output = await extract({ kind: ExtractInputKind.Uri, uri: "document.pdf" }, config);
+console.log(`Chunks created: ${output.results?.[0]?.chunks?.length ?? 0}`);
 ```

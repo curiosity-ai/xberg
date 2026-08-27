@@ -37,11 +37,35 @@ done
 set -E
 trap 'log "ERROR: exit $? at line ${LINENO} (function: ${FUNCNAME[0]:-main}): ${BASH_COMMAND}"' ERR
 
+# libc and the loader are the only things a target is truly guaranteed to
+# supply at a compatible version, so they -- and the openssl pair, which a
+# host is expected to patch on its own schedule -- stay unbundled.
+#
+# libstdc++/libgcc_s are deliberately bundled only on musl. The musl images build
+# against Alpine *edge* packages (see the --repository flags in
+# docker/Dockerfile.musl-*), so the vendored libonnxruntime.so.1 carries
+# undefined references that only edge's libstdc++ 6.0.34 defines -- notably
+# std::__format::__locale_encoding_to_utf8. Alpine 3.21/3.22 stable ship
+# 6.0.33, which does not, so treating the C++ runtime as a base library
+# shipped an artifact that cannot relocate on any stable Alpine: the Elixir
+# smoke test failed with exactly that symbol, and the Java smoke test failed
+# on the same closure the C# one loaded fine, differing only in whether the
+# base image happened to carry a new enough libstdc++. Bundling the C++
+# runtime beside the artifact under $ORIGIN is what auditwheel already does
+# for the musl Python wheel in this repo -- the one artifact of the five that
+# was unaffected. On glibc, manylinux supplies the C++ runtime and bundling the
+# runner's copy can raise the artifact's effective glibc floor. ~keep
+IS_MUSL=0
+if compgen -G '/lib/ld-musl-*.so.1' >/dev/null; then
+  IS_MUSL=1
+fi
+
 is_base_lib() {
   case "$1" in
+  libstdc++.so* | libgcc_s.so*) [ "$IS_MUSL" = 0 ] ;;
   ld-linux* | ld-musl* | libc.so* | libc.musl* | libc-*.so* | libm.so* | libmvec.so* | \
-    libdl.so* | librt.so* | libpthread.so* | libresolv.so* | libgcc_s.so* | \
-    libstdc++.so* | libssl.so* | libcrypto.so*) return 0 ;;
+    libdl.so* | librt.so* | libpthread.so* | libresolv.so* | \
+    libssl.so* | libcrypto.so*) return 0 ;;
   *) return 1 ;;
   esac
 }
@@ -111,13 +135,26 @@ verify_local_closure() {
   log "ldd output for $(basename "$native") (exit $ldd_status):"
   cat "$report" >&2
 
-  if [ "$ldd_status" -ne 0 ]; then
+  # musl's ldd performs full relocation processing, so it reports undefined
+  # SYMBOLS (`Error relocating <file>: <sym>: symbol not found`) in the same
+  # breath as missing LIBRARIES, and exits 127 for either. A CPython extension
+  # module leaves every `Py*` symbol undefined by design -- it links no
+  # libpython, and the interpreter exports those symbols to the process at
+  # load time -- so keying failure on ldd's exit status, or on a bare
+  # `not found` substring, rejects a wheel whose closure is in fact complete.
+  # That is exactly what killed the musl wheel build: `_xberg.abi3.so has
+  # unresolved dependencies after vendoring (ldd exited 127)`, where all 101
+  # named symbols were `Py*`/`_Py*` and no library was missing at all.
+  # A genuinely absent library is what must be fatal, and it is reported
+  # distinctly: musl says `Error loading shared library <soname>`, glibc says
+  # `<soname> => not found`. Undefined symbols fall through to the dlopen
+  # probe below, which resolves them against a real interpreter process. ~keep
+  if grep -qE '=> not found|Error loading shared library' "$report"; then
     rm -f "$report"
-    die "$(basename "$native") has unresolved dependencies after vendoring (ldd exited $ldd_status)"
+    die "$(basename "$native") is missing a shared library after vendoring"
   fi
-  if grep -q 'not found' "$report"; then
-    rm -f "$report"
-    die "$(basename "$native") has unresolved dependencies after vendoring"
+  if [ "$ldd_status" -ne 0 ]; then
+    log "ldd exited $ldd_status for $(basename "$native") but named no missing library; treating the remaining diagnostics as undefined symbols the host process supplies at load time"
   fi
 
   while IFS= read -r lib; do

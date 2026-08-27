@@ -157,6 +157,7 @@ impl Default for PostProcessorConfig {
 /// };
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChunkingConfig {
     /// Maximum size per chunk (in units determined by `sizing`).
     ///
@@ -225,29 +226,6 @@ pub struct ChunkingConfig {
     #[serde(default, deserialize_with = "deserialize_null_default")]
     pub sizing: ChunkSizing,
 
-    /// **Deprecated and inert** (#1393): no longer prepends anything into
-    /// `content`. Setting this field has no observable effect on chunking output
-    /// any more.
-    ///
-    /// Previously, when `true` and `chunker_type` was `Markdown`, this prepended
-    /// the heading hierarchy path (e.g. `"# Title > ## Section\n\n"`) directly
-    /// into each chunk's `content` string. `content` now always equals the exact
-    /// `[byte_start, byte_end)` source span regardless of this flag — see
-    /// [`BreadcrumbTarget`](crate::core::config::extraction::BreadcrumbTarget) for
-    /// the full rationale. `heading_context`/`heading_path` on `ChunkMetadata` are
-    /// populated independently of this flag, so callers lose no information —
-    /// only the in-place mutation is gone.
-    ///
-    /// Call [`render_heading_breadcrumb`](crate::chunking::render_heading_breadcrumb)
-    /// explicitly at index time instead, for the retrieval consumer that wants the
-    /// breadcrumb inline.
-    ///
-    /// Kept only so existing callers keep compiling.
-    ///
-    /// Default: `false`
-    #[serde(default)]
-    pub prepend_heading_context: bool,
-
     /// Optional cosine similarity threshold for semantic topic boundary detection.
     ///
     /// Only used when `chunker_type` is `Semantic` and an `EmbeddingConfig` is
@@ -270,18 +248,6 @@ pub struct ChunkingConfig {
     /// Default: `Split`
     #[serde(default)]
     pub table_chunking: TableChunkingMode,
-
-    /// **Deprecated and inert** (#1393): see
-    /// [`BreadcrumbTarget`](crate::core::config::extraction::BreadcrumbTarget) for
-    /// the full explanation. Neither variant has any effect on `content` any
-    /// more — call
-    /// [`render_heading_breadcrumb`](crate::chunking::render_heading_breadcrumb)
-    /// explicitly at index time instead. Kept only for backward compatibility.
-    ///
-    /// Default: `Content`.
-    #[serde(default)]
-    #[cfg_attr(feature = "alef-meta", alef(since = "1.1.0"))]
-    pub breadcrumb_target: crate::core::config::extraction::BreadcrumbTarget,
 }
 
 impl ChunkingConfig {
@@ -330,23 +296,10 @@ impl ChunkingConfig {
             }
         };
 
-        let embedding = self.embedding.clone();
-
-        Self {
-            max_characters: preset.chunk_size,
-            overlap: preset.overlap,
-            embedding,
-            sparse_embedding: self.sparse_embedding.clone(),
-            late_interaction: self.late_interaction.clone(),
-            trim: self.trim,
-            chunker_type: self.chunker_type,
-            preset: self.preset.clone(),
-            sizing: self.sizing.clone(),
-            prepend_heading_context: self.prepend_heading_context,
-            topic_threshold: self.topic_threshold,
-            table_chunking: self.table_chunking,
-            breadcrumb_target: self.breadcrumb_target,
-        }
+        let mut resolved = self.clone();
+        resolved.max_characters = preset.chunk_size;
+        resolved.overlap = preset.overlap;
+        resolved
     }
 
     /// Resolve a preset name (no-op without the `embeddings` feature).
@@ -371,10 +324,8 @@ impl Default for ChunkingConfig {
             late_interaction: None,
             preset: None,
             sizing: ChunkSizing::default(),
-            prepend_heading_context: false,
             topic_threshold: None,
             table_chunking: TableChunkingMode::Split,
-            breadcrumb_target: crate::core::config::extraction::BreadcrumbTarget::Content,
         }
     }
 }
@@ -455,9 +406,7 @@ pub struct EmbeddingConfig {
 impl Default for EmbeddingConfig {
     fn default() -> Self {
         Self {
-            model: EmbeddingModelType::Preset {
-                name: "balanced".to_string(),
-            },
+            model: default_balanced_embedding_model(),
             normalize: true,
             batch_size: 32,
             show_download_progress: false,
@@ -592,6 +541,12 @@ fn default_model() -> EmbeddingModelType {
     }
 }
 
+fn default_balanced_embedding_model() -> EmbeddingModelType {
+    EmbeddingModelType::Preset {
+        name: "balanced".to_string(),
+    }
+}
+
 /// `deserialize_with` companion for `EmbeddingModelType` fields that may be
 /// explicitly `null` in polyglot binding payloads. Treats null as the configured
 /// `default_model()` (the "gte-modernbert-base" preset) rather than the trait `Default` impl
@@ -642,6 +597,24 @@ mod tests {
         assert!(config.trim);
         assert_eq!(config.chunker_type, ChunkerType::Text);
         assert!(matches!(config.sizing, ChunkSizing::Characters));
+    }
+
+    #[test]
+    fn chunking_config_serialization_omits_removed_breadcrumb_settings() {
+        let config = serde_json::to_value(ChunkingConfig::default()).expect("chunking config must serialize");
+
+        assert!(config.get("prepend_heading_context").is_none());
+        assert!(config.get("breadcrumb_target").is_none());
+    }
+
+    #[test]
+    fn chunking_config_rejects_removed_breadcrumb_settings() {
+        for json in [
+            r#"{"prepend_heading_context":true}"#,
+            r#"{"breadcrumb_target":"metadata"}"#,
+        ] {
+            assert!(serde_json::from_str::<ChunkingConfig>(json).is_err());
+        }
     }
 
     #[test]

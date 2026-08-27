@@ -15,21 +15,23 @@
 //!
 //! # Example
 //!
-//! `OcrProcessor::new` and `process_image` are `pub(crate)` — OCR is driven through the
-//! extraction pipeline (`ExtractionConfig::ocr`), not by constructing a processor directly.
-//! The example below documents the internal shape and is not compiled.
+//! Configure OCR through the extraction pipeline:
 //!
-//! ```ignore
-//! use xberg::ocr::{OcrProcessor, TesseractConfig};
+//! ```no_run
+//! use xberg::{extract, ExtractInput, ExtractionConfig, OcrConfig};
 //!
-//! # fn example() -> Result<(), xberg::ocr::error::OcrError> {
-//! let processor = OcrProcessor::new(None)?;
-//! let config = TesseractConfig::default();
-//!
-//! let image_bytes = std::fs::read("scanned.png").expect("failed to read image");
-//! let result = processor.process_image(&image_bytes, &config)?;
-//!
-//! println!("Extracted text: {}", result.content);
+//! # async fn run(image_bytes: Vec<u8>) -> xberg::Result<()> {
+//! let config = ExtractionConfig {
+//!     ocr: Some(OcrConfig::default()),
+//!     ..Default::default()
+//! };
+//! let input = ExtractInput::from_bytes(image_bytes, "image/png", Some("scan.png".into()));
+//! let output = extract(input, &config).await?;
+//! let document = output
+//!     .results
+//!     .first()
+//!     .ok_or_else(|| xberg::XbergError::Other("OCR produced no document".into()))?;
+//! assert!(!document.content.is_empty());
 //! # Ok(())
 //! # }
 //! ```
@@ -39,7 +41,7 @@
 //! This module requires the `ocr` feature to be enabled:
 //! ```toml
 //! [dependencies]
-//! xberg = { version = "4.0", features = ["ocr"] }
+//! xberg = { version = "1.1", features = ["ocr"] }
 //! ```
 #[cfg(feature = "ocr")]
 /// Persistent file-backed cache for OCR results keyed by image hash and config.

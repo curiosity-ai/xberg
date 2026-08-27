@@ -2,13 +2,13 @@
 //! character per line.
 //!
 //! When a PDF positions each character via a separate `BT … ET` block with a
-//! sinusoidal y-jitter, pdf_oxide's ColumnAware reading order groups spans by
+//! sinusoidal y-jitter, xberg_native_pdf's ColumnAware reading order groups spans by
 //! y-level rather than reading order, producing single-character spans that each
 //! land on their own output line. Microsoft Word triggers this pattern for
 //! "broken image" placeholder text
 //! (`Het afbeelding onderdeel met relatie-id … is niet aangetroffen`).
 //!
-//! Fix: `oxide/text.rs` detects the fragmentation signature (≥ 3 same-line
+//! Fix: `native/text.rs` detects the fragmentation signature (≥ 3 same-line
 //! x-disorder events among short spans; see `pdf::structure::constants`) and
 //! rebuilds page text from span positions: sort by y-descending, group by
 //! y-proximity, sort each group by x, insert spaces at word gaps.
@@ -26,7 +26,7 @@ use xberg::ExtractionConfig;
 /// `jitter_pt` and period `JITTER_PERIOD`, replicating the pattern Microsoft
 /// Word emits for broken-image placeholder text.
 ///
-/// pdf_oxide's ColumnAware mode groups these single-character spans by y-level,
+/// xberg_native_pdf's ColumnAware mode groups these single-character spans by y-level,
 /// producing out-of-reading-order output that the fragmentation repair path detects
 /// and corrects.
 fn make_glyph_jitter_pdf(jitter_pt: f32) -> Vec<u8> {
@@ -177,7 +177,7 @@ fn make_two_line_pdf() -> Vec<u8> {
 /// Used to verify space insertion between words.
 ///
 /// "Hello" starting at x=72, "World" starting at x=300.
-/// All chars at same y, no jitter. Uses absolute Tm positioning so pdf_oxide can
+/// All chars at same y, no jitter. Uses absolute Tm positioning so xberg_native_pdf can
 /// correctly determine each span's position.
 fn make_word_gap_pdf() -> Vec<u8> {
     let stream = "BT /F1 12 Tf 1 0 0 1 72.00 700.00 Tm (Hello) Tj ET\n\
@@ -268,10 +268,10 @@ fn test_all_fixtures_loadable() {
 /// The coalesced text must preserve every character of the source word.
 ///
 /// TEXT = "Hetafbeeldingisnietsaangetroffen" (32 chars). With a 3.5 pt sinusoidal
-/// y-jitter, pdf_oxide's ColumnAware reader groups glyphs by y-band before our
+/// y-jitter, xberg_native_pdf's ColumnAware reader groups glyphs by y-band before our
 /// fragmentation-repair pass sees them. The current `rebuild_text_from_fragmented_spans`
 /// chained-proximity grouping plus per-group x-sort recovers reading order but does
-/// not guarantee a contiguous substring match — pdf_oxide may pre-coalesce adjacent
+/// not guarantee a contiguous substring match — xberg_native_pdf may pre-coalesce adjacent
 /// glyphs into 2-3 char spans whose starting x can interleave across the original
 /// word boundaries. The strict "contains Hetafbeelding" assertion that shipped with
 /// this test in bc131058db has been red on CI since the day it landed; it expresses

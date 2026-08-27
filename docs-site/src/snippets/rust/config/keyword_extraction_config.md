@@ -1,6 +1,6 @@
 ```rust title="Rust"
 use xberg::{extract, ExtractionConfig, ExtractInput};
-use xberg::keywords::{KeywordConfig, KeywordAlgorithm};
+use xberg::keywords::{KeywordConfig, KeywordAlgorithm, NgramRange};
 
 #[tokio::main]
 async fn main() -> xberg::Result<()> {
@@ -9,7 +9,7 @@ async fn main() -> xberg::Result<()> {
             algorithm: KeywordAlgorithm::Yake,
             max_keywords: 10,
             min_score: 0.1,
-            ngram_range: (1, 3),
+            ngram_range: NgramRange { min: 1, max: 3 },
             language: Some("en".to_string()),
             ..Default::default()
         }),

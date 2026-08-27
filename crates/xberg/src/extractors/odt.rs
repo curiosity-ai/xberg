@@ -5,7 +5,7 @@
 use crate::Result;
 use crate::core::config::ExtractionConfig;
 use crate::extraction::office_metadata;
-use crate::extractors::security::SecurityBudget;
+use crate::extractors::security::{SecurityBudget, SecurityError, ZipBombValidator};
 use crate::plugins::{InternalDocumentExtractor, Plugin};
 use crate::types::ExtractedImage;
 use crate::types::Metadata;
@@ -22,6 +22,43 @@ use std::io::Cursor;
 
 /// `ProcessingWarning::source` for every warning this extractor emits (#171).
 const ODT_WARNING_SOURCE: &str = "odt";
+
+/// Maximum bytes read from any single ZIP member inside an ODT archive
+/// (`content.xml`, `styles.xml`, a `Pictures/*` image, or a formula
+/// sub-object's `content.xml`).
+///
+/// `ZipBombValidator::validate` (called at both archive opens in
+/// `OdtExtractor::extract_content`) already bounds every entry's *declared*
+/// uncompressed size via the central directory. That is not the same
+/// guarantee: the ZIP format's declared uncompressed-size field is metadata
+/// the decompressor never enforces while streaming (see
+/// `zip::read::find_content`, which bounds the reader by *compressed* size
+/// only), so a crafted entry can declare a tiny size while its real deflate
+/// stream expands far past it. This constant instead bounds the actual bytes
+/// pulled out via `Read::take` at every read site, independent of what the
+/// header claimed.
+///
+/// Matches DOCX's per-file cap (`crate::extraction::docx::MAX_UNCOMPRESSED_FILE_SIZE`,
+/// 100 MiB) for consistency across the codebase's ZIP-container extractors.
+/// Kept as its own constant rather than imported (mirroring EPUB's
+/// `MAX_EPUB_MEMBER_SIZE`) so this extractor does not take on a dependency on
+/// the `office`-gated `extraction::docx` module for an unrelated format.
+pub(crate) const MAX_ODT_MEMBER_SIZE: u64 = 100 * 1024 * 1024;
+
+/// Aggregate cap on bytes held resident at once across every image
+/// `pre_extract_images` reads out of `Pictures/`.
+///
+/// `MAX_ODT_MEMBER_SIZE` bounds a single entry, but every image is decoded
+/// and kept in the returned map *simultaneously* (the map is built once and
+/// handed to the whole document walk), so a `Pictures/` directory holding
+/// many images each just under the per-entry cap would otherwise have no
+/// aggregate ceiling of its own, unlike `ZipBombValidator`'s
+/// `max_archive_size`, which bounds the archive's *declared* total but not
+/// what a lying entry actually decompresses to. Once the running total of
+/// image bytes actually read exceeds this, extraction fails fast with a
+/// `SecurityError` instead of continuing to grow. Matches DOCX's aggregate
+/// cap (`crate::extraction::docx::MAX_TOTAL_UNCOMPRESSED_SIZE`, 500 MiB).
+pub(crate) const MAX_ODT_IMAGES_TOTAL_SIZE: u64 = 500 * 1024 * 1024;
 
 /// High-performance ODT extractor using native Rust XML parsing.
 ///
@@ -307,12 +344,20 @@ fn collect_region_text(node: roxmltree::Node) -> String {
 /// Scans the archive for files under `Pictures/` (the standard ODT image directory)
 /// and builds a lookup map so that image references in content.xml can be resolved
 /// to binary data without re-borrowing the archive during XML walking.
+///
+/// Every read is bounded per-entry by [`MAX_ODT_MEMBER_SIZE`] via `Read::take`, and
+/// the running total across every image is bounded by [`MAX_ODT_IMAGES_TOTAL_SIZE`]
+/// since all images are kept resident in the returned map at once. Exceeding the
+/// aggregate cap fails the whole extraction with a `SecurityError` rather than
+/// silently dropping the remaining images, matching how [`pre_extract_formulas`]
+/// aborts on budget exhaustion instead of truncating.
 pub(crate) fn pre_extract_images(
     archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>,
-) -> AHashMap<String, (Vec<u8>, String)> {
+) -> crate::error::Result<AHashMap<String, (Vec<u8>, String)>> {
     use std::io::Read;
 
     let mut images = AHashMap::new();
+    let mut total_bytes: u64 = 0;
     let names: Vec<String> = (0..archive.len())
         .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().to_string()))
         .collect();
@@ -332,14 +377,22 @@ pub(crate) fn pre_extract_images(
             "tiff" | "tif" => "tiff",
             _ => "png",
         };
-        if let Ok(mut file) = archive.by_name(&name) {
+        if let Ok(file) = archive.by_name(&name) {
             let mut buf = Vec::new();
-            if file.read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+            if file.take(MAX_ODT_MEMBER_SIZE).read_to_end(&mut buf).is_ok() && !buf.is_empty() {
+                total_bytes = total_bytes.saturating_add(buf.len() as u64);
+                if total_bytes > MAX_ODT_IMAGES_TOTAL_SIZE {
+                    return Err(SecurityError::ContentTooLarge {
+                        size: usize::try_from(total_bytes).unwrap_or(usize::MAX),
+                        max: usize::try_from(MAX_ODT_IMAGES_TOTAL_SIZE).unwrap_or(usize::MAX),
+                    }
+                    .into());
+                }
                 images.insert(name, (buf, format.to_string()));
             }
         }
     }
-    images
+    Ok(images)
 }
 
 /// Pre-extract embedded formula objects (MathML) from the ODT archive.
@@ -366,9 +419,9 @@ pub(crate) fn pre_extract_formulas(
         if !name.ends_with("/content.xml") || name == "content.xml" {
             continue;
         }
-        if let Ok(mut file) = archive.by_name(name) {
+        if let Ok(file) = archive.by_name(name) {
             let mut xml = String::new();
-            if file.read_to_string(&mut xml).is_ok() && xml.contains("math") {
+            if file.take(MAX_ODT_MEMBER_SIZE).read_to_string(&mut xml).is_ok() && xml.contains("math") {
                 let text = crate::extraction::mathml::convert_mathml_str_to_latex(&xml, budget)?;
                 if !text.is_empty() {
                     let dir = name.trim_end_matches("/content.xml");
@@ -552,15 +605,16 @@ fn build_internal_document(
     archive: &mut zip::ZipArchive<Cursor<Vec<u8>>>,
     budget: &mut SecurityBudget,
 ) -> crate::error::Result<InternalDocument> {
-    let image_data = pre_extract_images(archive);
+    let image_data = pre_extract_images(archive)?;
     let formula_data = pre_extract_formulas(archive, budget)?;
 
     let mut xml_content = String::new();
 
     match archive.by_name("content.xml") {
-        Ok(mut file) => {
+        Ok(file) => {
             use std::io::Read;
-            file.read_to_string(&mut xml_content)
+            file.take(MAX_ODT_MEMBER_SIZE)
+                .read_to_string(&mut xml_content)
                 .map_err(|e| crate::error::XbergError::parsing(format!("Failed to read content.xml: {}", e)))?;
         }
         Err(_) => {
@@ -584,10 +638,13 @@ fn build_internal_document(
     // shared `office:styles` rather than content.xml's automatic-styles
     // (#104); merge them in without overriding a same-named style already
     // found in content.xml.
-    if let Ok(mut styles_file) = archive.by_name("styles.xml") {
+    if let Ok(styles_file) = archive.by_name("styles.xml") {
         use std::io::Read;
         let mut styles_xml = String::new();
-        if styles_file.read_to_string(&mut styles_xml).is_ok()
+        if styles_file
+            .take(MAX_ODT_MEMBER_SIZE)
+            .read_to_string(&mut styles_xml)
+            .is_ok()
             && let Ok(styles_doc) = Document::parse(&styles_xml)
         {
             for (name, ordered) in build_list_style_map(styles_doc.root_element()) {
@@ -983,9 +1040,9 @@ fn extract_odt_internal_headers_footers(
     use crate::types::document_structure::ContentLayer;
 
     let mut styles_xml = String::new();
-    if let Ok(mut file) = archive.by_name("styles.xml") {
+    if let Ok(file) = archive.by_name("styles.xml") {
         use std::io::Read;
-        if file.read_to_string(&mut styles_xml).is_err() {
+        if file.take(MAX_ODT_MEMBER_SIZE).read_to_string(&mut styles_xml).is_err() {
             // The member exists but could not be decoded: unlike a missing
             // styles.xml (an ODT with no headers/footers at all, which is not a
             // loss), this is a real document whose header/footer content is now
@@ -1441,10 +1498,12 @@ impl InternalDocumentExtractor for OdtExtractor {
     ) -> Result<InternalDocument> {
         tracing::debug!(format = "odt", size_bytes = content.len(), "extraction starting");
         let content_owned = content.to_vec();
+        let limits = config.security_limits.clone().unwrap_or_default();
 
         let cursor = Cursor::new(content_owned.clone());
         let mut archive = zip::ZipArchive::new(cursor)
             .map_err(|e| crate::error::XbergError::parsing(format!("Failed to open ZIP archive: {}", e)))?;
+        ZipBombValidator::new(limits.clone()).validate(&mut archive)?;
 
         let mut budget = SecurityBudget::from_config(config);
         let mut doc = build_internal_document(&mut archive, &mut budget)?;
@@ -1456,6 +1515,11 @@ impl InternalDocumentExtractor for OdtExtractor {
         let mut meta_archive = zip::ZipArchive::new(meta_cursor).map_err(|e| {
             crate::error::XbergError::parsing(format!("Failed to open ZIP archive for metadata: {}", e))
         })?;
+        // The metadata archive is a second, independent `ZipArchive::new` over the
+        // same bytes (not a reused handle), so it needs its own validation call --
+        // otherwise `meta.xml` below would be read from an archive nothing ever
+        // checked, exactly the gap DOCX has at `extractors/docx.rs:913`. ~keep
+        ZipBombValidator::new(limits).validate(&mut meta_archive)?;
 
         if let Ok(odt_props) = office_metadata::extract_odt_properties(&mut meta_archive) {
             if let Some(title) = odt_props.title {

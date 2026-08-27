@@ -68,7 +68,7 @@ pub async fn caption_image(
     crate::llm::region_extractor::extract_region_with_vlm(
         image_bytes,
         mime,
-        crate::llm::region_extractor::RegionKind::Caption,
+        crate::RegionKind::Caption,
         llm_config,
         custom_prompt,
     )
@@ -97,7 +97,7 @@ pub(crate) async fn caption_image_with_usage(
     crate::llm::region_extractor::extract_region_with_vlm_usage(
         image_bytes,
         mime,
-        crate::llm::region_extractor::RegionKind::Caption,
+        crate::RegionKind::Caption,
         llm_config,
         custom_prompt,
     )

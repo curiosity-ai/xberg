@@ -3,11 +3,15 @@
 //! These tests verify that:
 //! - `OcrBackendRegistry::new` seeds each backend under its canonical name.
 //! - Unknown backend names return `None` from the registry (via `list()`).
-//! - `parse_options`-level behaviour (defaults + non-object JSON resilience) is
-//!   correct without downloading any model weights.
 //! - Network-gated e2e tests (tagged `#[ignore]`) drive real inference through the
 //!   unified `OcrBackend::process_image` interface with device=auto to respect GPU
 //!   acceleration when built with `candle-cuda`.
+//!
+//! `parse_options` is a private inherent method on each backend, so it cannot be
+//! exercised from this external test crate. Its defaults + non-object JSON
+//! resilience + empty-object-defaults behaviour is covered by the `#[cfg(test)]`
+//! unit tests inside each backend module instead (`glm_ocr_backend.rs`,
+//! `deepseek_ocr_backend.rs`, `paddleocr_vl_backend.rs`).
 //!
 //! Models are gated uniformly via `XBERG_REQUIRE_MODELS`:
 //! - When unset or falsy: tests skip gracefully if required weights/env vars are missing.
@@ -126,131 +130,6 @@ fn registry_returns_none_for_unknown_candle_backend() {
         "Expected 'candle-doesnotexist' to be absent from registry; got: {:?}",
         names,
     );
-}
-
-/// GLM-OCR: non-object backend_options (array) leaves parse_options returning defaults.
-///
-/// The `parse_options` implementation calls `opts.get("key")` which is only valid
-/// on JSON objects. Passing an array or scalar must not panic — the backend must
-/// silently fall back to defaults.
-#[cfg(feature = "candle-glm-ocr")]
-#[test]
-fn parse_options_glm_ocr_rejects_non_object_json_by_returning_defaults() {
-    use xberg::candle_ocr::GlmOcrBackend;
-    use xberg::candle_ocr::glm_ocr_backend::LayoutMode;
-    use xberg_candle_ocr::models::GlmOcrTask;
-
-    let backend = GlmOcrBackend::new(GlmOcrTask::default(), LayoutMode::default());
-
-    let _config = OcrConfig {
-        backend_options: Some(serde_json::json!([1, 2, 3])),
-        ..Default::default()
-    };
-
-    use xberg::plugins::Plugin as _;
-    assert_eq!(backend.name(), "candle-glm-ocr");
-
-    let _config2 = OcrConfig {
-        backend_options: Some(serde_json::json!("ocr")),
-        ..Default::default()
-    };
-    assert_eq!(
-        backend.name(),
-        "candle-glm-ocr",
-        "backend remains coherent after scalar options"
-    );
-}
-
-/// DeepSeek-OCR: non-object backend_options yields defaults without panicking.
-#[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
-#[test]
-fn parse_options_deepseek_ocr_rejects_non_object_json_by_returning_defaults() {
-    use xberg::candle_ocr::DeepseekOcrBackend;
-    use xberg::plugins::Plugin as _;
-
-    let backend = DeepseekOcrBackend::new();
-    assert_eq!(backend.name(), "candle-deepseek-ocr");
-
-    let config = OcrConfig {
-        backend_options: Some(serde_json::json!(null)),
-        ..Default::default()
-    };
-    let _ = config;
-    assert_eq!(backend.name(), "candle-deepseek-ocr");
-}
-
-/// PaddleOCR-VL: non-object backend_options yields defaults without panicking.
-#[cfg(feature = "candle-paddleocr-vl")]
-#[test]
-fn parse_options_paddleocr_vl_rejects_non_object_json_by_returning_defaults() {
-    use xberg::candle_ocr::PaddleOcrVlBackend;
-    use xberg::plugins::Plugin as _;
-    use xberg_candle_ocr::models::PaddleOcrVlTask;
-
-    let backend = PaddleOcrVlBackend::new(PaddleOcrVlTask::default());
-    assert_eq!(backend.name(), "candle-paddleocr-vl");
-
-    let config = OcrConfig {
-        backend_options: Some(serde_json::json!(false)),
-        ..Default::default()
-    };
-    let _ = config;
-    assert_eq!(backend.name(), "candle-paddleocr-vl");
-}
-
-/// GLM-OCR: empty object backend_options is silently accepted; defaults apply.
-#[cfg(feature = "candle-glm-ocr")]
-#[test]
-fn parse_options_glm_ocr_accepts_empty_object_and_returns_defaults() {
-    use xberg::candle_ocr::GlmOcrBackend;
-    use xberg::candle_ocr::glm_ocr_backend::LayoutMode;
-    use xberg::plugins::Plugin as _;
-    use xberg_candle_ocr::models::GlmOcrTask;
-
-    let backend = GlmOcrBackend::new(GlmOcrTask::default(), LayoutMode::default());
-
-    let _config = OcrConfig {
-        backend_options: Some(serde_json::json!({})),
-        ..Default::default()
-    };
-
-    assert_eq!(backend.name(), "candle-glm-ocr");
-    assert_eq!(backend.version(), "0.1.0");
-}
-
-/// DeepSeek-OCR: empty object backend_options is accepted; defaults apply.
-#[cfg(all(feature = "candle-deepseek-ocr", not(target_arch = "wasm32")))]
-#[test]
-fn parse_options_deepseek_ocr_accepts_empty_object_and_returns_defaults() {
-    use xberg::candle_ocr::DeepseekOcrBackend;
-    use xberg::plugins::Plugin as _;
-
-    let backend = DeepseekOcrBackend::new();
-    let _config = OcrConfig {
-        backend_options: Some(serde_json::json!({})),
-        ..Default::default()
-    };
-
-    assert_eq!(backend.name(), "candle-deepseek-ocr");
-    assert_eq!(backend.version(), "0.1.0");
-}
-
-/// PaddleOCR-VL: empty object backend_options is accepted; defaults apply.
-#[cfg(feature = "candle-paddleocr-vl")]
-#[test]
-fn parse_options_paddleocr_vl_accepts_empty_object_and_returns_defaults() {
-    use xberg::candle_ocr::PaddleOcrVlBackend;
-    use xberg::plugins::Plugin as _;
-    use xberg_candle_ocr::models::PaddleOcrVlTask;
-
-    let backend = PaddleOcrVlBackend::new(PaddleOcrVlTask::default());
-    let _config = OcrConfig {
-        backend_options: Some(serde_json::json!({})),
-        ..Default::default()
-    };
-
-    assert_eq!(backend.name(), "candle-paddleocr-vl");
-    assert_eq!(backend.version(), "0.1.0");
 }
 
 // Network-gated e2e tests — #[ignore] until env vars are set.

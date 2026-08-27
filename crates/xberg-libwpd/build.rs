@@ -23,7 +23,12 @@
 // exists where `cc`/`flate2`/`tar`/`sha2` are available. Whether we *do*
 // anything is a separate, target-driven decision in `main`. ~keep
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[path = "build_target_flags.rs"]
+mod build_target_flags;
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 mod build_libwpd {
+    use super::build_target_flags::msvc_only_flags;
     use flate2::read::GzDecoder;
     use sha2::{Digest, Sha256};
     use std::env;
@@ -52,6 +57,10 @@ mod build_libwpd {
 
     fn targeting_windows() -> bool {
         target_os() == "windows"
+    }
+
+    fn target_env() -> String {
+        env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default()
     }
 
     /// Root of a vcpkg installation, honoring `VCPKG_ROOT`/
@@ -257,14 +266,12 @@ mod build_libwpd {
             .include("src");
 
         // librevenge calls POSIX S_ISREG/S_ISDIR, which MSVC does not define.
-        // Force-include the shim rather than patch the upstream sources. ~keep
-        if targeting_windows() {
-            build.flag("/FImsvc_compat.h");
-            // Enable C++ exceptions on MSVC. Without /EHsc, MSVC leaves
-            // `_CPPUNWIND` undefined, so Boost defines `BOOST_NO_EXCEPTIONS` and
-            // vendored sources never provide (LNK2019). GCC/clang enable
-            // exceptions by default, which is why only the MSVC link failed.
-            build.flag("/EHsc");
+        // Force-include the shim rather than patch the upstream sources. MinGW
+        // uses GCC, which treats these MSVC options as additional input files.
+        // `/EHsc` enables C++ exceptions so Boost does not define
+        // `BOOST_NO_EXCEPTIONS`; GCC/clang enable exceptions by default. ~keep
+        for flag in msvc_only_flags(&target_os(), &target_env()) {
+            build.flag(flag);
         }
 
         // librevenge's RVNGZipStream.cpp does `#include <zlib.h>`. `libz-sys`

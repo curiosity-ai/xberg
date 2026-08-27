@@ -26,7 +26,6 @@
 //! constants [`QWEN3_QUERY_PREFIX`] / [`QWEN3_DOCUMENT_SUFFIX`] for the
 //! prompt wrapping applied at encode time.
 //!
-//! Since v5.0.0.
 
 use ndarray::{ArrayView, ArrayView3, Dim, Dimension, IxDynImpl, s};
 use ort::session::Session;
@@ -38,7 +37,6 @@ use crate::core::config::reranker::RerankerHead;
 
 /// Errors that can occur during cross-encoder reranking inference.
 ///
-/// Since v5.0.0.
 #[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Error)]
 pub enum RerankError {
@@ -85,7 +83,6 @@ const QWEN3_DOCUMENT_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n<think>\
 /// - [`RerankerHead::Qwen3Generative`] — Qwen3 generative-reranker path; requires
 ///   `true_token_id` / `false_token_id` to have been resolved from the tokenizer.
 ///
-/// Since v5.0.0.
 #[cfg_attr(alef, alef(skip))]
 pub struct RerankerEngine {
     tokenizer: Tokenizer,

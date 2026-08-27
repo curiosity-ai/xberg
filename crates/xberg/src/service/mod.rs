@@ -12,19 +12,24 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust
 //! use xberg::service::{ExtractionServiceBuilder, ExtractionRequest};
 //! use xberg::ExtractionConfig;
-//! use tower::Service;
+//! use tower::ServiceExt;
 //! use std::time::Duration;
 //!
-//! let mut svc = ExtractionServiceBuilder::new()
+//! # #[tokio::main]
+//! # async fn main() -> xberg::Result<()> {
+//! let svc = ExtractionServiceBuilder::new()
 //!     .with_timeout(Duration::from_secs(300))
 //!     .with_concurrency_limit(4)
-//!     .build();
+//!     .build()?;
 //!
 //! let req = ExtractionRequest::bytes(b"hello".as_slice(), "text/plain", ExtractionConfig::default());
-//! let result = svc.call(req).await?;
+//! let result = svc.oneshot(req).await?;
+//! assert_eq!(result.content, "hello");
+//! # Ok(())
+//! # }
 //! ```
 
 mod extraction;
@@ -63,7 +68,7 @@ impl Default for ExtractionServiceBuilder {
 
 impl ExtractionServiceBuilder {
     /// Create a new builder with no layers configured.
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             timeout: None,
             concurrency_limit: None,
@@ -74,34 +79,29 @@ impl ExtractionServiceBuilder {
     }
 
     /// Add a per-request timeout.
-    #[cfg(test)]
-    pub(crate) fn with_timeout(mut self, duration: Duration) -> Self {
+    pub fn with_timeout(mut self, duration: Duration) -> Self {
         self.timeout = Some(duration);
         self
     }
 
     /// Limit concurrent in-flight extractions.
-    #[cfg(test)]
-    pub(crate) fn with_concurrency_limit(mut self, max: usize) -> Self {
+    ///
+    /// A zero limit is rejected by [`Self::build`].
+    pub fn with_concurrency_limit(mut self, max: usize) -> Self {
         self.concurrency_limit = Some(max);
         self
     }
 
     /// Add a tracing span to each extraction request.
-    pub(crate) fn with_tracing(mut self) -> Self {
+    pub fn with_tracing(mut self) -> Self {
         self.tracing = true;
         self
     }
 
     /// Add metrics recording to each extraction request.
-    ///
-    /// Requires the `otel` feature. This is a no-op when `otel` is not enabled.
-    #[allow(unused_mut)]
-    pub(crate) fn with_metrics(mut self) -> Self {
-        #[cfg(feature = "otel")]
-        {
-            self.metrics = true;
-        }
+    #[cfg(feature = "otel")]
+    pub fn with_metrics(mut self) -> Self {
+        self.metrics = true;
         self
     }
 
@@ -109,7 +109,17 @@ impl ExtractionServiceBuilder {
     ///
     /// Layer order (outermost to innermost):
     /// `Tracing → Metrics → Timeout → ConcurrencyLimit → ExtractionService`
-    pub(crate) fn build(self) -> BoxCloneService<ExtractionRequest, ExtractedDocument, XbergError> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XbergError::Validation`] when the concurrency limit is zero.
+    pub fn build(self) -> crate::Result<BoxCloneService<ExtractionRequest, ExtractedDocument, XbergError>> {
+        if self.concurrency_limit == Some(0) {
+            return Err(XbergError::validation(
+                "building extraction service: concurrency limit must be greater than zero",
+            ));
+        }
+
         let svc = ExtractionService::new();
 
         let svc = match self.concurrency_limit {
@@ -138,14 +148,16 @@ impl ExtractionServiceBuilder {
             svc
         };
 
-        if self.tracing {
+        let svc = if self.tracing {
             ServiceBuilder::new()
                 .layer(layers::tracing::TracingLayer::new())
                 .service(svc)
                 .boxed_clone()
         } else {
             svc
-        }
+        };
+
+        Ok(svc)
     }
 }
 
@@ -190,24 +202,39 @@ mod tests {
 
     #[test]
     fn builder_new_builds_service() {
-        let _svc = ExtractionServiceBuilder::new().build();
+        let _svc = ExtractionServiceBuilder::new()
+            .build()
+            .expect("default builder should be valid");
     }
 
     #[test]
     fn builder_with_timeout_does_not_panic() {
         let _svc = ExtractionServiceBuilder::new()
             .with_timeout(Duration::from_secs(30))
-            .build();
+            .build()
+            .expect("positive timeout should be valid");
     }
 
     #[test]
     fn builder_with_concurrency_limit_does_not_panic() {
-        let _svc = ExtractionServiceBuilder::new().with_concurrency_limit(4).build();
+        let _svc = ExtractionServiceBuilder::new()
+            .with_concurrency_limit(4)
+            .build()
+            .expect("positive concurrency limit should be valid");
+    }
+
+    #[test]
+    fn builder_rejects_zero_concurrency_limit() {
+        let result = ExtractionServiceBuilder::new().with_concurrency_limit(0).build();
+
+        assert!(matches!(result, Err(XbergError::Validation { .. })));
     }
 
     #[tokio::test]
     async fn builder_service_extracts_text() {
-        let mut svc = ExtractionServiceBuilder::new().build();
+        let mut svc = ExtractionServiceBuilder::new()
+            .build()
+            .expect("default builder should be valid");
         let req = ExtractionRequest::bytes(
             b"hello from builder".as_slice(),
             "text/plain",
@@ -221,7 +248,8 @@ mod tests {
     async fn builder_with_timeout_extracts_text() {
         let mut svc = ExtractionServiceBuilder::new()
             .with_timeout(Duration::from_secs(10))
-            .build();
+            .build()
+            .expect("positive timeout should be valid");
         let req = ExtractionRequest::bytes(b"timeout test".as_slice(), "text/plain", ExtractionConfig::default());
         let result = svc.call(req).await.expect("extraction should succeed within timeout");
         assert!(result.content.contains("timeout test"));
@@ -231,7 +259,8 @@ mod tests {
     async fn timeout_fires_on_zero_duration() {
         let mut svc = ExtractionServiceBuilder::new()
             .with_timeout(Duration::from_nanos(1))
-            .build();
+            .build()
+            .expect("positive timeout should be valid");
         let req = ExtractionRequest::bytes(b"hello".as_slice(), "text/plain", ExtractionConfig::default());
         let result = svc.call(req).await;
         match result {

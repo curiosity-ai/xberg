@@ -5,11 +5,12 @@
 //! consumers into one place: `GraphOptimizationLevel::All`, an intra-op thread
 //! budget from the concurrency config, a single inter-op thread, and the
 //! execution provider selected by [`crate::ort_discovery::apply_execution_providers`],
-//! with a CPU-only retry when the platform EP fails to build. [`OrtSession`]
-//! wraps the resulting `ort::session::Session` and converts tensors at the
-//! boundary.
+//! with a CPU-only retry when the platform EP fails to build — but only for an
+//! auto-detected provider; an explicitly-requested provider that fails to build
+//! surfaces its error instead, since `apply_execution_providers` deliberately
+//! hard-errors in that case. [`OrtSession`] wraps the resulting
+//! `ort::session::Session` and converts tensors at the boundary.
 //!
-//! Since v5.0.0 (issue #1275).
 
 use std::borrow::Cow;
 use std::path::Path;
@@ -76,6 +77,14 @@ impl OrtBackend {
         let session = match Self::commit(source, accel, thread_budget, true) {
             Ok(session) => session,
             Err(first_err) => {
+                let explicit_provider_request = crate::ort_discovery::is_explicit_provider_request(accel);
+                if !should_retry_on_cpu(explicit_provider_request) {
+                    // The caller explicitly asked for this provider (e.g. `cuda`, `tensorrt`);
+                    // `apply_execution_providers` deliberately hard-errors in that case rather
+                    // than falling back, so that error must reach the caller unchanged instead
+                    // of being swallowed into a silent CPU session.
+                    return Err(first_err);
+                }
                 tracing::warn!("OrtBackend: platform EP build failed ({first_err}), retrying CPU-only");
                 Self::commit(source, accel, thread_budget, false)?
             }
@@ -84,6 +93,18 @@ impl OrtBackend {
         let input_names = session.inputs().iter().map(|i| i.name().to_string()).collect();
         Ok(Box::new(OrtSession { session, input_names }))
     }
+}
+
+/// Whether a session build that failed with the platform execution provider may retry
+/// CPU-only. Retrying is the desired best-effort behavior for an auto-detected provider that
+/// failed to build, but must NOT happen when the provider was explicitly requested: in that
+/// case `ort_discovery::apply_execution_providers` deliberately hard-errors, and retrying would
+/// silently swallow that error into a CPU session the caller never asked for.
+///
+/// Deciding this on `explicit_provider_request` alone (never on the error's message) keeps the
+/// decision independent of `ort`'s error text, which is not a stable contract to match on.
+fn should_retry_on_cpu(explicit_provider_request: bool) -> bool {
+    !explicit_provider_request
 }
 
 /// Where an ORT session's graph is read from — a cached file or an in-memory buffer.
@@ -224,6 +245,30 @@ mod tests {
     use ndarray::ArrayD;
 
     use super::*;
+
+    // These exercise `should_retry_on_cpu`, the pure decision `build_session` makes when the
+    // platform EP build fails — not `build_session` itself, which needs a real ORT session and
+    // model to construct. The four `decide_gpu_ep_outcome` tests in `ort_discovery` call that
+    // pure helper directly too, and passed unmodified with the swallow-bug fully present,
+    // because nothing in `build_session` ever consulted them: `build_session` retried
+    // CPU-only on ANY `Self::commit(..., true)` error, explicit or not. `should_retry_on_cpu`
+    // is the decision that closes that gap; these tests pin it directly.
+
+    #[test]
+    fn should_retry_on_cpu_allows_retry_for_auto_detected_provider() {
+        assert!(should_retry_on_cpu(false));
+    }
+
+    #[test]
+    fn should_retry_on_cpu_forbids_retry_for_explicit_provider_request() {
+        // Fails against the unfixed code: `should_retry_on_cpu` does not exist prior to this
+        // fix, and `build_session` retried CPU-only unconditionally — including when the
+        // caller explicitly requested a GPU provider that `apply_execution_providers`
+        // deliberately hard-errored on (commit b0444fffdd). That swallowed the explicit
+        // request's error into a silent CPU fallback behind only a `tracing::warn!`, which is
+        // exactly the HIGH-severity regression this fix closes.
+        assert!(!should_retry_on_cpu(true));
+    }
 
     #[test]
     fn f32_input_conversion_preserves_shape_and_data() {

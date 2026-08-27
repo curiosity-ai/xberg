@@ -17,9 +17,13 @@ class TestWorkflowMatrixValidation(unittest.TestCase):
     def test_expands_every_exact_contract_cell_once(self) -> None:
         cells = VALIDATOR.workflow_cells(WORKFLOW)
 
-        assert len(cells) == 140
-        assert len({VALIDATOR.cell_key(cell) for cell in cells}) == 140
-        assert sum(not cell["optional"] for cell in cells) == 104
+        assert len(cells) == 132
+        assert len({VALIDATOR.cell_key(cell) for cell in cells}) == 132
+        assert sum(not cell["optional"] for cell in cells) == 96
+        pdfium_cells = [cell for cell in cells if cell["framework"].endswith("-baseline-pdfium")]
+        assert len(pdfium_cells) == 4
+        assert all(cell["cohort"] == "native-pdf-fast-b8" for cell in pdfium_cells)
+        assert all(not cell["optional"] for cell in pdfium_cells)
 
     def test_framework_env_drift_changes_cell_even_when_artifact_name_is_unchanged(self) -> None:
         mutated = WORKFLOW.replace("FRAMEWORK: docling", "FRAMEWORK: docling-wrong", 1)

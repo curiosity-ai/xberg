@@ -97,7 +97,100 @@ use std::sync::RwLock;
 type CachedEngine = Arc<EmbeddingEngine>;
 
 #[cfg(feature = "embeddings")]
-static ENGINE_CACHE: LazyLock<RwLock<AHashMap<String, CachedEngine>>> = LazyLock::new(|| RwLock::new(AHashMap::new()));
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EmbeddingEngineCacheKey {
+    repo_name: String,
+    model_file: String,
+    additional_files: Vec<String>,
+    revision: String,
+    pooling: engine::Pooling,
+    max_sequence_length: usize,
+    cache_root: String,
+    acceleration: crate::onnx::OnnxAccelerationCacheKey,
+}
+
+#[cfg(all(test, feature = "embeddings"))]
+mod engine_cache_key_tests {
+    use super::*;
+    use crate::core::config::acceleration::{AccelerationConfig, ExecutionProviderType};
+
+    fn key(
+        additional_files: &[String],
+        pooling: engine::Pooling,
+        max_sequence_length: usize,
+        acceleration: &AccelerationConfig,
+    ) -> EmbeddingEngineCacheKey {
+        EmbeddingEngineCacheKey::new(
+            "owner/model",
+            "model.onnx",
+            additional_files,
+            "revision",
+            pooling,
+            max_sequence_length,
+            "cache-root".to_string(),
+            crate::onnx::OnnxAccelerationCacheKey::from_resolved(acceleration.provider.clone(), acceleration.device_id),
+        )
+    }
+
+    #[test]
+    fn engine_cache_reuses_equal_configs_and_isolates_distinct_configs() {
+        let cpu = AccelerationConfig {
+            provider: ExecutionProviderType::Cpu,
+            device_id: 0,
+        };
+        let cuda = AccelerationConfig {
+            provider: ExecutionProviderType::Cuda,
+            device_id: 1,
+        };
+        let files = vec!["config.json".to_string(), "weights.onnx.data".to_string()];
+        let reversed_files = vec!["weights.onnx.data".to_string(), "config.json".to_string()];
+        let original = key(&files, engine::Pooling::Mean, 512, &cpu);
+        let equal = key(&files, engine::Pooling::Mean, 512, &cpu);
+        let mut cache = AHashMap::new();
+        cache.insert(original, 7_u8);
+
+        assert_eq!(cache.get(&equal), Some(&7));
+        assert_eq!(cache.get(&key(&files, engine::Pooling::Mean, 1024, &cpu)), None);
+        assert_eq!(cache.get(&key(&files, engine::Pooling::Mean, 512, &cuda)), None);
+        assert_eq!(cache.get(&key(&[], engine::Pooling::Mean, 512, &cpu)), None);
+        assert_eq!(cache.get(&key(&reversed_files, engine::Pooling::Mean, 512, &cpu)), None);
+        assert_eq!(cache.get(&key(&files, engine::Pooling::Cls, 512, &cpu)), None);
+    }
+}
+
+#[cfg(feature = "embeddings")]
+impl EmbeddingEngineCacheKey {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every argument is a distinct dimension of the cache key this constructor builds; \
+                  grouping any of them would just move the same fields behind another struct"
+    )]
+    fn new(
+        repo_name: &str,
+        model_file: &str,
+        additional_files: &[String],
+        revision: &str,
+        pooling: engine::Pooling,
+        max_sequence_length: usize,
+        cache_root: String,
+        acceleration: crate::onnx::OnnxAccelerationCacheKey,
+    ) -> Self {
+        Self {
+            repo_name: repo_name.to_string(),
+            model_file: model_file.to_string(),
+            additional_files: additional_files.to_vec(),
+            revision: revision.to_string(),
+            pooling,
+            max_sequence_length,
+            cache_root,
+            acceleration,
+        }
+    }
+}
+
+#[cfg(feature = "embeddings")]
+static ENGINE_CACHE: LazyLock<RwLock<AHashMap<EmbeddingEngineCacheKey, CachedEngine>>> =
+    LazyLock::new(|| RwLock::new(AHashMap::new()));
 
 /// Global semaphore that limits concurrent ONNX embedding inference calls.
 ///
@@ -401,10 +494,15 @@ fn get_or_init_engine(
     accel: Option<crate::core::config::acceleration::AccelerationConfig>,
 ) -> crate::Result<Arc<EmbeddingEngine>> {
     let revision = (repo_name == "xberg-io/embedding-models").then_some(EMBEDDING_MODEL_REVISION);
-    let cache_key = crate::model_download::hf_cache_key(cache_dir.as_deref());
-    let engine_key = format!(
-        "{repo_name}_{model_file}_{}_{max_sequence_length}_{cache_key}",
-        revision.unwrap_or("main")
+    let engine_key = EmbeddingEngineCacheKey::new(
+        repo_name,
+        model_file,
+        additional_files,
+        revision.unwrap_or("main"),
+        pooling.clone(),
+        max_sequence_length,
+        crate::model_download::hf_cache_key(cache_dir.as_deref()),
+        crate::onnx::OnnxAccelerationCacheKey::new(accel.as_ref()),
     );
 
     {

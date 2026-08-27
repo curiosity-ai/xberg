@@ -1,11 +1,52 @@
 #[cfg(any(feature = "xml", feature = "office", feature = "hwpx"))]
 use std::borrow::Cow;
 
-/// Converts XML tag name bytes to a string, avoiding allocation when possible.
+#[cfg(any(feature = "xml", feature = "office", feature = "hwpx"))]
+/// Decode raw XML bytes to a UTF-8 string, honoring the `<?xml encoding=...?>`
+/// declaration when present and falling back to charset detection otherwise.
+/// Strips a leading BOM.
+///
+/// Returns whether any bytes were lost to a U+FFFD replacement (#395). This is the one
+/// call site in the crate where that can happen under an *explicit* encoding rather
+/// than only through `quality`'s chardetng detection: a declared `<?xml encoding=...?>`
+/// that does not match the actual bytes decodes deterministically with errors in both
+/// build configurations, so `decode_with_provenance` must be consulted for the declared
+/// path too, not only the detection fallback.
+pub(crate) fn decode_xml_to_utf8(content: &[u8]) -> (String, bool) {
+    let prolog_len = content.len().min(256);
+    let prolog = String::from_utf8_lossy(&content[..prolog_len]);
+    let declared = prolog
+        .split_once("encoding")
+        .and_then(|(_, rest)| rest.split_once(['"', '\'']))
+        .and_then(|(_, rest)| rest.split(['"', '\'']).next())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    // `decode_with_provenance` honors a valid `declared` label the same way the previous
+    // manual `encoding_rs::Encoding::for_label` check did, and falls through to
+    // detection/lossy decoding for `None` or an unrecognized label -- so passing `declared`
+    // through unconditionally reproduces the old branching without duplicating it here.
+    //
+    // One deliberate behaviour change under `quality`: the declared-label path now also
+    // runs `fix_mojibake_internal`, which the old raw `encoding.decode()` call skipped.
+    // That is what every other extractor already does with its decoded text, so XML was
+    // the outlier; the alternative would be to keep XML uniquely un-repaired. ~keep
+    let outcome = crate::utils::decode_with_provenance(content, declared);
+    (
+        crate::utils::strip_bom(&outcome.text).to_string(),
+        outcome.replaced_characters,
+    )
+}
+
+/// Borrows an XML tag name as a string.
+///
+/// quick-xml decodes names to `&str` at parse time, so this no longer decodes
+/// anything; it stays as a `Cow` so the call sites that hold the result across a
+/// borrow of the event keep working unchanged.
 #[cfg(any(feature = "xml", feature = "office", feature = "hwpx"))]
 #[inline]
-pub(crate) fn xml_tag_name(name: &[u8]) -> Cow<'_, str> {
-    String::from_utf8_lossy(name)
+pub(crate) fn xml_tag_name(name: &str) -> Cow<'_, str> {
+    Cow::Borrowed(name)
 }
 
 /// Streaming XML reader that restores pre-quick-xml-0.38 text semantics.
@@ -71,13 +112,13 @@ impl<'x> EntityReader<'x> {
             None => self.reader.read_event()?,
         };
         let mut text = match first {
-            Event::Text(t) => String::from_utf8_lossy(t.as_ref()).into_owned(),
+            Event::Text(t) => std::borrow::Cow::Borrowed(t.as_ref()).into_owned(),
             Event::GeneralRef(r) => resolve_general_ref(&r),
             other => return Ok(other),
         };
         loop {
             match self.reader.read_event()? {
-                Event::Text(t) => text.push_str(&String::from_utf8_lossy(t.as_ref())),
+                Event::Text(t) => text.push_str(&std::borrow::Cow::Borrowed(t.as_ref())),
                 Event::GeneralRef(r) => text.push_str(&resolve_general_ref(&r)),
                 other => {
                     self.pending = Some(other);
@@ -103,9 +144,7 @@ pub(crate) fn resolve_general_ref(reference: &quick_xml::events::BytesRef<'_>) -
     if let Ok(Some(ch)) = reference.resolve_char_ref() {
         return ch.to_string();
     }
-    let Ok(name) = reference.decode() else {
-        return String::new();
-    };
+    let name: Cow<str> = Cow::Borrowed(reference.as_ref());
     if let Some(resolved) = quick_xml::escape::resolve_predefined_entity(&name) {
         return resolved.to_string();
     }
@@ -157,7 +196,7 @@ mod tests {
         let mut texts = Vec::new();
         loop {
             match reader.read_event().expect("valid XML") {
-                Event::Text(t) => texts.push(String::from_utf8_lossy(t.as_ref()).into_owned()),
+                Event::Text(t) => texts.push(t.as_ref().to_string()),
                 Event::Eof => break,
                 _ => {}
             }
@@ -172,10 +211,10 @@ mod tests {
         let mut summary = Vec::new();
         loop {
             match reader.read_event().expect("valid XML") {
-                Event::Start(e) => summary.push(format!("start:{}", String::from_utf8_lossy(e.name().as_ref()))),
-                Event::Empty(e) => summary.push(format!("empty:{}", String::from_utf8_lossy(e.name().as_ref()))),
-                Event::End(e) => summary.push(format!("end:{}", String::from_utf8_lossy(e.name().as_ref()))),
-                Event::Text(t) => summary.push(format!("text:{}", String::from_utf8_lossy(t.as_ref()))),
+                Event::Start(e) => summary.push(format!("start:{}", e.name().as_ref())),
+                Event::Empty(e) => summary.push(format!("empty:{}", e.name().as_ref())),
+                Event::End(e) => summary.push(format!("end:{}", e.name().as_ref())),
+                Event::Text(t) => summary.push(format!("text:{}", t.as_ref())),
                 Event::Eof => break,
                 _ => {}
             }

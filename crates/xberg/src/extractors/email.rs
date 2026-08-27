@@ -316,7 +316,13 @@ fn process_node(
                 builder.push_formula(text.as_str(), None, None);
             }
             crate::types::NodeContent::MetadataBlock { entries } => {
-                builder.push_metadata_block(entries, None);
+                builder.push_metadata_block(
+                    &entries
+                        .iter()
+                        .map(|entry| (entry.key.clone(), entry.value.clone()))
+                        .collect::<Vec<_>>(),
+                    None,
+                );
             }
             crate::types::NodeContent::Quote => {
                 builder.push_quote_start();
@@ -1070,6 +1076,93 @@ Content-Type: text/html; charset=utf-8
         assert_eq!(
             paragraph_count, 2,
             "Should have exactly 2 body paragraphs (no duplicates)"
+        );
+    }
+
+    /// Regression test for task #727, from the consumer side: `process_node` already
+    /// forwards `node.annotations` for list items, so the only reason bold text in an HTML
+    /// `<li>` renders flat is that the HTML structure builder never attached it.
+    ///
+    /// Against the unfixed code the rendered line is `- alpha bold`.
+    #[test]
+    fn test_html_list_item_formatting_survives_into_markdown() {
+        let eml = r#"From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Subject: Formatted list
+Content-Type: multipart/alternative; boundary="boundary"
+
+--boundary
+Content-Type: text/plain; charset=utf-8
+
+Plain text fallback.
+
+--boundary
+Content-Type: text/html; charset=utf-8
+
+<html><body><ul><li>alpha <strong>bold</strong></li></ul></body></html>
+--boundary--
+"#;
+        let doc = EmailExtractor::new()
+            .extract_sync(eml.as_bytes(), "message/rfc822", &ExtractionConfig::default())
+            .unwrap();
+        let markdown = crate::rendering::render_markdown(&doc);
+
+        let line = markdown
+            .lines()
+            .find(|line| line.contains("alpha"))
+            .expect("expected the list item in the rendered markdown");
+        assert!(
+            line.contains("**bold**"),
+            "list-item formatting must reach the renderer, got line {line:?}; full markdown:\n{markdown}"
+        );
+    }
+
+    /// Regression test for task #728, from the consumer side: `process_node` walks the
+    /// `DocumentStructure` in *tree* order, so a sublist parented at the root instead of
+    /// under its `<li>` is emitted after the whole outer list — putting the parent item's
+    /// trailing text ahead of the sublist it follows in the source.
+    ///
+    /// Against the unfixed code the item texts come out as `["parent", "tail", "child"]`,
+    /// all at depth 1 (`process_node`'s recursion into `ListItem` children never runs,
+    /// because HTML-derived list items have no children).
+    #[test]
+    fn test_html_sublist_is_rendered_inside_its_parent_item() {
+        let eml = r#"From: Alice <alice@example.com>
+To: Bob <bob@example.com>
+Subject: Nested list
+Content-Type: multipart/alternative; boundary="boundary"
+
+--boundary
+Content-Type: text/plain; charset=utf-8
+
+Plain text fallback.
+
+--boundary
+Content-Type: text/html; charset=utf-8
+
+<html><body><ul><li>parent<ul><li>child</li></ul>tail</li></ul></body></html>
+--boundary--
+"#;
+        let doc = EmailExtractor::new()
+            .extract_sync(eml.as_bytes(), "message/rfc822", &ExtractionConfig::default())
+            .unwrap();
+
+        let items: Vec<(&str, u16)> = doc
+            .elements
+            .iter()
+            .filter(|element| matches!(element.kind, crate::types::internal::ElementKind::ListItem { .. }))
+            .map(|element| (element.text.as_str(), element.depth))
+            .collect();
+
+        assert_eq!(
+            items.iter().map(|(text, _)| *text).collect::<Vec<_>>(),
+            vec!["parent", "child", "tail"],
+            "the sublist must be emitted between its parent item and that item's trailing text"
+        );
+        assert_eq!(
+            items.iter().map(|(_, depth)| *depth).collect::<Vec<_>>(),
+            vec![1, 2, 1],
+            "the sublist's item must sit one level deeper than the outer list's items"
         );
     }
 

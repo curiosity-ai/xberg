@@ -301,8 +301,10 @@ static MATH_SCRIPT_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::
 /// equation, the shape legacy MathJax and MediaWiki pages use.
 #[cfg(feature = "office")]
 static TEX_IMG_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r#"(?is)<img\b[^>]*\bclass\s*=\s*["'][^"']*\b(?:tex|mwe-math-fallback-image-\w+|latex)\b[^"']*["'][^>]*>"#)
-        .unwrap()
+    regex::Regex::new(
+        r#"(?is)<img\b[^>]*\bclass\s*=\s*["'][^"']*\b(?:tex|mwe-math-fallback-image-\w+|latex)\b[^"']*["'][^>]*>"#,
+    )
+    .unwrap()
 });
 
 /// Matches an `alt` attribute's value.
@@ -315,7 +317,7 @@ static ALT_ATTR_RE: std::sync::LazyLock<regex::Regex> =
 /// serializes the raw MathML XML and leaks straight into `pre_rendered_content`/plain text
 /// output; it carries no value once the equation has been recovered as LaTeX below, so it
 /// is stripped.
-static MATHML_COMMENT_RE: std::sync::LazyLock<regex::Regex> =
+pub(crate) static MATHML_COMMENT_RE: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"(?is)<!--\s*MathML:.*?-->\s*").unwrap());
 
 /// Recover MathML equations as LaTeX `Formula` elements (issue #129).
@@ -1459,8 +1461,14 @@ mod tests {
         );
         assert_eq!(meta.author, Some("Jane Doe".to_string()), "Author should be extracted");
     }
+
+    // Formula recovery is compiled only under `office`: `recover_mathml_formulas`
+    // gates its whole body on that feature because the MathML->LaTeX converter needs
+    // roxmltree. Without it no `Formula` element is ever produced, so the assertions
+    // below are unsatisfiable rather than wrong.
     /// MathJax v2 pages carry the LaTeX source in a `math/tex` script, which is
     /// the only copy of the math on a page that ships no MathML.
+    #[cfg(feature = "office")]
     #[tokio::test]
     async fn test_math_tex_script_becomes_a_formula() {
         use crate::core::config::ExtractionConfig;
@@ -1482,6 +1490,7 @@ mod tests {
 
     /// A rendered-equation image carries its source in `alt`, and the entities
     /// in it decode.
+    #[cfg(feature = "office")]
     #[tokio::test]
     async fn test_tex_image_alt_becomes_a_formula() {
         use crate::core::config::ExtractionConfig;
@@ -1502,6 +1511,7 @@ mod tests {
     }
 
     /// An ordinary image is not an equation.
+    #[cfg(feature = "office")]
     #[tokio::test]
     async fn test_plain_image_alt_is_not_a_formula() {
         use crate::core::config::ExtractionConfig;
@@ -1521,6 +1531,7 @@ mod tests {
     /// MediaWiki ships one equation twice: the `math` element and a fallback
     /// image whose `alt` holds the same TeX. The second is a representation of
     /// the first, not another formula.
+    #[cfg(feature = "office")]
     #[tokio::test]
     async fn test_mathml_and_its_fallback_image_are_one_formula() {
         use crate::core::config::ExtractionConfig;
@@ -1545,6 +1556,7 @@ mod tests {
 
     /// A page repeats a short formula legitimately, and each occurrence is its
     /// own equation.
+    #[cfg(feature = "office")]
     #[tokio::test]
     async fn test_repeated_formulas_are_kept() {
         use crate::core::config::ExtractionConfig;
@@ -1565,5 +1577,4 @@ mod tests {
             .collect();
         assert_eq!(latex, vec!["n", "n"], "both occurrences are formulas");
     }
-
 }

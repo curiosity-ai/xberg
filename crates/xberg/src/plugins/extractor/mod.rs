@@ -200,6 +200,11 @@ mod tests {
         ));
     }
 
+    /// `extract_path`'s default impl returns `Other("Path extraction requires the
+    /// tokio-runtime feature")` without that feature, so this test can only assert the
+    /// real behaviour in a build that has it. Ungated, it fails every narrow-feature leg
+    /// (`--no-default-features --features pdf`, `--features archives`, ...).
+    #[cfg(feature = "tokio-runtime")]
     #[tokio::test]
     async fn test_internal_document_extractor_extract_path_default_impl() {
         use std::io::Write;

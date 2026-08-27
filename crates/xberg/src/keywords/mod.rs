@@ -60,7 +60,7 @@ mod yake;
 #[cfg(feature = "keywords-rake")]
 mod rake;
 
-pub use config::KeywordConfig;
+pub use config::{KeywordConfig, NgramRange};
 pub use processor::KeywordExtractor;
 
 #[cfg(feature = "keywords-rake")]
@@ -87,6 +87,7 @@ pub use types::{Keyword, KeywordAlgorithm};
 /// # Errors
 ///
 /// Returns an error if:
+/// - The n-gram range is invalid
 /// - The specified algorithm feature is not enabled
 /// - Keyword extraction fails
 ///
@@ -109,6 +110,8 @@ pub use types::{Keyword, KeywordAlgorithm};
 /// # Ok::<(), xberg::XbergError>(())
 /// ```
 pub fn extract_keywords(text: &str, config: &KeywordConfig) -> Result<Vec<Keyword>> {
+    config.validate()?;
+
     match config.algorithm {
         #[cfg(feature = "keywords-yake")]
         KeywordAlgorithm::Yake => yake::extract_keywords_yake(text, config),
@@ -278,6 +281,24 @@ mod tests {
 
         assert!(!keywords.is_empty());
         assert_eq!(keywords[0].algorithm, KeywordAlgorithm::Rake);
+    }
+
+    #[cfg(feature = "keywords-rake")]
+    #[test]
+    fn should_reject_directly_constructed_invalid_ngram_range() {
+        let config = KeywordConfig {
+            ngram_range: NgramRange { min: 0, max: 0 },
+            ..KeywordConfig::rake()
+        };
+
+        let error = extract_keywords("Rust keyword extraction", &config).expect_err("invalid range must fail");
+
+        match error {
+            crate::XbergError::Validation { message, .. } => {
+                assert_eq!(message, "ngram range minimum must be at least 1, got 0");
+            }
+            other => panic!("expected validation error, got {other:?}"),
+        }
     }
 
     #[cfg(all(feature = "keywords-yake", feature = "keywords-rake"))]

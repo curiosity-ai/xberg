@@ -11,9 +11,9 @@ import (
 )
 
 /*
-#cgo CFLAGS: -I${SRCDIR}/../../../crates/xberg-ffi
+#cgo CFLAGS: -I${SRCDIR}/../../../crates/xberg-ffi/include
 #cgo LDFLAGS: -L${SRCDIR}/../../../target/release -L${SRCDIR}/../../../target/debug -lxberg_ffi
-#include "../../../crates/xberg-ffi/xberg.h"
+#include "../../../crates/xberg-ffi/include/xberg.h"
 #include <stdlib.h>
 */
 import "C"

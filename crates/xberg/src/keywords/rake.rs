@@ -76,7 +76,7 @@ fn run_rake_with_stopwords(
                 return None;
             }
 
-            if word_count < config.ngram_range.0 || word_count > config.ngram_range.1 {
+            if word_count < config.ngram_range.min || word_count > config.ngram_range.max {
                 return None;
             }
 
@@ -148,7 +148,7 @@ fn normalize_language_code(lang: &str) -> String {
     }
 }
 
-#[cfg(all(test, feature = "keywords"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::keywords::config::RakeParams;

@@ -4,7 +4,7 @@ use crate::pdf::hierarchy::SegmentData;
 
 /// Minimum horizontal gap between two same-line segments, expressed as a fraction of
 /// the trailing segment's font size, that indicates a genuine word space rather than a
-/// kerning-run split of a single word. This matches pdf_oxide's main span-joining
+/// kerning-run split of a single word. This matches xberg_native_pdf's main span-joining
 /// convention. Zero and negative gaps remain joined, preserving kerning-run repair.
 const SEGMENT_GAP_SPACE_RATIO: f32 = 0.15;
 
@@ -41,7 +41,7 @@ pub(super) fn needs_space_between(prev: &str, next: &str) -> bool {
 /// and the first word of `next_seg`, using segment geometry to distinguish a real
 /// word gap from a kerning-run split of one word across two spans.
 ///
-/// pdf_oxide sometimes splits a single word into multiple text spans at kerning-run
+/// xberg_native_pdf sometimes splits a single word into multiple text spans at kerning-run
 /// boundaries (e.g. "elit" -> "eli" + "t"). Those spans are visually adjacent (or
 /// overlapping) on the same baseline, unlike spans separated by an actual space
 /// character. When the two segments sit on different lines (a wrapped-line reflow),

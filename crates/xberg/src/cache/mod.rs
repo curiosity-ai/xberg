@@ -568,9 +568,22 @@ mod tests {
 
         static INSTALLED: std::sync::Once = std::sync::Once::new();
         INSTALLED.call_once(|| {
+            // Prefer the pdf-render capture subscriber when it is available. It is itself a
+            // bare `Registry` that neither filters nor caps the level, so it closes the
+            // subscriber-less-thread hole exactly as `AlwaysInterested` does — while ALSO
+            // satisfying `layout_runner`'s glyph-drop test, which asserts the capture is armed.
+            // Both mechanisms compete for the single process-global dispatcher slot, and
+            // whichever test ran first used to win; installing the capturing one satisfies both
+            // instead of trading one red test for the other.
+            #[cfg(feature = "pdf")]
+            let installed = crate::pdf::render::install_pdf_render_diagnostics();
+            #[cfg(not(feature = "pdf"))]
+            let installed = false;
             // An error means some other test already installed a global default. That is
             // fine — any global default at all closes the subscriber-less-thread hole.
-            let _ = tracing::subscriber::set_global_default(AlwaysInterested);
+            if !installed {
+                let _ = tracing::subscriber::set_global_default(AlwaysInterested);
+            }
             // Callsites reached before this point are still cached from whatever answered
             // then; re-evaluate them now that a permissive global default exists. Safe to
             // call here because this thread now resolves to that global default.

@@ -1,7 +1,7 @@
 //! PDF text utilities (backend-agnostic).
 //!
 //! Contains pure utility functions for text post-processing used by the
-//! oxide extraction backend.
+//! native extraction backend.
 
 use std::borrow::Cow;
 

@@ -55,6 +55,23 @@ default = [
     "tree-sitter",
 ]
 pdf-surface = ["xberg/pdf"]
+# Gates `--pdf-backend pdfium` (#700): PdfBackend::Pdfium always exists once
+# `pdf-surface` is on, but selecting it without this feature is rejected at
+# CLI validation time with an actionable rebuild hint. With this feature on,
+# `xberg::extractors::pdf::PdfExtractor` dispatches to the real pdfium engine
+# (#702, crates/xberg/src/extractors/pdf/pdfium_engine.rs). Without it, that
+# same dispatch point rejects `PdfBackend::Pdfium` at extraction time. That
+# core-level rejection is what actually prevents a silent fallback to
+# pdf-native: CLI validation alone only covers `xberg-cli`, not library
+# callers, the API/MCP servers, or other language bindings that build
+# `ExtractionConfig` directly.
+#
+# This feature only compiles the engine in. libpdfium itself is never linked
+# or bundled -- pdfium_engine::bind_once dlopen()s it at run time from
+# PDFIUM_DYNAMIC_LIB_PATH or the system library search path, so enabling this
+# adds the xberg-pdfium-render wrapper to the binary, not a ~10 MB shared
+# object. Deployments must supply libpdfium out of band.
+pdf-pdfium-surface = ["pdf-surface", "xberg/pdf-pdfium"]
 pdf-heuristic = ["pdf-surface"]
 pdf-ocr = ["pdf-heuristic", "ocr-surface", "xberg/ocr"]
 formula-recognition = ["layout-detection", "xberg/formula-recognition"]
@@ -140,6 +157,10 @@ ner-onnx = ["legacy-base", "xberg/ner-onnx"]
 ner-llm = ["legacy-base", "xberg/ner-llm"]
 summarization = ["legacy-base", "xberg/summarization"]
 summarization-llm = ["legacy-base", "xberg/summarization-llm"]
+# Audio transcription is intentionally opt-in because it adds the Whisper/ORT
+# inference stack. The `all` release and container profile enables it so the CLI
+# exposes every capability included by xberg's corresponding full feature set.
+transcription = ["legacy-base", "xberg/transcription"]
 heic = ["legacy-base", "formats", "xberg/heic"]
 # Self-contained static single-file CLI for `cargo binstall xberg-cli`. Every
 # capability here is pure-Rust and statically linkable on musl: document
@@ -183,6 +204,11 @@ all = [
     "ner-llm",
     "summarization",
     "summarization-llm",
+    "transcription",
+    # Enables `--pdf-backend pdfium` (#700/#702). The Docker `cli`/`core`/`full`/
+    # `musl-build` images stage a runtime libpdfium via PDFIUM_DYNAMIC_LIB_PATH
+    # (see docker/Dockerfile.*), so this feature has a real library to load.
+    "pdf-pdfium-surface",
 ]
 
 [dependencies]

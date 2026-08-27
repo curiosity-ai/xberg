@@ -1,7 +1,5 @@
 [workspace]
-alef_version = "0.61.0"
-# -D warnings (emitted into every generated Rust binding as #![allow(...)]).
-extra_clippy_allows = ["redundant_field_names", "collapsible_if", "vec_init_then_push"]
+alef_version = "0.71.0"
 languages = [
   "python",
   "node",
@@ -24,6 +22,16 @@ languages = [
 [workspace.tools]
 python_package_manager = "uv"
 node_package_manager = "pnpm"
+
+# Alef currently has two Kotlin Android defaults: its resolved config uses the
+# variant-scoped assemble tasks, while the CLI fallback uses umbrella `gradle
+# build`, which also runs release validation before Android ABI libraries have
+# been staged. Keep local builds on the debug variant; publishing stages native
+# libraries before invoking the release task. ~keep
+[workspace.build_commands.kotlin_android]
+precondition = "command -v gradle >/dev/null 2>&1"
+build = "cd packages/kotlin-android && gradle assembleDebug"
+build_release = "cd packages/kotlin-android && gradle assembleRelease"
 
 
 [workspace.dto]
@@ -58,6 +66,7 @@ async_wrappers = false
 
 [workspace.docs]
 reference_output = "docs-site/src/content/docs/reference"
+reference_link_style = "extensionless"
 
 # Include the command modules that define `#[command(flatten)]` structs (e.g.
 [workspace.docs.cli]
@@ -66,12 +75,71 @@ sources = ["crates/xberg-cli/src/main.rs", "crates/xberg-cli/src/commands/overri
 [workspace.docs.mcp]
 sources = ["crates/xberg/src/mcp/server.rs"]
 
+[[workspace.docs.mcp.declared]]
+kind = "prompt"
+name = "extract_document"
+description = "Generate a Xberg extraction call for a document"
+
+[[workspace.docs.mcp.declared]]
+kind = "prompt"
+name = "extract_with_ocr"
+description = "Extract a document with explicit OCR language configuration"
+
+[[workspace.docs.mcp.declared]]
+kind = "prompt"
+name = "semantic_search"
+description = "Prepare a document for semantic search through unified extraction"
+
+[[workspace.docs.mcp.declared]]
+kind = "resource"
+name = "xberg://formats"
+title = "Supported Formats"
+description = "All document formats and MIME types supported by Xberg"
+
+[[workspace.docs.mcp.declared]]
+kind = "resource"
+name = "xberg://models"
+title = "Model Manifest"
+description = "Model files, sizes, and SHA256 checksums"
+
+[[workspace.docs.mcp.declared]]
+kind = "resource"
+name = "xberg://languages/ocr"
+title = "OCR Languages"
+description = "Available OCR language codes"
+
+[[workspace.docs.mcp.declared]]
+kind = "resource"
+name = "xberg://presets/embeddings"
+title = "Embedding Presets"
+description = "Available embedding model presets when the embeddings feature is enabled"
+
 [workspace.docs.skills]
 template_dir = "templates/docs/skills"
 outputs = [".codex/skills", ".agents/skills", ".github/skills", ".claude/skills"]
 
 [workspace.docs.snippets]
-dirs = ["docs-site/src/snippets", "docs-site/src/snippets-generated"]
+dirs = ["docs-site/src/snippets-generated"]
+inline_dirs = ["docs-site/src/snippets"]
+docs_dirs = ["docs-site/src/content/docs", "docs-site/src/components"]
+content_collections = { apiExamples = "docs-site/src/snippets-generated" }
+include_base_paths = ["docs-site/src"]
+required_languages = [
+  "python",
+  "rust",
+  "typescript",
+  "go",
+  "ruby",
+  "elixir",
+  "java",
+  "csharp",
+  "php",
+  "dart",
+  "kotlin",
+  "swift",
+  "zig",
+  "c",
+]
 validation_level = "compile"
 # 600s was sized for typecheck/compile-only validation of individual snippets.
 # It is also the ceiling for every session `before` hook (single global
@@ -128,17 +196,10 @@ manifest = "crates/xberg-node/package.json"
 # `@xberg-io/xberg` -- 64 of their 69 failures were a single TS2307
 # "cannot find module". Generated snippets are unaffected either way: they
 # carry `target: node`/`target: wasm`, which takes priority over this fallback.
-# Aliased to the node package because every hand-authored TS snippet under
-# docs-site/src/snippets/typescript/ imports `@xberg-io/xberg`.
-# KNOWN GAP, measured 2026-08-14: that alias is wrong for the 15 hand-authored
-# snippets under docs-site/src/snippets/wasm/ (9 .md + 6 .ts), which DO import
-# `@xberg-io/xberg-wasm` and therefore fail this session with 18 x TS2307
-# "cannot find module". An earlier revision of this comment asserted that none
-# of them existed; it only surveyed the typescript/ directory.
-# They cannot be routed the generated tree's way either: `target:` lives in
-# markdown frontmatter, 0 of the 419 hand-authored snippets carry frontmatter at
-# all, and 6 of these 15 are raw `.ts` files that cannot carry any. Selecting a
-# session per directory is the missing capability; raised upstream. ~keep
+# Aliased to the node package because every hand-authored snippet under
+# docs-site/src/snippets/typescript/ imports `@xberg-io/xberg`. The handwritten
+# Markdown snippets under docs-site/src/snippets/wasm/ declare `target: wasm`
+# explicitly, so Alef validates them against the WASM session below. ~keep
 [workspace.docs.snippets.sessions.typescript]
 cwd = "crates/xberg-node"
 manifest = "crates/xberg-node/package.json"
@@ -201,7 +262,7 @@ manifest = "packages/kotlin-android/build.gradle.kts"
 # sixteen languages unmeasured. Kotlin's reported count is then artifact
 # absence, NOT snippet quality, and must not be read as the latter. ~keep
 before = [
-  'sdk=$(command -v sdkmanager || true); if [ -z "${ANDROID_HOME:-}" ] && [ -n "$sdk" ]; then ANDROID_HOME=$(cd "$(dirname "$sdk")/../../.." && pwd); export ANDROID_HOME; fi; if [ -z "${ANDROID_HOME:-}" ]; then echo "alef: no Android SDK (ANDROID_HOME unset, sdkmanager not on PATH); skipping gradle assembleDebug"; elif [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then echo "alef: gradle/wrapper/gradle-wrapper.jar is absent; skipping gradle assembleDebug"; else ./gradlew assembleDebug || echo "alef: gradle assembleDebug FAILED; Kotlin snippets will fail typecheck (the io.xberg classes will be absent) instead of zeroing every other language"; fi',
+  'sdk=$(command -v sdkmanager || true); if [ -z "${ANDROID_HOME:-}" ] && [ -n "$sdk" ]; then ANDROID_HOME=$(cd "$(dirname "$sdk")/../../.." && pwd); export ANDROID_HOME; fi; if [ -z "${ANDROID_HOME:-}" ]; then echo "alef: no Android SDK (ANDROID_HOME unset, sdkmanager not on PATH); skipping gradle assembleDebug"; elif [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then echo "alef: gradle/wrapper/gradle-wrapper.jar is absent; skipping gradle assembleDebug"; else ./gradlew assembleDebug; fi',
 ]
 
 [workspace.docs.snippets.sessions.kotlin_android]
@@ -227,7 +288,7 @@ manifest = "packages/kotlin-android/build.gradle.kts"
 # sixteen languages unmeasured. Kotlin's reported count is then artifact
 # absence, NOT snippet quality, and must not be read as the latter. ~keep
 before = [
-  'sdk=$(command -v sdkmanager || true); if [ -z "${ANDROID_HOME:-}" ] && [ -n "$sdk" ]; then ANDROID_HOME=$(cd "$(dirname "$sdk")/../../.." && pwd); export ANDROID_HOME; fi; if [ -z "${ANDROID_HOME:-}" ]; then echo "alef: no Android SDK (ANDROID_HOME unset, sdkmanager not on PATH); skipping gradle assembleDebug"; elif [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then echo "alef: gradle/wrapper/gradle-wrapper.jar is absent; skipping gradle assembleDebug"; else ./gradlew assembleDebug || echo "alef: gradle assembleDebug FAILED; Kotlin snippets will fail typecheck (the io.xberg classes will be absent) instead of zeroing every other language"; fi',
+  'sdk=$(command -v sdkmanager || true); if [ -z "${ANDROID_HOME:-}" ] && [ -n "$sdk" ]; then ANDROID_HOME=$(cd "$(dirname "$sdk")/../../.." && pwd); export ANDROID_HOME; fi; if [ -z "${ANDROID_HOME:-}" ]; then echo "alef: no Android SDK (ANDROID_HOME unset, sdkmanager not on PATH); skipping gradle assembleDebug"; elif [ ! -f gradle/wrapper/gradle-wrapper.jar ]; then echo "alef: gradle/wrapper/gradle-wrapper.jar is absent; skipping gradle assembleDebug"; else ./gradlew assembleDebug; fi',
 ]
 
 [workspace.docs.snippets.sessions.swift]
@@ -258,7 +319,7 @@ manifest = "packages/swift/Package.swift"
 # and take the whole snippet run down, exactly the failure mode this guard
 # exists to prevent. ~keep
 before = [
-  'if ! command -v swift >/dev/null 2>&1; then echo "alef: swift not on PATH; skipping cargo build (Swift snippets will fail typecheck)"; elif [ -f ../../target/release/libxberg_swift.a ] && [ -f ../../target/release/libxberg_ffi.a ]; then echo "alef: release staticlibs already built; skipping cargo build"; elif [ -f ../../target/debug/libxberg_swift.a ] && [ -f ../../target/debug/libxberg_ffi.a ]; then echo "alef: debug staticlibs already built; skipping cargo build"; else cargo build --manifest-path rust/Cargo.toml -p xberg-swift -p xberg-ffi || echo "alef: cargo build -p xberg-swift -p xberg-ffi failed; Swift snippets will fail typecheck (Xberg module unavailable), other languages unaffected"; fi; true',
+  'if ! command -v swift >/dev/null 2>&1; then echo "alef: swift not on PATH; skipping cargo build (Swift snippets will fail typecheck)"; elif [ -f ../../target/release/libxberg_swift.a ] && [ -f ../../target/release/libxberg_ffi.a ]; then echo "alef: release staticlibs already built; skipping cargo build"; elif [ -f ../../target/debug/libxberg_swift.a ] && [ -f ../../target/debug/libxberg_ffi.a ]; then echo "alef: debug staticlibs already built; skipping cargo build"; else cargo build --manifest-path rust/Cargo.toml -p xberg-swift -p xberg-ffi; fi',
 ]
 
 [workspace.docs.snippets.sessions.zig]
@@ -722,11 +783,12 @@ roots = ["crawlberg::CrawlConfig", "crawlberg::MapResult"]
 
 [[crates.source_crates]]
 name = "html-to-markdown-rs"
-sources = [
-  "../html-to-markdown/crates/html-to-markdown/src/options/conversion.rs",
-  "../html-to-markdown/crates/html-to-markdown/src/options/preprocessing.rs",
-  "../html-to-markdown/crates/html-to-markdown/src/options/validation.rs",
-]
+# Read from the vendored registry copy, not a sibling checkout. html-to-markdown-rs is a
+# plain registry dependency, so `../html-to-markdown/...` only resolves in a developer
+# checkout that happens to sit next to that repo — it is absent on CI and in any git
+# worktree, where it aborts the run with "failed to compute sources hash". ~keep
+from_registry = true
+sources = ["src/options/conversion.rs", "src/options/preprocessing.rs", "src/options/validation.rs"]
 roots = ["html_to_markdown_rs::ConversionOptions"]
 
 [crates.extra_dependencies]
@@ -832,6 +894,9 @@ default_features = false
 
 [crates.ruby]
 gem_name = "xberg"
+# Keep HEIC out of generated wrapper defaults and the core dependency so the
+# MinGW target override cannot be widened back to the unsupported full set.
+excluded_default_features = ["heic"]
 exclude_functions = [
   "calculate_quality_score",
   "count_tokens",
@@ -1109,6 +1174,8 @@ exclude_functions = [
   "embed_sparse_async",
   "embed_multi_vector",
   "embed_multi_vector_async",
+  "max_sim_rank",
+  "max_sim_score",
   # Infallible return type; alef emits a compile_error! rather than a binding for it. Excluded
   # here per that error's own remedy -- `xberg doctor` inspects host backends and model caches,
   # neither of which exists in a browser. ~keep
@@ -1136,7 +1203,16 @@ wasm-bindgen-test = "0.3"
 # symbols export regardless of module visibility, cbindgen parses the whole crate,
 # and a glob re-export would risk colliding with generated crate-root items. ~keep
 [crates.custom_modules]
-ffi = ["cancellation", "config_builder", "config"]
+# Emptied when the three hand-written modules it named were deleted. alef only
+# *declares* a custom module in the generated lib.rs; it never generates the
+# contents, so every name here must have a hand-written file behind it or
+# generation aborts. `cancellation`, `config_builder` and `config` had rotted --
+# 2073 lines and 34 `extern "C"` fns referencing `crate::helpers`,
+# `crate::ffi_panic_guard` and `config/{html,parse}.rs`, none of which exist --
+# and were never in the shipped ABI: not one appeared among the 2525
+# declarations in `include/xberg.h`, because no `mod` statement ever compiled
+# them. Re-add a name here only alongside a module that builds. ~keep
+ffi = []
 
 [crates.ffi]
 prefix = "xberg"
@@ -1147,13 +1223,38 @@ visitor_callbacks = false
 # swift-bridge shim can depend on `xberg-ffi` with that feature — heic's
 # `libheif-sys` build.rs cannot cross-compile. Not part of the auto-generated
 # passthrough set, so it must be listed here.
-extra_features = ["full-no-heic"]
+#
+# `pdf-pdfium` is here for the same reason and must stay out of `default`: the
+# engine dlopen()s libpdfium at run time, so compiling it in by default would
+# hand every FFI consumer a backend that fails with MissingDependency unless
+# they install the library themselves. Declaring it here gives the go/csharp/
+# zig/java/C consumers who build libxberg_ffi themselves a documented opt-in at
+# zero cost to everyone else. `extra_features` exists only on `[crates.ffi]`
+# and `[crates.wasm]`, so the other bindings have no declare-only key and
+# cannot be given the same opt-in without an alef change.
+#
+# `ocr-wasm` appears in emitted `any(feature = "ocr", feature = "ocr-wasm")`
+# gates. Alef declares every discovered gate and otherwise enables it by default,
+# even though desktop FFI already satisfies those gates through `ocr`. Keep the
+# WASM alternative declared for opt-in builds without pulling it into native
+# artifacts.
+#
+# `candle-ocr` is discovered from cfg gates elsewhere in the shared OCR surface,
+# but native FFI packages do not ship Candle model backends. Declare the feature
+# without enabling it by default so those artifacts remain lean and portable. ~keep
+extra_features = ["full-no-heic", "pdf-pdfium", "ocr-wasm", "candle-ocr"]
 # Feature list for the desktop `cfg(not(any(android,ios,windows,macos-x86_64)))`
 # core dep. Without this override the FFI crate inherits the global
 # `[[crates]].features`, whose first entry is `full` — that pulls `heic`
 # (`libheif-sys`, no pkg-config cross-compile support) and `candle-*` into the
 # swift-bundle's cross-compiled desktop dep, which broke Swift publishing in
-# v1.0.12. This is the v1.0.11 granular floor: `full` minus heic/candle. ~keep
+# v1.0.12. This is the v1.0.11 granular floor: `full` minus heic/candle.
+#
+# Go, Java, C#, and Zig consume this one native library. Their feature arrays
+# below MUST remain byte-for-byte equivalent to this list: Alef filters each
+# host surface using its own literal feature names and cannot reference a shared
+# TOML array. Language-specific exclusions belong in exclude_types/functions,
+# not in divergent feature lists. ~keep
 features = [
   "pdf",
   # GH#1387: these eight must be listed explicitly here. alef matches the LITERAL
@@ -1172,6 +1273,7 @@ features = [
   "xml",
   "qr-codes",
   "ocr",
+  "sceptre-ocr",
   "paddle-ocr",
   "paddle-ocr-types",
   "layout-detection",
@@ -1185,6 +1287,7 @@ features = [
   "late-interaction",
   "late-interaction-presets",
   "chunking",
+  "chunking-tokenizers",
   "keywords-yake",
   "keywords-rake",
   "language-detection",
@@ -1216,6 +1319,7 @@ features = [
   "heuristics",
   "presets",
   "structured",
+  "url-config-types",
   "url-ingestion",
 ]
 plugin_error_constructor = "xberg::XbergError::Plugin { message: msg, plugin_name: String::new() }"
@@ -1321,6 +1425,68 @@ default_features = false
 [crates.go]
 module = "github.com/xberg-io/xberg/packages/go"
 package_name = "xberg"
+# Must match `[crates.ffi].features`; all four host bindings link the same
+# generated native library, and Alef filters cfg-gated glue by this literal list. ~keep
+features = [
+  "pdf",
+  "excel",
+  "hwp",
+  "hwpx",
+  "iwork",
+  "wordperfect",
+  "mdx",
+  "xml",
+  "qr-codes",
+  "ocr",
+  "sceptre-ocr",
+  "paddle-ocr",
+  "paddle-ocr-types",
+  "layout-detection",
+  "layout-types",
+  "embeddings",
+  "embedding-presets",
+  "reranker",
+  "reranker-presets",
+  "sparse-embeddings",
+  "sparse-embedding-presets",
+  "late-interaction",
+  "late-interaction-presets",
+  "chunking",
+  "chunking-tokenizers",
+  "keywords-yake",
+  "keywords-rake",
+  "language-detection",
+  "html",
+  "tree-sitter",
+  "office",
+  "email",
+  "archives",
+  "stopwords",
+  "auto-rotate",
+  "auto-rotate-types",
+  "tokio-runtime",
+  "api",
+  "api-types",
+  "mcp",
+  "liter-llm",
+  "quality",
+  "svg",
+  "transcription",
+  "transcription-types",
+  "classification",
+  "captioning",
+  "ner-onnx",
+  "ner-llm",
+  "diff",
+  "markdown-footnotes",
+  "redaction",
+  "enrichment",
+  "heuristics",
+  "presets",
+  "structured",
+  "url-config-types",
+  "url-ingestion",
+]
 exclude_functions = [
   "calculate_quality_score",
   "count_tokens",
@@ -1405,10 +1571,19 @@ exclude_types = []
 [crates.java]
 package = "io.xberg"
 ffi_style = "panama"
+# Must match `[crates.ffi].features`; Java binds that exact native ABI. ~keep
 features = [
-  "full",
   "pdf",
+  "excel",
+  "hwp",
+  "hwpx",
+  "iwork",
+  "wordperfect",
+  "mdx",
+  "xml",
+  "qr-codes",
   "ocr",
+  "sceptre-ocr",
   "paddle-ocr",
   "paddle-ocr-types",
   "layout-detection",
@@ -1422,22 +1597,40 @@ features = [
   "late-interaction",
   "late-interaction-presets",
   "chunking",
+  "chunking-tokenizers",
   "keywords-yake",
   "keywords-rake",
   "language-detection",
   "html",
+  "tree-sitter",
   "office",
   "email",
   "archives",
   "stopwords",
   "auto-rotate",
   "auto-rotate-types",
-  "tree-sitter",
   "tokio-runtime",
   "api",
+  "api-types",
   "mcp",
   "liter-llm",
   "quality",
+  "svg",
+  "transcription",
+  "transcription-types",
+  "classification",
+  "captioning",
+  "ner-onnx",
+  "ner-llm",
+  "diff",
+  "markdown-footnotes",
+  "redaction",
+  "enrichment",
+  "heuristics",
+  "presets",
+  "structured",
+  "url-config-types",
+  "url-ingestion",
 ]
 exclude_types = ["OcrBackendType", "ProcessingStage"]
 exclude_functions = [
@@ -1562,7 +1755,75 @@ namespace = "io.xberg"
 artifact_id = "xberg-android"
 group_id = "io.xberg"
 abis = ["arm64-v8a", "x86_64"]
-features = ["full"]
+# Alef matches cfg gates literally and does not expand Cargo aggregates. Keep
+# `android-target` for the actual runtime, then spell out its Android-safe leaf
+# surface so generated Kotlin/JNI glue retains every available DTO and method
+# without exposing desktop ORT-only APIs. ~keep
+features = [
+  "android-target",
+  "no-ort-target",
+  "pdf",
+  "pdf-native",
+  "html",
+  "notebook",
+  "xml",
+  "email",
+  "language-detection",
+  "chunking",
+  "chunking-tokenizers",
+  "quality",
+  "keywords",
+  "keywords-yake",
+  "keywords-rake",
+  "markdown-footnotes",
+  "enrichment",
+  "heuristics",
+  "office",
+  "iwork",
+  "hwp",
+  "mdx",
+  "archives",
+  "stopwords",
+  "embedding-presets",
+  "static-embeddings",
+  "reranker-presets",
+  "sparse-embedding-presets",
+  "late-interaction-presets",
+  "layout-types",
+  "auto-rotate-types",
+  "paddle-ocr-types",
+  "ner",
+  "presets",
+  "redaction",
+  "summarization",
+  "qr-codes",
+  "svg",
+  "image-encode",
+  "transcription-types",
+  "excel",
+  "tree-sitter",
+  "ocr",
+  "ocr-pipeline",
+  "sceptre-ocr-tract",
+  "tract",
+  "auto-rotate-tract",
+  "layout-tract",
+  "paddle-ocr-tract",
+  "api",
+  "api-types",
+  "tower-service",
+  "mcp",
+  "liter-llm",
+  "structured",
+  "hwpx",
+  "diff",
+  "classification",
+  "captioning",
+  "ner-llm",
+  "url-config-types",
+  "url-ingestion",
+  "tokio-runtime",
+]
 exclude_types = []
 exclude_functions = [
   "embed_texts_async",
@@ -1742,31 +2003,71 @@ cfg = 'any(target_os = "ios", target_os = "android")'
 features = ["android-target"]
 default_features = false
 
-# NOTE (heic / xberg-ffi on the swift-bridge shim):
-# The swift-bridge backend injects an `xberg-ffi` path dependency (the C-ABI
-# shim) with Cargo-default features. That pulls xberg-ffi's default `heic`
-# cannot cross-compile, breaking every cross-compiled xberg-swift target
-# (x86_64-apple-darwin; Linux via zigbuild). alef hardcodes this injection
-# (src/backends/swift/gen_rust_crate/cargo.rs) with no `default-features`
-# control, and it is NOT covered by the swift crate's `excluded_default_features`
-# / `target_dep_overrides` (those govern only the primary `xberg` core dep). An
-# `extra_dependencies.xberg-ffi` entry does NOT override it — it emits a SECOND
-# `xberg-ffi` key, a duplicate-key manifest that poisons the workspace mid-regen.
-# So we do NOT declare it here. Instead `packages/swift/rust/Cargo.toml` carries
-# a committed post-regen normalization: its single unconditional `xberg-ffi` line
-# is split into two `[target.cfg(...)]` blocks, mirroring the `xberg` dep below —
-# `default-features = false` + `full-no-heic` off-iOS/Android, `android-target` on
-# iOS/Android. A plain unconditional `full-no-heic` pulls in `sceptre-ocr` (->
-# `sceptre-ocr-ort`), which trips the mobile-only `compile_error!` guards in
-# crates/xberg/src/lib.rs (issue #324) because Cargo unifies features across
-# dependency edges for the same resolved package. That edit is stable for
-# CI/publish (no CI job regenerates `packages/` + diffs), but a local `alef all`
-# reverts it — reapply it. Durable fix is upstream in alef.
-
 [crates.csharp]
 namespace = "Xberg"
 package_id = "XbergIo.Xberg"
 project_file = "packages/csharp/Xberg/Xberg.csproj"
+# Must match `[crates.ffi].features`; C# binds that exact native ABI. ~keep
+features = [
+  "pdf",
+  "excel",
+  "hwp",
+  "hwpx",
+  "iwork",
+  "wordperfect",
+  "mdx",
+  "xml",
+  "qr-codes",
+  "ocr",
+  "sceptre-ocr",
+  "paddle-ocr",
+  "paddle-ocr-types",
+  "layout-detection",
+  "layout-types",
+  "embeddings",
+  "embedding-presets",
+  "reranker",
+  "reranker-presets",
+  "sparse-embeddings",
+  "sparse-embedding-presets",
+  "late-interaction",
+  "late-interaction-presets",
+  "chunking",
+  "chunking-tokenizers",
+  "keywords-yake",
+  "keywords-rake",
+  "language-detection",
+  "html",
+  "tree-sitter",
+  "office",
+  "email",
+  "archives",
+  "stopwords",
+  "auto-rotate",
+  "auto-rotate-types",
+  "tokio-runtime",
+  "api",
+  "api-types",
+  "mcp",
+  "liter-llm",
+  "quality",
+  "svg",
+  "transcription",
+  "transcription-types",
+  "classification",
+  "captioning",
+  "ner-onnx",
+  "ner-llm",
+  "diff",
+  "markdown-footnotes",
+  "redaction",
+  "enrichment",
+  "heuristics",
+  "presets",
+  "structured",
+  "url-config-types",
+  "url-ingestion",
+]
 exclude_functions = [
   "calculate_quality_score",
   "count_tokens",
@@ -1789,6 +2090,67 @@ exclude_functions = [
 
 [crates.zig]
 module_name = "xberg"
+# Must match `[crates.ffi].features`; Zig binds that exact native ABI. ~keep
+features = [
+  "pdf",
+  "excel",
+  "hwp",
+  "hwpx",
+  "iwork",
+  "wordperfect",
+  "mdx",
+  "xml",
+  "qr-codes",
+  "ocr",
+  "sceptre-ocr",
+  "paddle-ocr",
+  "paddle-ocr-types",
+  "layout-detection",
+  "layout-types",
+  "embeddings",
+  "embedding-presets",
+  "reranker",
+  "reranker-presets",
+  "sparse-embeddings",
+  "sparse-embedding-presets",
+  "late-interaction",
+  "late-interaction-presets",
+  "chunking",
+  "chunking-tokenizers",
+  "keywords-yake",
+  "keywords-rake",
+  "language-detection",
+  "html",
+  "tree-sitter",
+  "office",
+  "email",
+  "archives",
+  "stopwords",
+  "auto-rotate",
+  "auto-rotate-types",
+  "tokio-runtime",
+  "api",
+  "api-types",
+  "mcp",
+  "liter-llm",
+  "quality",
+  "svg",
+  "transcription",
+  "transcription-types",
+  "classification",
+  "captioning",
+  "ner-onnx",
+  "ner-llm",
+  "diff",
+  "markdown-footnotes",
+  "redaction",
+  "enrichment",
+  "heuristics",
+  "presets",
+  "structured",
+  "url-config-types",
+  "url-ingestion",
+]
 exclude_functions = [
   "calculate_quality_score",
   "count_tokens",
@@ -1826,22 +2188,10 @@ dart = "packages/dart/lib/src/"
 zig = "packages/zig/src/"
 
 [crates.exclude]
-fields = [
-  "ConversionOptions.output_format",
-  "ConversionOptions.include_document_structure",
-  "ConversionOptions.extract_images",
-  # tier_strategy pulls in TierStrategy, whose Tier1 variant is #[cfg(feature = "testkit")]
-  "ConversionOptions.tier_strategy",
-]
 types = [
-  "Pool",
-
   "SplitConfig",
   "SplitStrategy",
   "SplitSegment",
-  "xberg::core::split::SplitConfig",
-  "xberg::core::split::SplitStrategy",
-  "xberg::core::split::SplitSegment",
 
   "xberg::extraction::docx::parser::Table",
   "xberg::extraction::docx::parser::TableCell",
@@ -1852,34 +2202,22 @@ types = [
 
   "GlineBackend",
   "LlmBackend",
-  "xberg::text::ner::llm::LlmBackend",
 
   "xberg::chunking::semantic::merge::Segment",
 
   "NerBackend",
-  "xberg::text::ner::backend::NerBackend",
 
   "EnrichmentConfig",
   "EnrichedResult",
-  "xberg::enrich::EnrichmentConfig",
-  "xberg::enrich::EnrichedResult",
   "NerEnrichmentConfig",
-  "xberg::enrich::NerEnrichmentConfig",
   "ClassificationEnrichmentConfig",
-  "xberg::enrich::ClassificationEnrichmentConfig",
   "CaptioningEnrichmentConfig",
-  "xberg::enrich::CaptioningEnrichmentConfig",
 
-  "EnrichOptions",
-  "EnrichResult",
-  "EnrichStatus",
   "xberg::enrichment::EnrichOptions",
   "xberg::enrichment::EnrichResult",
   "xberg::enrichment::EnrichStatus",
   "ChunkPlan",
   "ChunkingDecision",
-  "xberg::heuristics::decision::ChunkPlan",
-  "xberg::heuristics::decision::ChunkingDecision",
   "ChunkingResult",
   "ConfidenceSignals",
   "ConfidenceWeights",
@@ -1888,39 +2226,11 @@ types = [
   "StructuredInput",
   "StructuredThresholds",
   "StructuredCallMode",
-  "StructuredOptions",
-  "StructuredOutput",
-  "StructuredError",
-  "PresetSpec",
-  "VisionConfig",
-
-  "ClassifyContext",
   "xberg::text::classification::page_classifier::ClassifyContext",
 
-  "BatchBytesItem",
-  "BatchFileItem",
-
-  "SyncExtractor",
-
-  "Engine",
-  "EngineBuilder",
   "xberg::engine::Engine",
   "xberg::engine::EngineBuilder",
 
-  "CacheBackend",
-  "NoopCache",
-  "ProgressSink",
-  "ProgressEvent",
-  "NoopProgressSink",
-  "StructuredPolicy",
-  "DefaultStructuredPolicy",
-  "PresetResolver",
-  "CorePresetResolver",
-  "LlmClient",
-  "LiterLlmClient",
-  "ModelProvider",
-  "DefaultModelProvider",
-  "ModelId",
   "xberg::engine::seams::CacheBackend",
   "xberg::engine::seams::NoopCache",
   "xberg::engine::seams::ProgressSink",
@@ -1936,16 +2246,6 @@ types = [
   "xberg::engine::seams::DefaultModelProvider",
   "xberg::engine::seams::ModelId",
 
-  "PageImage",
-  "RasterizeError",
-  "Batch",
-  "ChunkerConfig",
-  "Outcome",
-  "MergedOutput",
-  "CitationSource",
-  "CitedField",
-  "CitationOutput",
-  "BuiltPrompt",
   "xberg::engine::structured::rasterize::PageImage",
   "xberg::engine::structured::rasterize::RasterizeError",
   "xberg::engine::structured::chunk::Batch",
@@ -1957,35 +2257,14 @@ types = [
   "xberg::engine::structured::citations::CitationOutput",
   "xberg::engine::structured::prompts::BuiltPrompt",
 
-  "FinalizedOutput",
   "xberg::engine::structured::finalize::FinalizedOutput",
 
-  "ParsedDocument",
   "xberg::engine::parsed::ParsedDocument",
 ]
 methods = [
-  "ApiError.from",
-
-  # Hand-written redacting Debug impls that keep api_key and header values out of
-  # logs. `fmt` takes a std::fmt::Formatter, which has no binding representation.
-  "LlmConfig.fmt",
-  "BedrockConfig.fmt",
-
-  "BBox.fmt",
-  "LayoutDetection.fmt",
-  "PooledString.fmt",
-
-  "PooledString.deref",
-  "PooledString.deref_mut",
-  "PooledString.buffer_mut",
-
-  "BBox.center",
-  "TessdataManager.manifest",
-
   "LayoutDetection.class",
   "LayoutRegion.class",
 
-  "ModelCache.new",
   "MetricsLayer.layer",
   "MultipartApi.from_request",
 
@@ -1999,7 +2278,6 @@ functions = [
   # an FFI wrapper the ffi crate's feature set cannot satisfy. A prometheus
   # Registry is not a meaningful C-ABI/binding surface in any case.
   "init_prometheus",
-  "xberg::telemetry::init_prometheus",
   "fuse",
   "build_prompt",
   "build_vision_fallback_prompt",
@@ -2008,19 +2286,15 @@ functions = [
   # Wraps build_vision_fallback_prompt with the threshold decision; returns
   # Option<BuiltPrompt>, and BuiltPrompt is already excluded above.
   "escalate_if_below_threshold",
-  # Returns Vec<(u32, u32, Vec<u32>)> -- a bare tuple with no binding
-  # representation. Internal Whisper token-stream helper.
+  "build_decoder_prompt_tokens",
+  "timestamp_token_to_ms",
   "parse_timestamped_segments",
+  "install_pdf_render_diagnostics",
+  "take_xberg_native_pdf_render_warnings",
+  "ensure_initialized",
   "batch_pages",
   "pages_for_call",
   "validate_and_merge",
-  "xberg::engine::structured::citations::fuse",
-  "xberg::engine::structured::prompts::build_prompt",
-  "xberg::engine::structured::prompts::build_vision_fallback_prompt",
-  "xberg::engine::structured::chunk::batch_pages",
-  "xberg::engine::structured::rasterize::pages_for_call",
-  "xberg::engine::structured::schema::validate_and_merge",
-
   "apply_strategy",
 
   "classify_one",
@@ -2036,7 +2310,6 @@ functions = [
   "classify_text",
   "chunk_for_rag",
   "embed_texts",
-  "embed_texts_async",
   "get_embedding_preset",
   "list_embedding_presets",
   "rerank",
@@ -2046,12 +2319,7 @@ functions = [
 
   "enrich",
 
-  "extract_structured",
-  "extract_structured_sync",
-  "extract_structured_json",
   "split_and_extract",
-  "split_and_extract_sync",
-  "split_and_extract_json",
 
   "analyze_document",
   "analyze_with_user_chunks",
@@ -2089,17 +2357,6 @@ functions = [
   "known_models",
   "register_builtin",
   "resolve",
-
-  "extract_sync",
-  "extract_batch_sync",
-  "extract_bytes",
-  "extract_bytes_sync",
-  "extract_file",
-  "extract_file_sync",
-  "batch_extract_bytes",
-  "batch_extract_bytes_sync",
-  "batch_extract_files",
-  "batch_extract_files_sync",
 
   # Both take `TokenizerSource<'a>`, a borrowed enum whose four variants mean
   # different things (HF model ID, model+revision pair, local `tokenizer.json`
@@ -2203,7 +2460,7 @@ e2e = "bash scripts/e2e/run-with-mock-server.sh bash -c 'cd e2e/swift_e2e && swi
 [crates.test.dart]
 precondition = "command -v dart >/dev/null 2>&1"
 before = """
-{ command -v flutter_rust_bridge_codegen >/dev/null 2>&1 || cargo install flutter_rust_bridge_codegen --version 2.12.0; } && \
+{ command -v flutter_rust_bridge_codegen >/dev/null 2>&1 || cargo install flutter_rust_bridge_codegen --version 2.13.0; } && \
 cd packages/dart && dart pub get && cd rust && \
 { \
   INPUT_HASH=$(printf '%s' "$(cat src/lib.rs flutter_rust_bridge.yaml)" | shasum | cut -d' ' -f1); \
@@ -2624,7 +2881,7 @@ module = "xberg"
 
 [crates.e2e.calls.clear_ocr_backends]
 result_is_simple = true
-function = ""
+function = "clear_ocr_backends"
 module = ""
 async = false
 returns_result = false
@@ -2645,7 +2902,6 @@ module = "xberg"
 
 [crates.e2e.calls.clear_ocr_backends.overrides.go]
 function = "ClearOCRBackends"
-module = "xberg"
 
 [crates.e2e.calls.clear_ocr_backends.overrides.ruby]
 function = "clear_ocr_backends"
@@ -2657,7 +2913,6 @@ module = "Xberg"
 
 [crates.e2e.calls.clear_ocr_backends.overrides.java]
 function = "clearOcrBackends"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.clear_ocr_backends.overrides.csharp]
 function = "ClearOcrBackends"
@@ -2690,7 +2945,7 @@ class = "OcrBackendBridge"
 
 [crates.e2e.calls.clear_post_processors]
 result_is_simple = true
-function = ""
+function = "clear_post_processors"
 module = ""
 async = false
 returns_result = false
@@ -2711,7 +2966,6 @@ module = "xberg"
 
 [crates.e2e.calls.clear_post_processors.overrides.go]
 function = "ClearPostProcessors"
-module = "xberg"
 
 [crates.e2e.calls.clear_post_processors.overrides.ruby]
 function = "clear_post_processors"
@@ -2723,7 +2977,6 @@ module = "Xberg"
 
 [crates.e2e.calls.clear_post_processors.overrides.java]
 function = "clearPostProcessors"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.clear_post_processors.overrides.csharp]
 function = "ClearPostProcessors"
@@ -2756,7 +3009,7 @@ class = "PostProcessorBridge"
 
 [crates.e2e.calls.clear_validators]
 result_is_simple = true
-function = ""
+function = "clear_validators"
 module = ""
 async = false
 returns_result = false
@@ -2777,7 +3030,6 @@ module = "xberg"
 
 [crates.e2e.calls.clear_validators.overrides.go]
 function = "ClearValidators"
-module = "xberg"
 
 [crates.e2e.calls.clear_validators.overrides.ruby]
 function = "clear_validators"
@@ -2789,7 +3041,6 @@ module = "Xberg"
 
 [crates.e2e.calls.clear_validators.overrides.java]
 function = "clearValidators"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.clear_validators.overrides.csharp]
 function = "ClearValidators"
@@ -2822,7 +3073,7 @@ class = "ValidatorBridge"
 
 [crates.e2e.calls.unregister_ocr_backend]
 result_is_simple = true
-function = ""
+function = "unregister_ocr_backend"
 module = ""
 async = false
 returns_result = false
@@ -2843,7 +3094,6 @@ module = "xberg"
 
 [crates.e2e.calls.unregister_ocr_backend.overrides.go]
 function = "UnregisterOCRBackend"
-module = "xberg"
 
 [crates.e2e.calls.unregister_ocr_backend.overrides.ruby]
 function = "unregister_ocr_backend"
@@ -2855,7 +3105,6 @@ module = "Xberg"
 
 [crates.e2e.calls.unregister_ocr_backend.overrides.java]
 function = "unregisterOcrBackend"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.unregister_ocr_backend.overrides.csharp]
 function = "UnregisterOcrBackend"
@@ -2888,7 +3137,7 @@ class = "OcrBackendBridge"
 
 [crates.e2e.calls.unregister_post_processor]
 result_is_simple = true
-function = ""
+function = "unregister_post_processor"
 module = ""
 async = false
 returns_result = false
@@ -2909,7 +3158,6 @@ module = "xberg"
 
 [crates.e2e.calls.unregister_post_processor.overrides.go]
 function = "UnregisterPostProcessor"
-module = "xberg"
 
 [crates.e2e.calls.unregister_post_processor.overrides.ruby]
 function = "unregister_post_processor"
@@ -2921,7 +3169,6 @@ module = "Xberg"
 
 [crates.e2e.calls.unregister_post_processor.overrides.java]
 function = "unregisterPostProcessor"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.unregister_post_processor.overrides.csharp]
 function = "UnregisterPostProcessor"
@@ -2954,7 +3201,7 @@ class = "PostProcessorBridge"
 
 [crates.e2e.calls.unregister_validator]
 result_is_simple = true
-function = ""
+function = "unregister_validator"
 module = ""
 async = false
 returns_result = false
@@ -2975,7 +3222,6 @@ module = "xberg"
 
 [crates.e2e.calls.unregister_validator.overrides.go]
 function = "UnregisterValidator"
-module = "xberg"
 
 [crates.e2e.calls.unregister_validator.overrides.ruby]
 function = "unregister_validator"
@@ -2987,7 +3233,6 @@ module = "Xberg"
 
 [crates.e2e.calls.unregister_validator.overrides.java]
 function = "unregisterValidator"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.unregister_validator.overrides.csharp]
 function = "UnregisterValidator"
@@ -3020,7 +3265,7 @@ class = "ValidatorBridge"
 
 [crates.e2e.calls.register_ocr_backend]
 result_is_simple = true
-function = ""
+function = "register_ocr_backend"
 module = ""
 async = false
 returns_result = false
@@ -3041,7 +3286,6 @@ module = "xberg"
 
 [crates.e2e.calls.register_ocr_backend.overrides.go]
 function = "RegisterOCRBackend"
-module = "xberg"
 
 [crates.e2e.calls.register_ocr_backend.overrides.ruby]
 function = "register_ocr_backend"
@@ -3053,7 +3297,6 @@ module = "Xberg"
 
 [crates.e2e.calls.register_ocr_backend.overrides.java]
 function = "registerOcrBackend"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.register_ocr_backend.overrides.csharp]
 function = "RegisterOcrBackend"
@@ -3087,7 +3330,7 @@ class = "OcrBackendBridge"
 
 [crates.e2e.calls.register_post_processor]
 result_is_simple = true
-function = ""
+function = "register_post_processor"
 module = ""
 async = false
 returns_result = false
@@ -3108,7 +3351,6 @@ module = "xberg"
 
 [crates.e2e.calls.register_post_processor.overrides.go]
 function = "RegisterPostProcessor"
-module = "xberg"
 
 [crates.e2e.calls.register_post_processor.overrides.ruby]
 function = "register_post_processor"
@@ -3120,7 +3362,6 @@ module = "Xberg"
 
 [crates.e2e.calls.register_post_processor.overrides.java]
 function = "registerPostProcessor"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.register_post_processor.overrides.csharp]
 function = "RegisterPostProcessor"
@@ -3154,7 +3395,7 @@ class = "PostProcessorBridge"
 
 [crates.e2e.calls.register_validator]
 result_is_simple = true
-function = ""
+function = "register_validator"
 module = ""
 async = false
 returns_result = false
@@ -3175,7 +3416,6 @@ module = "xberg"
 
 [crates.e2e.calls.register_validator.overrides.go]
 function = "RegisterValidator"
-module = "xberg"
 
 [crates.e2e.calls.register_validator.overrides.ruby]
 function = "register_validator"
@@ -3187,7 +3427,6 @@ module = "Xberg"
 
 [crates.e2e.calls.register_validator.overrides.java]
 function = "registerValidator"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.register_validator.overrides.csharp]
 function = "RegisterValidator"
@@ -3221,7 +3460,7 @@ class = "ValidatorBridge"
 
 [crates.e2e.calls.register_embedding_backend]
 result_is_simple = true
-function = ""
+function = "register_embedding_backend"
 module = ""
 async = false
 returns_result = false
@@ -3242,7 +3481,6 @@ module = "xberg"
 
 [crates.e2e.calls.register_embedding_backend.overrides.go]
 function = "RegisterEmbeddingBackend"
-module = "xberg"
 
 [crates.e2e.calls.register_embedding_backend.overrides.ruby]
 function = "register_embedding_backend"
@@ -3254,7 +3492,6 @@ module = "Xberg"
 
 [crates.e2e.calls.register_embedding_backend.overrides.java]
 function = "registerEmbeddingBackend"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.register_embedding_backend.overrides.csharp]
 function = "RegisterEmbeddingBackend"
@@ -3288,7 +3525,7 @@ class = "EmbeddingBackendBridge"
 
 [crates.e2e.calls.unregister_embedding_backend]
 result_is_simple = true
-function = ""
+function = "unregister_embedding_backend"
 module = ""
 async = false
 returns_result = false
@@ -3309,7 +3546,6 @@ module = "xberg"
 
 [crates.e2e.calls.unregister_embedding_backend.overrides.go]
 function = "UnregisterEmbeddingBackend"
-module = "xberg"
 
 [crates.e2e.calls.unregister_embedding_backend.overrides.ruby]
 function = "unregister_embedding_backend"
@@ -3321,7 +3557,6 @@ module = "Xberg"
 
 [crates.e2e.calls.unregister_embedding_backend.overrides.java]
 function = "unregisterEmbeddingBackend"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.unregister_embedding_backend.overrides.csharp]
 function = "UnregisterEmbeddingBackend"
@@ -3354,7 +3589,7 @@ class = "EmbeddingBackendBridge"
 
 [crates.e2e.calls.clear_embedding_backends]
 result_is_simple = true
-function = ""
+function = "clear_embedding_backends"
 module = ""
 async = false
 returns_result = false
@@ -3375,7 +3610,6 @@ module = "xberg"
 
 [crates.e2e.calls.clear_embedding_backends.overrides.go]
 function = "ClearEmbeddingBackends"
-module = "xberg"
 
 [crates.e2e.calls.clear_embedding_backends.overrides.ruby]
 function = "clear_embedding_backends"
@@ -3387,7 +3621,6 @@ module = "Xberg"
 
 [crates.e2e.calls.clear_embedding_backends.overrides.java]
 function = "clearEmbeddingBackends"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.clear_embedding_backends.overrides.csharp]
 function = "ClearEmbeddingBackends"
@@ -3421,7 +3654,7 @@ class = "EmbeddingBackendBridge"
 
 [crates.e2e.calls.register_reranker_backend]
 result_is_simple = true
-function = ""
+function = "register_reranker_backend"
 module = ""
 async = false
 returns_result = false
@@ -3442,7 +3675,6 @@ module = "xberg"
 
 [crates.e2e.calls.register_reranker_backend.overrides.go]
 function = "RegisterRerankerBackend"
-module = "xberg"
 
 [crates.e2e.calls.register_reranker_backend.overrides.ruby]
 function = "register_reranker_backend"
@@ -3454,7 +3686,6 @@ module = "Xberg"
 
 [crates.e2e.calls.register_reranker_backend.overrides.java]
 function = "registerRerankerBackend"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.register_reranker_backend.overrides.csharp]
 function = "RegisterRerankerBackend"
@@ -3488,7 +3719,7 @@ class = "RerankerBackendBridge"
 
 [crates.e2e.calls.unregister_reranker_backend]
 result_is_simple = true
-function = ""
+function = "unregister_reranker_backend"
 module = ""
 async = false
 returns_result = false
@@ -3509,7 +3740,6 @@ module = "xberg"
 
 [crates.e2e.calls.unregister_reranker_backend.overrides.go]
 function = "UnregisterRerankerBackend"
-module = "xberg"
 
 [crates.e2e.calls.unregister_reranker_backend.overrides.ruby]
 function = "unregister_reranker_backend"
@@ -3521,7 +3751,6 @@ module = "Xberg"
 
 [crates.e2e.calls.unregister_reranker_backend.overrides.java]
 function = "unregisterRerankerBackend"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.unregister_reranker_backend.overrides.csharp]
 function = "UnregisterRerankerBackend"
@@ -3554,7 +3783,7 @@ class = "RerankerBackendBridge"
 
 [crates.e2e.calls.clear_reranker_backends]
 result_is_simple = true
-function = ""
+function = "clear_reranker_backends"
 module = ""
 async = false
 returns_result = false
@@ -3575,7 +3804,6 @@ module = "xberg"
 
 [crates.e2e.calls.clear_reranker_backends.overrides.go]
 function = "ClearRerankerBackends"
-module = "xberg"
 
 [crates.e2e.calls.clear_reranker_backends.overrides.ruby]
 function = "clear_reranker_backends"
@@ -3587,7 +3815,6 @@ module = "Xberg"
 
 [crates.e2e.calls.clear_reranker_backends.overrides.java]
 function = "clearRerankerBackends"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.clear_reranker_backends.overrides.csharp]
 function = "ClearRerankerBackends"
@@ -3621,7 +3848,7 @@ class = "RerankerBackendBridge"
 
 [crates.e2e.calls.register_tokenizer_backend]
 result_is_simple = true
-function = ""
+function = "register_tokenizer_backend"
 module = ""
 async = false
 returns_result = false
@@ -3642,7 +3869,6 @@ module = "xberg"
 
 [crates.e2e.calls.register_tokenizer_backend.overrides.go]
 function = "RegisterTokenizerBackend"
-module = "xberg"
 
 [crates.e2e.calls.register_tokenizer_backend.overrides.ruby]
 function = "register_tokenizer_backend"
@@ -3654,7 +3880,6 @@ module = "Xberg"
 
 [crates.e2e.calls.register_tokenizer_backend.overrides.java]
 function = "registerTokenizerBackend"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.register_tokenizer_backend.overrides.csharp]
 function = "RegisterTokenizerBackend"
@@ -3688,7 +3913,7 @@ class = "TokenizerBackendBridge"
 
 [crates.e2e.calls.unregister_tokenizer_backend]
 result_is_simple = true
-function = ""
+function = "unregister_tokenizer_backend"
 module = ""
 async = false
 returns_result = false
@@ -3709,7 +3934,6 @@ module = "xberg"
 
 [crates.e2e.calls.unregister_tokenizer_backend.overrides.go]
 function = "UnregisterTokenizerBackend"
-module = "xberg"
 
 [crates.e2e.calls.unregister_tokenizer_backend.overrides.ruby]
 function = "unregister_tokenizer_backend"
@@ -3721,7 +3945,6 @@ module = "Xberg"
 
 [crates.e2e.calls.unregister_tokenizer_backend.overrides.java]
 function = "unregisterTokenizerBackend"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.unregister_tokenizer_backend.overrides.csharp]
 function = "UnregisterTokenizerBackend"
@@ -3754,7 +3977,7 @@ class = "TokenizerBackendBridge"
 
 [crates.e2e.calls.clear_tokenizer_backends]
 result_is_simple = true
-function = ""
+function = "clear_tokenizer_backends"
 module = ""
 async = false
 returns_result = false
@@ -3775,7 +3998,6 @@ module = "xberg"
 
 [crates.e2e.calls.clear_tokenizer_backends.overrides.go]
 function = "ClearTokenizerBackends"
-module = "xberg"
 
 [crates.e2e.calls.clear_tokenizer_backends.overrides.ruby]
 function = "clear_tokenizer_backends"
@@ -3787,7 +4009,6 @@ module = "Xberg"
 
 [crates.e2e.calls.clear_tokenizer_backends.overrides.java]
 function = "clearTokenizerBackends"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.clear_tokenizer_backends.overrides.csharp]
 function = "ClearTokenizerBackends"
@@ -3820,7 +4041,7 @@ class = "TokenizerBackendBridge"
 
 [crates.e2e.calls.register_renderer]
 result_is_simple = true
-function = ""
+function = "register_renderer"
 module = ""
 async = false
 returns_result = false
@@ -3841,7 +4062,6 @@ module = "xberg"
 
 [crates.e2e.calls.register_renderer.overrides.go]
 function = "RegisterRenderer"
-module = "xberg"
 
 [crates.e2e.calls.register_renderer.overrides.ruby]
 function = "register_renderer"
@@ -3853,7 +4073,6 @@ module = "Xberg"
 
 [crates.e2e.calls.register_renderer.overrides.java]
 function = "registerRenderer"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.register_renderer.overrides.csharp]
 function = "RegisterRenderer"
@@ -3887,7 +4106,7 @@ class = "RendererBridge"
 
 [crates.e2e.calls.unregister_renderer]
 result_is_simple = true
-function = ""
+function = "unregister_renderer"
 module = ""
 async = false
 returns_result = false
@@ -3908,7 +4127,6 @@ module = "xberg"
 
 [crates.e2e.calls.unregister_renderer.overrides.go]
 function = "UnregisterRenderer"
-module = "xberg"
 
 [crates.e2e.calls.unregister_renderer.overrides.ruby]
 function = "unregister_renderer"
@@ -3920,7 +4138,6 @@ module = "Xberg"
 
 [crates.e2e.calls.unregister_renderer.overrides.java]
 function = "unregisterRenderer"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.unregister_renderer.overrides.csharp]
 function = "UnregisterRenderer"
@@ -3953,7 +4170,7 @@ class = "RendererBridge"
 
 [crates.e2e.calls.clear_renderers]
 result_is_simple = true
-function = ""
+function = "clear_renderers"
 module = ""
 async = false
 returns_result = false
@@ -3974,7 +4191,6 @@ module = "xberg"
 
 [crates.e2e.calls.clear_renderers.overrides.go]
 function = "ClearRenderers"
-module = "xberg"
 
 [crates.e2e.calls.clear_renderers.overrides.ruby]
 function = "clear_renderers"
@@ -3986,7 +4202,6 @@ module = "Xberg"
 
 [crates.e2e.calls.clear_renderers.overrides.java]
 function = "clearRenderers"
-module = "io.xberg.Xberg"
 
 [crates.e2e.calls.clear_renderers.overrides.csharp]
 function = "ClearRenderers"
@@ -4079,7 +4294,7 @@ path = "../../crates/xberg-wasm/pkg/nodejs"
 CRAWLBERG_ALLOW_PRIVATE_NETWORK = "true"
 
 [crates.e2e.format]
-python = "ruff check --fix {dir} && ruff format {dir}"
+python = "uv run --no-sync ruff check --fix {dir} && uv run --no-sync ruff format {dir}"
 go = "gofmt -w {dir}"
 rust = "(cd {dir} && cargo fmt --all)"
 
@@ -4136,7 +4351,7 @@ name = "Rust"
 package_name = "xberg"
 badge_url = "https://img.shields.io/crates/v/xberg?label=Rust&color=007ec6"
 docs_url = "https://xberg.io/"
-description = "High-performance document intelligence library for Rust. Extract text, tables, metadata, and code intelligence from 101 file formats and 371 programming languages."
+description = "High-performance document intelligence library for Rust. Extract text, tables, metadata, and code intelligence from 100 file formats and 371 programming languages."
 package_manager = ["cargo"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
@@ -4149,7 +4364,7 @@ name = "Python"
 package_name = "xberg"
 badge_url = "https://img.shields.io/pypi/v/xberg?label=Python&color=007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Native Python bindings with async/await support, multiple OCR backends (Tesseract, PaddleOCR, Sceptre), and extensible plugin system."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Native Python bindings with async/await support, multiple OCR backends (Tesseract, PaddleOCR, Sceptre), and extensible plugin system."
 package_manager = ["pip"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
@@ -4163,12 +4378,12 @@ name = "TypeScript (Node.js)"
 package_name = "@xberg-io/xberg"
 badge_url = "https://img.shields.io/npm/v/@xberg-io/xberg?label=TypeScript&color=007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Native NAPI-RS bindings for Node.js with superior performance, async/await support, and TypeScript type definitions."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Native NAPI-RS bindings for Node.js with superior performance, async/await support, and TypeScript type definitions."
 package_manager = ["pnpm"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, config_discovery = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
 optional_sections = ["native_vs_wasm_comparison", "ocr_support", "performance", "napi_implementation"]
-snippets = { basic_extraction = "getting-started/basic_usage.md", async_extraction = "api/client_extract_single_file.md", batch_processing = "getting-started/extract_batch.md", ocr_configuration = "config/config_ocr.md", table_extraction = "api/tables.md", config_discovery = "config/config_discovery.md" }
+snippets = { basic_extraction = "getting-started/basic_usage.md", async_extraction = "api/client_extract_single_file.md", batch_processing = "api/extract_batch.md", ocr_configuration = "config/config_ocr.md", table_extraction = "api/tables.md", config_discovery = "config/config_discovery.md" }
 
 [crates.readme.languages.go]
 template = "go.md"
@@ -4177,7 +4392,7 @@ name = "Go"
 package_name = "github.com/xberg-io/xberg/packages/go"
 badge_url = "https://img.shields.io/github/v/tag/xberg-io/xberg?label=Go&color=007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Go bindings with context-aware async support, idiomatic Go API, and CGO-based native performance."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Go bindings with context-aware async support, idiomatic Go API, and CGO-based native performance."
 package_manager = ["go get"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
@@ -4190,7 +4405,7 @@ name = "Java"
 package_name = "io.xberg:xberg"
 badge_url = "https://img.shields.io/maven-central/v/io.xberg/xberg?label=Java&color=007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Java bindings with type-safe API, Foreign Function & Memory API integration, and native performance."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Java bindings with type-safe API, Foreign Function & Memory API integration, and native performance."
 package_manager = ["maven", "gradle"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
@@ -4203,12 +4418,12 @@ name = "PHP"
 package_name = "xberg-io/xberg"
 badge_url = "https://img.shields.io/packagist/v/xberg-io/xberg?label=PHP&color=007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. PHP bindings with modern PHP 8.2+ support and type-safe API."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. PHP bindings with modern PHP 8.2+ support and type-safe API."
 package_manager = ["composer"]
 features = { ocr = true, async = false, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
 optional_sections = ["composer_installation", "system_requirements"]
-snippets = { basic_extraction = "quickstart/basic_extraction_oop.php", batch_processing = "extraction/batch_processing.php", ocr_configuration = "ocr/basic_ocr.php" }
+snippets = { basic_extraction = "quickstart/basic_extraction_oop.md", batch_processing = "extraction/batch_processing.md", ocr_configuration = "ocr/basic_ocr.md" }
 
 [crates.readme.languages.ruby]
 template = "ruby.md"
@@ -4216,7 +4431,7 @@ name = "Ruby"
 package_name = "xberg"
 badge_url = "https://img.shields.io/gem/v/xberg?label=Ruby&color=007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Ruby bindings with idiomatic Ruby API and native performance."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Ruby bindings with idiomatic Ruby API and native performance."
 package_manager = ["rubygems", "bundler"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
@@ -4229,12 +4444,12 @@ name = "C#"
 package_name = "XbergIo.Xberg"
 badge_url = "https://img.shields.io/nuget/v/XbergIo.Xberg?label=C%23&color=007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. .NET bindings with full type safety, async/await support, and .NET 10.0+ compatibility."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. .NET bindings with full type safety, async/await support, and .NET 10.0+ compatibility."
 package_manager = ["nuget"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
 optional_sections = ["dotnet_installation", "system_requirements"]
-snippets = { basic_extraction = "getting-started/basic_usage.cs", async_extraction = "advanced/async_extraction.cs", batch_processing = "advanced/batch_processing.cs", ocr_configuration = "ocr/tesseract_backend.cs" }
+snippets = { basic_extraction = "getting-started/basic_usage.md", async_extraction = "advanced/async_extraction.md", batch_processing = "advanced/batch_processing.md", ocr_configuration = "ocr/tesseract_backend.md" }
 
 [crates.readme.languages.elixir]
 template = "language_package.md"
@@ -4242,12 +4457,12 @@ name = "Elixir"
 package_name = "xberg"
 badge_url = "https://img.shields.io/hexpm/v/xberg?label=Elixir&color=007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Elixir bindings with native BEAM concurrency, OTP integration, and idiomatic Elixir API."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Elixir bindings with native BEAM concurrency, OTP integration, and idiomatic Elixir API."
 package_manager = ["mix"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
 optional_sections = ["mix_installation", "async_with_tasks", "plugin_system"]
-snippets = { basic_extraction = "getting-started/basic_usage.exs", async_extraction = "core/extract.md", batch_processing = "core/extract_batch.md", ocr_configuration = "ocr/tesseract_basic.md", plugin_system = "plugins/word_count_processor.exs" }
+snippets = { basic_extraction = "getting-started/basic_usage.md", async_extraction = "core/extract.md", batch_processing = "core/extract_batch.md", ocr_configuration = "ocr/tesseract_basic.md", plugin_system = "plugins/word_count_processor.md" }
 
 [crates.readme.languages.wasm]
 template = "language_package.md"
@@ -4256,12 +4471,12 @@ name = "WebAssembly"
 package_name = "@xberg-io/xberg-wasm"
 badge_url = "https://img.shields.io/npm/v/@xberg-io/xberg-wasm?label=WASM&color=007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, and images. WebAssembly bindings for browsers, Deno, and Cloudflare Workers with portable deployment and multi-threading support."
+description = "Extract text, tables, images, and metadata from 100 file formats including PDF, Office documents, and images. WebAssembly bindings for browsers, Deno, and Cloudflare Workers with a single-threaded synchronous core and an async JavaScript surface."
 package_manager = ["pnpm"]
-features = { ocr = true, async = true, plugin_system = true, embeddings = false, code_intelligence = true }
+features = { ocr = true, async = true, plugin_system = true, embeddings = false, code_intelligence = false }
 ocr_backends = ["tesseract-wasm", "sceptre (opt-in worker API)"]
-optional_sections = ["multi_threading", "ocr_support", "performance_comparison"]
-snippets = { basic_extraction = "getting-started/basic-extract.ts", browser_extraction = "getting-started/browser-file-input.ts", node_extraction = "getting-started/basic-extract.ts", async_extraction = "getting-started/async-extraction.ts", cloudflare_workers = "getting-started/runtime-detection.ts", batch_processing = "getting-started/batch-processing.ts", ocr_configuration = "ocr/enable-ocr.ts" }
+optional_sections = ["ocr_support", "performance_comparison"]
+snippets = { basic_extraction = "getting-started/basic-extract.md", browser_extraction = "getting-started/browser-file-input.md", node_extraction = "getting-started/basic-extract.md", async_extraction = "getting-started/async-extraction.md", cloudflare_workers = "getting-started/runtime-detection.md", batch_processing = "getting-started/batch-processing.md", ocr_configuration = "ocr/enable-ocr.md" }
 
 [crates.readme.languages.ffi]
 template = "language_package.md"
@@ -4270,7 +4485,7 @@ name = "FFI (C/C++)"
 package_name = "xberg-ffi"
 badge_url = "https://img.shields.io/badge/C%2FC%2B%2B-xberg--ffi-007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. C/C++ FFI bindings providing a stable ABI for native integration, shared library distribution, and cross-language interop."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. C/C++ FFI bindings providing a stable ABI for native integration, shared library distribution, and cross-language interop."
 package_manager = ["cargo"]
 # `async = false`: the C ABI is synchronous, so the template's async section ("full
 # async/await support") would be untrue here, and there is deliberately no
@@ -4298,7 +4513,7 @@ name = "Kotlin (Android)"
 package_name = "io.xberg:xberg-android"
 badge_url = "https://img.shields.io/badge/Android-xberg-3DDC84"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Android library (AAR) with bundled jniLibs/arm64-v8a and jniLibs/x86_64 — Gradle automatically picks up the native cdylib for emulator and device builds. Server-side Kotlin/JVM consumers can use the Java binding directly via standard Kotlin/Java interop."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Android library (AAR) with bundled jniLibs/arm64-v8a and jniLibs/x86_64 — Gradle automatically picks up the native cdylib for emulator and device builds. Server-side Kotlin/JVM consumers can use the Java binding directly via standard Kotlin/Java interop."
 package_manager = ["gradle", "maven"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "sceptre-tract"]
@@ -4311,7 +4526,7 @@ name = "Swift"
 package_name = "Xberg"
 badge_url = "https://img.shields.io/badge/Swift-xberg-007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Swift bindings via swift-bridge for macOS, iOS, and Linux, with native Swift types and async/await support."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Swift bindings via swift-bridge for macOS and iOS, with native Swift types and async/await support."
 package_manager = ["spm"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
@@ -4324,7 +4539,7 @@ name = "Dart / Flutter"
 package_name = "xberg"
 badge_url = "https://img.shields.io/badge/Dart-xberg-007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Dart bindings via flutter_rust_bridge for both Flutter apps and pure-Dart server contexts, with isolate-safe Future/Stream APIs."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Dart bindings via flutter_rust_bridge for both Flutter apps and pure-Dart server contexts, with isolate-safe Future/Stream APIs."
 package_manager = ["pub"]
 features = { ocr = true, async = true, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]
@@ -4337,7 +4552,7 @@ name = "Zig"
 package_name = "xberg"
 badge_url = "https://img.shields.io/badge/Zig-xberg-007ec6"
 docs_url = "https://xberg.io/"
-description = "Extract text, tables, images, metadata, and code intelligence from 101 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Zig bindings consuming the C FFI surface via @cImport, idiomatic error sets, optional types, and slice-based memory management."
+description = "Extract text, tables, images, metadata, and code intelligence from 100 file formats and 371 programming languages including PDF, Office documents, images, and audio/video transcripts where native transcription is available. Zig bindings consuming the C FFI surface via @cImport, idiomatic error sets, optional types, and slice-based memory management."
 package_manager = ["zig"]
 features = { ocr = true, async = false, plugin_system = true, embeddings = true, code_intelligence = true }
 ocr_backends = ["tesseract", "paddleocr", "sceptre"]

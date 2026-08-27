@@ -1,8 +1,8 @@
 ```typescript title="TypeScript"
-import { extract } from '@xberg-io/xberg';
+import { ExtractInputKind, extract } from '@xberg-io/xberg';
 
 const output = await extract({
-    kind: "uri",
+    kind: ExtractInputKind.Uri,
     uri: "packet.pdf",
 }, {
     pageClassification: {
@@ -12,7 +12,8 @@ const output = await extract({
     },
 });
 
-for (const page of output.results[0].pageClassifications ?? []) {
+const [first] = output.results ?? [];
+for (const page of first?.pageClassifications ?? []) {
     console.log(`page ${page.pageNumber}: ${page.labels[0]?.label}`);
 }
 ```

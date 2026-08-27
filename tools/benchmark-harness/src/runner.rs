@@ -909,18 +909,8 @@ impl BenchmarkRunner {
                 )));
             }
 
-            if let Some(failed) = batch_results.iter().find(|result| !result.success) {
-                return Err(Error::Benchmark(format!(
-                    "framework '{}' returned a partial batch failure for {}: {}",
-                    adapter.name(),
-                    failed.file_path.display(),
-                    failed
-                        .error_message
-                        .as_deref()
-                        .unwrap_or("unspecified extraction failure")
-                )));
-            }
-
+            // Per-item framework failures are accountable benchmark rows, not harness failures.
+            // Retain them so aggregation and the minimum-success gate evaluate the full cohort.
             let has_timeout = batch_results.iter().any(|r| r.error_kind == ErrorKind::Timeout);
 
             if iteration >= warmup_iterations || has_timeout {
@@ -2276,7 +2266,10 @@ mod tests {
     fn write_ordered_cohort(temp: &Path, file_types: &[&str]) -> PathBuf {
         let fixtures = ["d.json", "b.json", "a.json", "c.json"];
         for (fixture_name, file_type) in fixtures.iter().zip(file_types) {
-            let document_name = fixture_name.replace(".json", ".pdf");
+            // The document extension must agree with the declared file_type: Fixture::validate
+            // rejects a fixture whose file_type names a different format than its document's
+            // own extension resolves to.
+            let document_name = fixture_name.replace(".json", &format!(".{file_type}"));
             std::fs::write(temp.join(&document_name), b"x").unwrap();
             std::fs::write(
                 temp.join(fixture_name),
@@ -2478,7 +2471,7 @@ mod tests {
 
         runner.run(&["recording".to_string()]).await.unwrap();
 
-        // The adapter supports only pdf, so the txt fixture (b.pdf) is filtered out before the
+        // The adapter supports only pdf, so the txt fixture (b.txt) is filtered out before the
         // native batch call. The 3 eligible pdfs partition into a full batch of 2 and a smaller
         // final batch of 1 (manifest fixture order d, a, c) rather than aborting the run.
         assert_eq!(
@@ -2813,7 +2806,7 @@ mod tests {
             calls: AtomicUsize::new(0),
         });
 
-        let error = BenchmarkRunner::run_batch_iterations_static(
+        let results = BenchmarkRunner::run_batch_iterations_static(
             vec![file.path().to_path_buf()],
             adapter,
             &config,
@@ -2823,9 +2816,14 @@ mod tests {
             OutputFormat::Markdown,
         )
         .await
-        .unwrap_err();
+        .unwrap();
 
-        assert!(error.to_string().contains("partial batch failure"));
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert_eq!(results[0].error_kind, ErrorKind::FrameworkError);
+        assert_eq!(results[0].error_message.as_deref(), Some("measured iteration failed"));
+        assert_eq!(results[0].extracted_text.as_deref(), Some("successful payload"));
+        assert_eq!(results[0].iterations.len(), 2);
     }
 
     #[test]

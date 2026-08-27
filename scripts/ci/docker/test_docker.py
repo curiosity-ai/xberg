@@ -23,6 +23,20 @@ NC = "\033[0m"
 REPO_ROOT = Path(__file__).resolve().parents[3]
 TEST_DOCS_DIR = REPO_ROOT / "test_documents"
 RESULTS_FILE = Path("/tmp/xberg-docker-test-results.json")
+MEBIBYTE_BYTES = 1024 * 1024
+# The CLI image must remain strictly below 200 MiB. Compare raw bytes so reporting precision
+# cannot change the pass/fail result.
+CLI_IMAGE_LIMIT_BYTES = 200 * MEBIBYTE_BYTES
+
+
+def format_image_size(size_bytes: int) -> str:
+    """Format an image size without discarding the bytes used by the gate."""
+    return f"{size_bytes / MEBIBYTE_BYTES:.6f} MiB ({size_bytes} bytes)"
+
+
+def cli_image_size_is_allowed(size_bytes: int) -> bool:
+    """Return whether a non-empty CLI image is below the exclusive byte limit."""
+    return 0 < size_bytes < CLI_IMAGE_LIMIT_BYTES
 
 
 @dataclass
@@ -902,7 +916,7 @@ def test_security_memlimit(t: TestRunner) -> None:
 
 
 def test_cli_image_size(t: TestRunner) -> None:
-    t.start("Image size is reasonable (< 200MB)")
+    t.start(f"Image size is below {format_image_size(CLI_IMAGE_LIMIT_BYTES)}")
     r = subprocess.run(
         ["docker", "inspect", t.image, "--format", "{{.Size}}"],
         check=False,
@@ -911,14 +925,17 @@ def test_cli_image_size(t: TestRunner) -> None:
         timeout=10,
     )
     try:
-        size_mb = int(r.stdout.strip()) // (1024 * 1024)
+        size_bytes = int(r.stdout.strip())
     except ValueError:
-        size_mb = 0
-    t.debug(f"Image size: {size_mb}MB")
-    if 0 < size_mb < 200:
+        size_bytes = 0
+    t.debug(f"Image size: {format_image_size(size_bytes)}")
+    if cli_image_size_is_allowed(size_bytes):
         t.pass_test()
     else:
-        t.fail_test("Image size", f"Expected < 200MB, got {size_mb}MB")
+        t.fail_test(
+            "Image size",
+            f"Expected below {format_image_size(CLI_IMAGE_LIMIT_BYTES)}, got {format_image_size(size_bytes)}",
+        )
 
 
 def run_cli_tests(t: TestRunner) -> None:

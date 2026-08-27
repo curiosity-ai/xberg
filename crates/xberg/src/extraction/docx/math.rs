@@ -93,7 +93,7 @@ pub(crate) fn collect_and_convert_omath_para(
     reader: &mut Reader<&[u8]>,
     budget: &mut SecurityBudget,
 ) -> Result<String, SecurityError> {
-    let children = collect_children(reader, b"m:oMathPara", budget)?;
+    let children = collect_children(reader, "m:oMathPara", budget)?;
     let mut parts = Vec::new();
     for child in &children {
         if let MathNode::Group { children: inner } = child {
@@ -116,14 +116,14 @@ pub(crate) fn collect_and_convert_omath(
     reader: &mut Reader<&[u8]>,
     budget: &mut SecurityBudget,
 ) -> Result<String, SecurityError> {
-    let children = collect_children(reader, b"m:oMath", budget)?;
+    let children = collect_children(reader, "m:oMath", budget)?;
     Ok(render_nodes(&children))
 }
 
 /// Recursively collect child nodes until the matching close tag.
 fn collect_children(
     reader: &mut Reader<&[u8]>,
-    end_tag: &[u8],
+    end_tag: &str,
     budget: &mut SecurityBudget,
 ) -> Result<Vec<MathNode>, SecurityError> {
     let mut nodes = Vec::new();
@@ -134,65 +134,65 @@ fn collect_children(
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                let tag = (e.name().as_ref() as &[u8]).to_vec();
-                match tag.as_slice() {
-                    b"m:r" => {
+                let tag = e.name().as_ref().to_string();
+                match tag.as_str() {
+                    "m:r" => {
                         nodes.push(collect_run(reader, budget)?);
                     }
-                    b"m:sSup" => {
+                    "m:sSup" => {
                         nodes.push(collect_ssup(reader, budget)?);
                     }
-                    b"m:sSub" => {
+                    "m:sSub" => {
                         nodes.push(collect_ssub(reader, budget)?);
                     }
-                    b"m:sSubSup" => {
+                    "m:sSubSup" => {
                         nodes.push(collect_ssubsup(reader, budget)?);
                     }
-                    b"m:f" => {
+                    "m:f" => {
                         nodes.push(collect_frac(reader, budget)?);
                     }
-                    b"m:rad" => {
+                    "m:rad" => {
                         nodes.push(collect_rad(reader, budget)?);
                     }
-                    b"m:nary" => {
+                    "m:nary" => {
                         nodes.push(collect_nary(reader, budget)?);
                     }
-                    b"m:d" => {
+                    "m:d" => {
                         nodes.push(collect_delim(reader, budget)?);
                     }
-                    b"m:func" => {
+                    "m:func" => {
                         nodes.push(collect_func(reader, budget)?);
                     }
-                    b"m:acc" => {
+                    "m:acc" => {
                         nodes.push(collect_acc(reader, budget)?);
                     }
-                    b"m:eqArr" => {
+                    "m:eqArr" => {
                         nodes.push(collect_eqarr(reader, budget)?);
                     }
-                    b"m:limLow" => {
+                    "m:limLow" => {
                         nodes.push(collect_limlow(reader, budget)?);
                     }
-                    b"m:limUpp" => {
+                    "m:limUpp" => {
                         nodes.push(collect_limupp(reader, budget)?);
                     }
-                    b"m:bar" => {
+                    "m:bar" => {
                         nodes.push(collect_bar(reader, budget)?);
                     }
-                    b"m:borderBox" => {
+                    "m:borderBox" => {
                         nodes.push(collect_borderbox(reader, budget)?);
                     }
-                    b"m:m" => {
+                    "m:m" => {
                         nodes.push(collect_matrix(reader, budget)?);
                     }
-                    b"m:box" | b"m:phant" => {
+                    "m:box" | "m:phant" => {
                         let children = collect_element_body(reader, &tag, budget)?;
                         nodes.push(MathNode::Group { children });
                     }
-                    b"m:sPre" => {
+                    "m:sPre" => {
                         nodes.push(collect_spre(reader, budget)?);
                     }
-                    b"m:oMath" => {
-                        let inner = collect_children(reader, b"m:oMath", budget)?;
+                    "m:oMath" => {
+                        let inner = collect_children(reader, "m:oMath", budget)?;
                         nodes.push(MathNode::Group { children: inner });
                     }
                     _ => {
@@ -206,7 +206,7 @@ fn collect_children(
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == end_tag {
+                if e.name().as_ref() == end_tag {
                     break;
                 }
             }
@@ -230,22 +230,21 @@ fn collect_run(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resul
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:t" => in_text = true,
-                    b"m:rPr" => {
+                match e.name().as_ref() {
+                    "m:t" => in_text = true,
+                    "m:rPr" => {
                         // Consumes its own `</m:rPr>`; refund the enter above.
-                        skip_to_end(reader, b"m:rPr");
+                        skip_to_end(reader, "m:rPr");
                         budget.leave();
                     }
                     _ => {}
                 }
             }
-            Ok(Event::Text(ref e)) => {
-                if in_text && let Ok(t) = e.decode() {
-                    budget.check_entity(&t)?;
-                    budget.account_text(t.len())?;
-                    text.push_str(&t);
-                }
+            Ok(Event::Text(ref e)) if in_text => {
+                let t = e.xml10_content();
+                budget.check_entity(&t)?;
+                budget.account_text(t.len())?;
+                text.push_str(&t);
             }
             Ok(Event::GeneralRef(ref e)) if in_text => {
                 let t = crate::utils::xml_utils::resolve_general_ref(e);
@@ -254,9 +253,9 @@ fn collect_run(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resul
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                match e.name().as_ref() as &[u8] {
-                    b"m:t" => in_text = false,
-                    b"m:r" => break,
+                match e.name().as_ref() {
+                    "m:t" => in_text = false,
+                    "m:r" => break,
                     _ => {}
                 }
             }
@@ -280,12 +279,12 @@ fn collect_ssup(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:e" => base = collect_children(reader, b"m:e", budget)?,
-                    b"m:sup" => sup = collect_children(reader, b"m:sup", budget)?,
-                    b"m:sSupPr" => {
+                match e.name().as_ref() {
+                    "m:e" => base = collect_children(reader, "m:e", budget)?,
+                    "m:sup" => sup = collect_children(reader, "m:sup", budget)?,
+                    "m:sSupPr" => {
                         // Consumes its own `</m:sSupPr>`; refund the enter above.
-                        skip_to_end(reader, b"m:sSupPr");
+                        skip_to_end(reader, "m:sSupPr");
                         budget.leave();
                     }
                     _ => {}
@@ -293,7 +292,7 @@ fn collect_ssup(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:sSup" {
+                if e.name().as_ref() == "m:sSup" {
                     break;
                 }
             }
@@ -317,12 +316,12 @@ fn collect_ssub(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:e" => base = collect_children(reader, b"m:e", budget)?,
-                    b"m:sub" => sub = collect_children(reader, b"m:sub", budget)?,
-                    b"m:sSubPr" => {
+                match e.name().as_ref() {
+                    "m:e" => base = collect_children(reader, "m:e", budget)?,
+                    "m:sub" => sub = collect_children(reader, "m:sub", budget)?,
+                    "m:sSubPr" => {
                         // Consumes its own `</m:sSubPr>`; refund the enter above.
-                        skip_to_end(reader, b"m:sSubPr");
+                        skip_to_end(reader, "m:sSubPr");
                         budget.leave();
                     }
                     _ => {}
@@ -330,7 +329,7 @@ fn collect_ssub(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:sSub" {
+                if e.name().as_ref() == "m:sSub" {
                     break;
                 }
             }
@@ -355,13 +354,13 @@ fn collect_ssubsup(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> R
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:e" => base = collect_children(reader, b"m:e", budget)?,
-                    b"m:sub" => sub = collect_children(reader, b"m:sub", budget)?,
-                    b"m:sup" => sup = collect_children(reader, b"m:sup", budget)?,
-                    b"m:sSubSupPr" => {
+                match e.name().as_ref() {
+                    "m:e" => base = collect_children(reader, "m:e", budget)?,
+                    "m:sub" => sub = collect_children(reader, "m:sub", budget)?,
+                    "m:sup" => sup = collect_children(reader, "m:sup", budget)?,
+                    "m:sSubSupPr" => {
                         // Consumes its own `</m:sSubSupPr>`; refund the enter above.
-                        skip_to_end(reader, b"m:sSubSupPr");
+                        skip_to_end(reader, "m:sSubSupPr");
                         budget.leave();
                     }
                     _ => {}
@@ -369,7 +368,7 @@ fn collect_ssubsup(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> R
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:sSubSup" {
+                if e.name().as_ref() == "m:sSubSup" {
                     break;
                 }
             }
@@ -394,21 +393,21 @@ fn collect_frac(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:fPr" => {
+                match e.name().as_ref() {
+                    "m:fPr" => {
                         // `collect_frac_pr` reads through its own `</m:fPr>` without
                         // calling `budget.leave()`; refund the enter above.
                         frac_type = collect_frac_pr(reader, budget)?;
                         budget.leave();
                     }
-                    b"m:num" => num = collect_children(reader, b"m:num", budget)?,
-                    b"m:den" => den = collect_children(reader, b"m:den", budget)?,
+                    "m:num" => num = collect_children(reader, "m:num", budget)?,
+                    "m:den" => den = collect_children(reader, "m:den", budget)?,
                     _ => {}
                 }
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:f" {
+                if e.name().as_ref() == "m:f" {
                     break;
                 }
             }
@@ -430,7 +429,7 @@ fn collect_frac_pr(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> R
         budget.step()?;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
-                if e.name().as_ref() as &[u8] == b"m:type"
+                if e.name().as_ref() == "m:type"
                     && let Some(val) = get_m_val(e)
                 {
                     frac_type = match val.as_str() {
@@ -441,7 +440,7 @@ fn collect_frac_pr(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> R
                     };
                 }
             }
-            Ok(Event::End(ref e)) if e.name().as_ref() as &[u8] == b"m:fPr" => {
+            Ok(Event::End(ref e)) if e.name().as_ref() == "m:fPr" => {
                 break;
             }
             Ok(Event::Eof) => break,
@@ -465,21 +464,21 @@ fn collect_rad(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resul
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:radPr" => {
+                match e.name().as_ref() {
+                    "m:radPr" => {
                         // `collect_rad_pr` reads through its own `</m:radPr>` without
                         // calling `budget.leave()`; refund the enter above.
                         deg_hide = collect_rad_pr(reader, budget)?;
                         budget.leave();
                     }
-                    b"m:deg" => deg = collect_children(reader, b"m:deg", budget)?,
-                    b"m:e" => body = collect_children(reader, b"m:e", budget)?,
+                    "m:deg" => deg = collect_children(reader, "m:deg", budget)?,
+                    "m:e" => body = collect_children(reader, "m:e", budget)?,
                     _ => {}
                 }
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:rad" {
+                if e.name().as_ref() == "m:rad" {
                     break;
                 }
             }
@@ -500,10 +499,10 @@ fn collect_rad_pr(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
     loop {
         budget.step()?;
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e) | Event::Empty(ref e)) if e.name().as_ref() as &[u8] == b"m:degHide" => {
+            Ok(Event::Start(ref e) | Event::Empty(ref e)) if e.name().as_ref() == "m:degHide" => {
                 deg_hide = get_m_val(e).as_deref() != Some("0");
             }
-            Ok(Event::End(ref e)) if e.name().as_ref() as &[u8] == b"m:radPr" => {
+            Ok(Event::End(ref e)) if e.name().as_ref() == "m:radPr" => {
                 break;
             }
             Ok(Event::Eof) => break,
@@ -530,22 +529,22 @@ fn collect_nary(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:naryPr" => {
+                match e.name().as_ref() {
+                    "m:naryPr" => {
                         // `collect_nary_pr` reads through its own `</m:naryPr>` without
                         // calling `budget.leave()`; refund the enter above.
                         collect_nary_pr(reader, &mut chr, &mut sub_hide, &mut sup_hide, budget)?;
                         budget.leave();
                     }
-                    b"m:sub" => sub = collect_children(reader, b"m:sub", budget)?,
-                    b"m:sup" => sup = collect_children(reader, b"m:sup", budget)?,
-                    b"m:e" => body = collect_children(reader, b"m:e", budget)?,
+                    "m:sub" => sub = collect_children(reader, "m:sub", budget)?,
+                    "m:sup" => sup = collect_children(reader, "m:sup", budget)?,
+                    "m:e" => body = collect_children(reader, "m:e", budget)?,
                     _ => {}
                 }
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:nary" {
+                if e.name().as_ref() == "m:nary" {
                     break;
                 }
             }
@@ -578,21 +577,21 @@ fn collect_nary_pr(
     loop {
         budget.step()?;
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e) | Event::Empty(ref e)) => match e.name().as_ref() as &[u8] {
-                b"m:chr" => {
+            Ok(Event::Start(ref e) | Event::Empty(ref e)) => match e.name().as_ref() {
+                "m:chr" => {
                     if let Some(val) = get_m_val(e) {
                         *chr = val;
                     }
                 }
-                b"m:subHide" => {
+                "m:subHide" => {
                     *sub_hide = get_m_val(e).as_deref() != Some("0");
                 }
-                b"m:supHide" => {
+                "m:supHide" => {
                     *sup_hide = get_m_val(e).as_deref() != Some("0");
                 }
                 _ => {}
             },
-            Ok(Event::End(ref e)) if e.name().as_ref() as &[u8] == b"m:naryPr" => {
+            Ok(Event::End(ref e)) if e.name().as_ref() == "m:naryPr" => {
                 break;
             }
             Ok(Event::Eof) => break,
@@ -617,22 +616,22 @@ fn collect_delim(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Res
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:dPr" => {
+                match e.name().as_ref() {
+                    "m:dPr" => {
                         // `collect_delim_pr` reads through its own `</m:dPr>` without
                         // calling `budget.leave()`; refund the enter above.
                         collect_delim_pr(reader, &mut begin_chr, &mut end_chr, &mut sep_chr, budget)?;
                         budget.leave();
                     }
-                    b"m:e" => {
-                        elements.push(collect_children(reader, b"m:e", budget)?);
+                    "m:e" => {
+                        elements.push(collect_children(reader, "m:e", budget)?);
                     }
                     _ => {}
                 }
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:d" {
+                if e.name().as_ref() == "m:d" {
                     break;
                 }
             }
@@ -663,25 +662,25 @@ fn collect_delim_pr(
     loop {
         budget.step()?;
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e) | Event::Empty(ref e)) => match e.name().as_ref() as &[u8] {
-                b"m:begChr" => {
+            Ok(Event::Start(ref e) | Event::Empty(ref e)) => match e.name().as_ref() {
+                "m:begChr" => {
                     if let Some(val) = get_m_val(e) {
                         *begin_chr = val;
                     }
                 }
-                b"m:endChr" => {
+                "m:endChr" => {
                     if let Some(val) = get_m_val(e) {
                         *end_chr = val;
                     }
                 }
-                b"m:sepChr" => {
+                "m:sepChr" => {
                     if let Some(val) = get_m_val(e) {
                         *sep_chr = val;
                     }
                 }
                 _ => {}
             },
-            Ok(Event::End(ref e)) if e.name().as_ref() as &[u8] == b"m:dPr" => {
+            Ok(Event::End(ref e)) if e.name().as_ref() == "m:dPr" => {
                 break;
             }
             Ok(Event::Eof) => break,
@@ -704,12 +703,12 @@ fn collect_func(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:fName" => name = collect_children(reader, b"m:fName", budget)?,
-                    b"m:e" => body = collect_children(reader, b"m:e", budget)?,
-                    b"m:funcPr" => {
+                match e.name().as_ref() {
+                    "m:fName" => name = collect_children(reader, "m:fName", budget)?,
+                    "m:e" => body = collect_children(reader, "m:e", budget)?,
+                    "m:funcPr" => {
                         // Consumes its own `</m:funcPr>`; refund the enter above.
-                        skip_to_end(reader, b"m:funcPr");
+                        skip_to_end(reader, "m:funcPr");
                         budget.leave();
                     }
                     _ => {}
@@ -717,7 +716,7 @@ fn collect_func(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:func" {
+                if e.name().as_ref() == "m:func" {
                     break;
                 }
             }
@@ -741,20 +740,20 @@ fn collect_acc(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resul
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:accPr" => {
+                match e.name().as_ref() {
+                    "m:accPr" => {
                         // `collect_acc_pr` reads through its own `</m:accPr>` without
                         // calling `budget.leave()`; refund the enter above.
                         collect_acc_pr(reader, &mut chr, budget)?;
                         budget.leave();
                     }
-                    b"m:e" => body = collect_children(reader, b"m:e", budget)?,
+                    "m:e" => body = collect_children(reader, "m:e", budget)?,
                     _ => {}
                 }
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:acc" {
+                if e.name().as_ref() == "m:acc" {
                     break;
                 }
             }
@@ -779,13 +778,13 @@ fn collect_acc_pr(
         budget.step()?;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
-                if e.name().as_ref() as &[u8] == b"m:chr"
+                if e.name().as_ref() == "m:chr"
                     && let Some(val) = get_m_val(e)
                 {
                     *chr = val;
                 }
             }
-            Ok(Event::End(ref e)) if e.name().as_ref() as &[u8] == b"m:accPr" => {
+            Ok(Event::End(ref e)) if e.name().as_ref() == "m:accPr" => {
                 break;
             }
             Ok(Event::Eof) => break,
@@ -807,11 +806,11 @@ fn collect_eqarr(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Res
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:e" => rows.push(collect_children(reader, b"m:e", budget)?),
-                    b"m:eqArrPr" => {
+                match e.name().as_ref() {
+                    "m:e" => rows.push(collect_children(reader, "m:e", budget)?),
+                    "m:eqArrPr" => {
                         // Consumes its own `</m:eqArrPr>`; refund the enter above.
-                        skip_to_end(reader, b"m:eqArrPr");
+                        skip_to_end(reader, "m:eqArrPr");
                         budget.leave();
                     }
                     _ => {}
@@ -819,7 +818,7 @@ fn collect_eqarr(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Res
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:eqArr" {
+                if e.name().as_ref() == "m:eqArr" {
                     break;
                 }
             }
@@ -843,12 +842,12 @@ fn collect_limlow(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:e" => body = collect_children(reader, b"m:e", budget)?,
-                    b"m:lim" => lim = collect_children(reader, b"m:lim", budget)?,
-                    b"m:limLowPr" => {
+                match e.name().as_ref() {
+                    "m:e" => body = collect_children(reader, "m:e", budget)?,
+                    "m:lim" => lim = collect_children(reader, "m:lim", budget)?,
+                    "m:limLowPr" => {
                         // Consumes its own `</m:limLowPr>`; refund the enter above.
-                        skip_to_end(reader, b"m:limLowPr");
+                        skip_to_end(reader, "m:limLowPr");
                         budget.leave();
                     }
                     _ => {}
@@ -856,7 +855,7 @@ fn collect_limlow(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:limLow" {
+                if e.name().as_ref() == "m:limLow" {
                     break;
                 }
             }
@@ -880,12 +879,12 @@ fn collect_limupp(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:e" => body = collect_children(reader, b"m:e", budget)?,
-                    b"m:lim" => lim = collect_children(reader, b"m:lim", budget)?,
-                    b"m:limUppPr" => {
+                match e.name().as_ref() {
+                    "m:e" => body = collect_children(reader, "m:e", budget)?,
+                    "m:lim" => lim = collect_children(reader, "m:lim", budget)?,
+                    "m:limUppPr" => {
                         // Consumes its own `</m:limUppPr>`; refund the enter above.
-                        skip_to_end(reader, b"m:limUppPr");
+                        skip_to_end(reader, "m:limUppPr");
                         budget.leave();
                     }
                     _ => {}
@@ -893,7 +892,7 @@ fn collect_limupp(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:limUpp" {
+                if e.name().as_ref() == "m:limUpp" {
                     break;
                 }
             }
@@ -917,20 +916,20 @@ fn collect_bar(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resul
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:barPr" => {
+                match e.name().as_ref() {
+                    "m:barPr" => {
                         // `collect_bar_pr` reads through its own `</m:barPr>` without
                         // calling `budget.leave()`; refund the enter above.
                         top = collect_bar_pr(reader, budget)?;
                         budget.leave();
                     }
-                    b"m:e" => body = collect_children(reader, b"m:e", budget)?,
+                    "m:e" => body = collect_children(reader, "m:e", budget)?,
                     _ => {}
                 }
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:bar" {
+                if e.name().as_ref() == "m:bar" {
                     break;
                 }
             }
@@ -952,13 +951,13 @@ fn collect_bar_pr(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
         budget.step()?;
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e) | Event::Empty(ref e)) => {
-                if e.name().as_ref() as &[u8] == b"m:pos"
+                if e.name().as_ref() == "m:pos"
                     && let Some(val) = get_m_val(e)
                 {
                     top = val != "bot";
                 }
             }
-            Ok(Event::End(ref e)) if e.name().as_ref() as &[u8] == b"m:barPr" => {
+            Ok(Event::End(ref e)) if e.name().as_ref() == "m:barPr" => {
                 break;
             }
             Ok(Event::Eof) => break,
@@ -980,11 +979,11 @@ fn collect_borderbox(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) ->
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:e" => body = collect_children(reader, b"m:e", budget)?,
-                    b"m:borderBoxPr" => {
+                match e.name().as_ref() {
+                    "m:e" => body = collect_children(reader, "m:e", budget)?,
+                    "m:borderBoxPr" => {
                         // Consumes its own `</m:borderBoxPr>`; refund the enter above.
-                        skip_to_end(reader, b"m:borderBoxPr");
+                        skip_to_end(reader, "m:borderBoxPr");
                         budget.leave();
                     }
                     _ => {}
@@ -992,7 +991,7 @@ fn collect_borderbox(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) ->
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:borderBox" {
+                if e.name().as_ref() == "m:borderBox" {
                     break;
                 }
             }
@@ -1015,13 +1014,13 @@ fn collect_matrix(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:mr" => {
+                match e.name().as_ref() {
+                    "m:mr" => {
                         rows.push(collect_matrix_row(reader, budget)?);
                     }
-                    b"m:mPr" => {
+                    "m:mPr" => {
                         // Consumes its own `</m:mPr>`; refund the enter above.
-                        skip_to_end(reader, b"m:mPr");
+                        skip_to_end(reader, "m:mPr");
                         budget.leave();
                     }
                     _ => {}
@@ -1029,7 +1028,7 @@ fn collect_matrix(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Re
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:m" {
+                if e.name().as_ref() == "m:m" {
                     break;
                 }
             }
@@ -1053,13 +1052,13 @@ fn collect_matrix_row(
     loop {
         budget.step()?;
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"m:e" => {
+            Ok(Event::Start(ref e)) if e.name().as_ref() == "m:e" => {
                 budget.enter()?;
-                cells.push(collect_children(reader, b"m:e", budget)?);
+                cells.push(collect_children(reader, "m:e", budget)?);
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:mr" {
+                if e.name().as_ref() == "m:mr" {
                     break;
                 }
             }
@@ -1084,13 +1083,13 @@ fn collect_spre(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                match e.name().as_ref() as &[u8] {
-                    b"m:e" => base = collect_children(reader, b"m:e", budget)?,
-                    b"m:sub" => sub = collect_children(reader, b"m:sub", budget)?,
-                    b"m:sup" => sup = collect_children(reader, b"m:sup", budget)?,
-                    b"m:sPrePr" => {
+                match e.name().as_ref() {
+                    "m:e" => base = collect_children(reader, "m:e", budget)?,
+                    "m:sub" => sub = collect_children(reader, "m:sub", budget)?,
+                    "m:sup" => sup = collect_children(reader, "m:sup", budget)?,
+                    "m:sPrePr" => {
                         // Consumes its own `</m:sPrePr>`; refund the enter above.
-                        skip_to_end(reader, b"m:sPrePr");
+                        skip_to_end(reader, "m:sPrePr");
                         budget.leave();
                     }
                     _ => {}
@@ -1098,7 +1097,7 @@ fn collect_spre(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == b"m:sPre" {
+                if e.name().as_ref() == "m:sPre" {
                     break;
                 }
             }
@@ -1114,7 +1113,7 @@ fn collect_spre(reader: &mut Reader<&[u8]>, budget: &mut SecurityBudget) -> Resu
 /// Collect body of a generic element (skip its *Pr, gather m:e children).
 fn collect_element_body(
     reader: &mut Reader<&[u8]>,
-    end_tag: &[u8],
+    end_tag: &str,
     budget: &mut SecurityBudget,
 ) -> Result<Vec<MathNode>, SecurityError> {
     let mut children = Vec::new();
@@ -1125,13 +1124,13 @@ fn collect_element_body(
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(ref e)) => {
                 budget.enter()?;
-                let tag = (e.name().as_ref() as &[u8]).to_vec();
-                if tag.ends_with(b"Pr") {
+                let tag = e.name().as_ref().to_string();
+                if tag.ends_with("Pr") {
                     // Consumes its own matching end tag; refund the enter above.
                     skip_to_end(reader, &tag);
                     budget.leave();
-                } else if tag == b"m:e" {
-                    children.extend(collect_children(reader, b"m:e", budget)?);
+                } else if tag == "m:e" {
+                    children.extend(collect_children(reader, "m:e", budget)?);
                 } else {
                     // Same as the `*Pr` branch: consumes its own matching end tag.
                     skip_to_end(reader, &tag);
@@ -1140,7 +1139,7 @@ fn collect_element_body(
             }
             Ok(Event::End(ref e)) => {
                 budget.leave();
-                if e.name().as_ref() as &[u8] == end_tag {
+                if e.name().as_ref() == end_tag {
                     break;
                 }
             }
@@ -1157,24 +1156,24 @@ fn collect_element_body(
 fn get_m_val(e: &quick_xml::events::BytesStart) -> Option<String> {
     for attr in e.attributes().flatten() {
         let key = attr.key.as_ref();
-        if key == b"m:val" || key == b"val" {
-            return std::str::from_utf8(&attr.value).ok().map(|s| s.to_string());
+        if key == "m:val" || key == "val" {
+            return Some(attr.value.to_string());
         }
     }
     None
 }
 
 /// Skip forward until the matching end tag is consumed.
-fn skip_to_end(reader: &mut Reader<&[u8]>, tag: &[u8]) {
+fn skip_to_end(reader: &mut Reader<&[u8]>, tag: &str) {
     let mut depth = 1u32;
     let mut buf = Vec::new();
 
     loop {
         match reader.read_event_into(&mut buf) {
-            Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == tag => {
+            Ok(Event::Start(ref e)) if e.name().as_ref() == tag => {
                 depth += 1;
             }
-            Ok(Event::End(ref e)) if e.name().as_ref() as &[u8] == tag => {
+            Ok(Event::End(ref e)) if e.name().as_ref() == tag => {
                 depth -= 1;
                 if depth == 0 {
                     break;
@@ -1519,7 +1518,7 @@ mod tests {
         let mut buf = Vec::new();
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"m:oMath" => break,
+                Ok(Event::Start(ref e)) if e.name().as_ref() == "m:oMath" => break,
                 Ok(Event::Eof) => return String::new(),
                 _ => {}
             }
@@ -1539,7 +1538,7 @@ mod tests {
         let mut buf = Vec::new();
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"m:oMath" => break,
+                Ok(Event::Start(ref e)) if e.name().as_ref() == "m:oMath" => break,
                 Ok(Event::Eof) => panic!("unexpected EOF before <m:oMath>"),
                 _ => {}
             }
@@ -1916,7 +1915,7 @@ mod tests {
         let mut buf = Vec::new();
         loop {
             match reader.read_event_into(&mut buf) {
-                Ok(Event::Start(ref e)) if e.name().as_ref() as &[u8] == b"m:oMathPara" => break,
+                Ok(Event::Start(ref e)) if e.name().as_ref() == "m:oMathPara" => break,
                 Ok(Event::Eof) => panic!("unexpected EOF"),
                 _ => {}
             }

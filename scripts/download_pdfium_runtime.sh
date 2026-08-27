@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-version="${PDFIUM_VERSION:-${1:-7529}}"
+# 7881, not the newest upstream build (bblanchon publishes 8009 as of 2026-08-21). The
+# constraint is the BINDINGS, not the binary: a binary whose exported symbols do not match the
+# bindings it is loaded against fails at runtime with DlSym errors, which is exactly how the
+# vendored fork rotted (symbols were being hand-added and hand-removed to chase drift).
+# 7881 is the highest version with a known-good binding set today. Bump it only together with
+# a regenerated binding set at the same version, and verify by loading the library and
+# resolving symbols -- never by the download alone, which succeeds regardless. ~keep
+version="${PDFIUM_VERSION:-${1:-7881}}"
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 dest_release="$root_dir/target/release"
 dest_debug="$root_dir/target/debug"

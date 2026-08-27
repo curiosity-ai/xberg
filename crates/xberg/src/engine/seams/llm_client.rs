@@ -2,12 +2,10 @@
 //!
 //! The in-core default is [`LiterLlmClient`], which delegates verbatim to
 //! [`llm::structured::complete_with_json_schema`](crate::llm::structured::complete_with_json_schema)
-//! — the liter-llm-backed path xberg uses today. Alternative clients (a mock, a
-//! gateway, a different provider SDK) implement this trait and are injected via
-//! [`EngineBuilder::with_llm_client`](super::super::EngineBuilder::with_llm_client).
+//! — the liter-llm-backed path xberg uses today.
 //!
 //! Gated behind `liter-llm`: without that feature there is no LLM dependency to
-//! wrap, so neither the trait's default nor the engine field exist.
+//! wrap, so neither the trait nor its default exist.
 
 use async_trait::async_trait;
 use serde_json::Value;

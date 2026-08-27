@@ -211,7 +211,7 @@ fn test_iso_21111_10_layout_extraction_completes() {
 
 /// Regression test for reading-order inversion caused by coordinate system mismatch.
 ///
-/// pdf_oxide returns bounding boxes in PDF coordinates (y=0 at bottom of page, y increases
+/// xberg_native_pdf returns bounding boxes in PDF coordinates (y=0 at bottom of page, y increases
 /// upward). Storing these directly in SegmentData.baseline_y and then sorting descending
 /// in `assemble_page_elements_with_tables` produces correct top-to-bottom reading order.
 ///
@@ -232,14 +232,14 @@ fn test_pdf_structure_reading_order() {
         "'Titre du document' (top of page) must appear before 'Tableau' (bottom of page); \
          got title at byte {title_pos}, Tableau at byte {tableau_pos}. \
          This indicates a reading-order inversion — check PDF coordinate handling in \
-         crates/xberg/src/pdf/oxide/hierarchy.rs"
+         crates/xberg/src/pdf/native/hierarchy.rs"
     );
 }
 
-/// Regression test for yfedoseev/pdf_oxide#847: inter-word spaces were dropped
+/// Regression test for yfedoseev/xberg_native_pdf#847: inter-word spaces were dropped
 /// on TJ-positioned runs, so words in this pdfplumber fixture's tabular
 /// rate-table header extracted glued (`Comparisonrate`, eight times) while the
-/// same words in flowing prose were spaced correctly. pdf_oxide 0.3.74 accounts
+/// same words in flowing prose were spaced correctly. xberg_native_pdf 0.3.74 accounts
 /// for the `TJ` numeric adjustment that carries the space, so the header text
 /// is spaced too.
 #[test]
@@ -256,7 +256,7 @@ fn test_tj_positioned_runs_keep_interword_spaces() {
         .content;
     assert!(
         !content.contains("Comparisonrate"),
-        "TJ-positioned header still glues 'Comparisonrate' — pdf_oxide#847 regression"
+        "TJ-positioned header still glues 'Comparisonrate' — xberg_native_pdf#847 regression"
     );
     assert!(
         content.contains("Comparison rate"),

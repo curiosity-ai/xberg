@@ -173,6 +173,53 @@ impl FromStr for XbergPipeline {
     }
 }
 
+/// Xberg PDF extraction backend (`--pdf-backend`), a cohort dimension independent of
+/// [`XbergPipeline`]. `Native` is the harness default and must keep producing the same
+/// `--pdf-backend native` argument and framework name it always has, so existing committed
+/// results stay comparable. `Pdfium` is opt-in only: it must be requested explicitly via the
+/// `run` subcommand's `--pdf-backends` flag (only the `baseline` xberg pipeline honors it --
+/// the pdfium engine has no OCR fallback path). It is only meaningful when the `xberg` binary
+/// the harness shells out to (see `adapters::xberg::create_xberg_adapter`) was itself built
+/// with the `pdf-pdfium` Cargo feature and has a `libpdfium` runtime library reachable via
+/// `PDFIUM_DYNAMIC_LIB_PATH` -- neither of those is a harness-side concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum XbergPdfBackend {
+    /// xberg's own pure-Rust PDF engine. Harness default.
+    #[default]
+    Native,
+    /// Google's PDFium engine (`pdf-pdfium` Cargo feature). Opt-in only.
+    Pdfium,
+}
+
+impl XbergPdfBackend {
+    /// Get the string representation of the backend, matching xberg's `--pdf-backend` values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            XbergPdfBackend::Native => "native",
+            XbergPdfBackend::Pdfium => "pdfium",
+        }
+    }
+}
+
+impl std::fmt::Display for XbergPdfBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+impl FromStr for XbergPdfBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().replace('_', "-").as_str() {
+            "native" => Ok(XbergPdfBackend::Native),
+            "pdfium" => Ok(XbergPdfBackend::Pdfium),
+            other => Err(format!("unknown Xberg PDF backend '{other}'. Valid: native, pdfium")),
+        }
+    }
+}
+
 /// OCR usage status for a benchmark extraction
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -656,6 +703,22 @@ mod tests {
             assert_eq!(pipeline.as_str().parse(), Ok(pipeline));
             assert!(pipeline.as_str().contains("ort") || pipeline.as_str().contains("tract"));
         }
+    }
+
+    #[test]
+    fn pdf_backend_parses_case_and_separator_insensitively() {
+        for value in ["native", "Native", "NATIVE"] {
+            assert_eq!(value.parse::<XbergPdfBackend>(), Ok(XbergPdfBackend::Native));
+        }
+        for value in ["pdfium", "Pdfium", "PDFIUM"] {
+            assert_eq!(value.parse::<XbergPdfBackend>(), Ok(XbergPdfBackend::Pdfium));
+        }
+    }
+
+    #[test]
+    fn pdf_backend_rejects_unknown_value_and_lists_valid_ones() {
+        let error = "pdf_oxide".parse::<XbergPdfBackend>().unwrap_err();
+        assert_eq!(error, "unknown Xberg PDF backend 'pdf-oxide'. Valid: native, pdfium");
     }
 
     #[test]

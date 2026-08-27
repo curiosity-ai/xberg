@@ -13,7 +13,6 @@
 //!   be shared across threads (page-parallel layout), matching how xberg's ORT
 //!   sessions are used today.
 //!
-//! Since v5.0.0 (issue #1275).
 
 use std::path::Path;
 
@@ -85,10 +84,15 @@ pub trait InferenceBackend: Send + Sync {
     /// `include_bytes!` or streamed from JS) and any caller that already holds the
     /// bytes. Native callers normally use [`load`](Self::load) with a cached path.
     ///
-    /// Landed as seam infrastructure ahead of its consumer: the only callers today
-    /// are the cross-engine parity tests. The WASM embedded-weight path wires the
-    /// first production caller in a later phase, so it is `dead_code`-allowed until
-    /// then rather than gated behind a narrower cfg.
+    /// The WASM embedded-weight path already wires a production caller: `crates/xberg-wasm`'s
+    /// `detectLayout`/`detectOrientation` entry points hand JS-fetched model bytes to
+    /// [`LayoutEngine::from_rtdetr_bytes`](crate::layout::LayoutEngine::from_rtdetr_bytes) and
+    /// [`DocOrientationDetector::from_bytes`](crate::doc_orientation::DocOrientationDetector::from_bytes),
+    /// both of which call through to this method on the tract backend. Those call sites are
+    /// gated behind the `layout-tract`/`auto-rotate-tract` features (part of `wasm-target`), so
+    /// in the default ORT-only feature slice this trait method is still reached only by the
+    /// cross-engine parity tests — hence it stays `dead_code`-allowed rather than cfg-gated,
+    /// matching [`load_with_thread_budget`](Self::load_with_thread_budget).
     #[allow(dead_code)]
     fn load_from_memory(
         &self,

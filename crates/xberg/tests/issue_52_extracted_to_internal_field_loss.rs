@@ -64,6 +64,7 @@ fn source_document() -> ExtractedDocument {
         speaker_notes: None,
         section_name: None,
         sheet_name: None,
+        image_preprocessing: None,
     }]);
     result.ocr_elements = Some(vec![OcrElement {
         text: "ocr token".to_string(),

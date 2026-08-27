@@ -128,6 +128,19 @@ impl TableAccumulator {
 #[derive(Debug)]
 struct ListContext {
     node_idx: NodeIndex,
+    /// Whether an `<li>` at this nesting level is currently open.
+    ///
+    /// Distinct from `HtmlWalker::in_list_item`, which only says whether text is
+    /// being buffered right now: descending into a sublist flushes and clears that
+    /// flag while the enclosing item is still open. This one survives the descent,
+    /// so closing the sublist can resume buffering into the enclosing item.
+    item_open: bool,
+    /// The `ListItem` node most recently emitted at this level, if the currently open
+    /// `<li>` has already produced one.
+    ///
+    /// Reset when an `<li>` opens, so it never names a previous sibling's item. A sublist
+    /// opening while `item_open` is set is parented under this node (task #728).
+    last_item_idx: Option<NodeIndex>,
 }
 
 /// Definition list context.
@@ -161,6 +174,10 @@ struct HtmlWalker<'a, 'b> {
     in_pre: bool,
     pre_block: Option<PreBlock>,
     table: Option<TableAccumulator>,
+    /// Number of `<table>` elements open inside the accumulated table. A nested
+    /// table is flattened into the enclosing cell instead of replacing the
+    /// enclosing table.
+    nested_table_depth: usize,
     list_stack: Vec<ListContext>,
     in_list_item: bool,
     list_item_text: String,
@@ -188,6 +205,7 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             in_pre: false,
             pre_block: None,
             table: None,
+            nested_table_depth: 0,
             list_stack: Vec::new(),
             in_list_item: false,
             list_item_text: String::new(),
@@ -360,44 +378,87 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
                 }
             }
             "ul" => {
+                // Flush any pending parent `<li>` text against the still-current (outer)
+                // list before descending, so it doesn't get misattributed to the list
+                // we're about to push (see task #719).
+                //
+                // The item is flushed *before* the paragraph: while an `<li>` is open
+                // `handle_text` buffers into `list_item_text`, so the item is the live
+                // context and owns the pending annotations, which `flush_paragraph` would
+                // otherwise discard on its way past an empty paragraph buffer (task #727).
+                self.flush_list_item();
                 self.flush_paragraph();
-                let idx = self.builder.push_list(false, None);
-                self.list_stack.push(ListContext { node_idx: idx });
+                let idx = self.push_list_node(false);
+                self.list_stack.push(ListContext {
+                    node_idx: idx,
+                    item_open: false,
+                    last_item_idx: None,
+                });
             }
             "ol" => {
+                self.flush_list_item();
                 self.flush_paragraph();
-                let idx = self.builder.push_list(true, None);
+                let idx = self.push_list_node(true);
                 if let Some(start_val) = extract_attr(attrs_str, "start") {
                     let mut attrs = AHashMap::new();
                     attrs.insert("start".to_string(), start_val.to_string());
                     self.builder.set_attributes(idx, attrs);
                 }
-                self.list_stack.push(ListContext { node_idx: idx });
+                self.list_stack.push(ListContext {
+                    node_idx: idx,
+                    item_open: false,
+                    last_item_idx: None,
+                });
             }
             "li" => {
                 self.flush_list_item();
                 self.in_list_item = true;
                 self.list_item_text.clear();
+                if let Some(ctx) = self.list_stack.last_mut() {
+                    ctx.item_open = true;
+                    ctx.last_item_idx = None;
+                }
             }
             "table" => {
-                self.flush_paragraph();
-                self.table = Some(TableAccumulator::new());
+                if let Some(ref mut table) = self.table {
+                    self.nested_table_depth += 1;
+                    table.push_text(" ");
+                } else {
+                    self.flush_paragraph();
+                    self.table = Some(TableAccumulator::new());
+                }
             }
             "tr" | "thead" | "tbody" | "tfoot" => {
                 if tag == "tr"
+                    && self.nested_table_depth == 0
                     && let Some(ref mut table) = self.table
                 {
                     table.open_row();
                 }
             }
+            "th" | "td" if self.nested_table_depth > 0 => {
+                if let Some(ref mut table) = self.table {
+                    table.push_text(" ");
+                }
+            }
             "th" | "td" => {
                 if let Some(ref mut table) = self.table {
+                    // Clamped at parse time so an out-of-range attribute (a hostile
+                    // `colspan="4294967295"`, say) never enters `CellMeta`/`GridCell` at
+                    // all, on top of the same clamp `grid_flatten::resolve_span_grid`
+                    // applies when it consumes these values — belt and suspenders, since
+                    // that helper also has to trust spans from an external crate it can't
+                    // control (see `extraction::grid_flatten` module docs). The bounds
+                    // themselves are the HTML Living Standard's own caps on these
+                    // attributes, not values we invented.
                     let col_span = extract_attr(attrs_str, "colspan")
                         .and_then(|v| v.parse::<u32>().ok())
-                        .unwrap_or(1);
+                        .unwrap_or(1)
+                        .clamp(1, crate::extraction::grid_flatten::MAX_COL_SPAN);
                     let row_span = extract_attr(attrs_str, "rowspan")
                         .and_then(|v| v.parse::<u32>().ok())
-                        .unwrap_or(1);
+                        .unwrap_or(1)
+                        .clamp(1, crate::extraction::grid_flatten::MAX_ROW_SPAN);
                     table.open_cell(col_span, row_span, tag == "th");
                 }
             }
@@ -529,7 +590,7 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         match tag {
             "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
                 let level: u8 = tag[1..].parse().unwrap_or(1);
-                let text = self.text_buf.trim().to_string();
+                let text = normalize_whitespace(&self.text_buf).trim().to_string();
                 if !text.is_empty() {
                     let idx = self.builder.push_heading(level, &text, None, None);
                     if let Some(classes) = self.pending_classes.take() {
@@ -577,9 +638,20 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
             "ul" | "ol" => {
                 self.flush_list_item();
                 self.list_stack.pop();
+                // Content can resume in the enclosing `<li>` after a sublist closes
+                // (`<li>before<ul>…</ul>after</li>`). Without restoring the flag that text
+                // falls through to the paragraph buffer and is emitted as a bare paragraph
+                // instead of staying list content (see task #721).
+                self.in_list_item = self.list_stack.last().is_some_and(|ctx| ctx.item_open);
             }
             "li" => {
                 self.flush_list_item();
+                if let Some(ctx) = self.list_stack.last_mut() {
+                    ctx.item_open = false;
+                }
+            }
+            "table" if self.nested_table_depth > 0 => {
+                self.nested_table_depth -= 1;
             }
             "table" => {
                 if let Some(mut table) = self.table.take() {
@@ -590,6 +662,7 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
                     }
                 }
             }
+            "tr" | "th" | "td" if self.nested_table_depth > 0 => {}
             "tr" => {
                 if let Some(ref mut table) = self.table {
                     table.close_cell();
@@ -793,18 +866,58 @@ impl<'a, 'b> HtmlWalker<'a, 'b> {
         self.inline_stack.clear();
     }
 
+    /// Create the `List` node for a `<ul>`/`<ol>` start tag, parented at the level the
+    /// markup actually nests it at.
+    ///
+    /// A sublist is a child of the `<li>` it is written inside, so that a consumer walking
+    /// the tree renders it before the item's trailing text rather than after the whole
+    /// outer list. Going through `push_list` instead parents under the section/container
+    /// stack, which makes every sublist a root-level sibling (task #728).
+    ///
+    /// Two shapes have no item node to hang the sublist on: `<li><ul>…` (the item has no
+    /// text of its own, so no `ListItem` was emitted) and a `<ul>` sitting directly inside
+    /// another `<ul>` with no `<li>` open. Both fall back to the enclosing `List` node,
+    /// which keeps the sublist inside the list subtree without minting an empty item.
+    fn push_list_node(&mut self, ordered: bool) -> NodeIndex {
+        let parent = self.list_stack.last().map(|ctx| {
+            if ctx.item_open {
+                ctx.last_item_idx.unwrap_or(ctx.node_idx)
+            } else {
+                ctx.node_idx
+            }
+        });
+        match parent {
+            Some(parent_idx) => self.builder.push_nested_list(parent_idx, ordered, None),
+            None => self.builder.push_list(ordered, None),
+        }
+    }
+
+    /// Emit the buffered `<li>` text as a `ListItem` and reset the inline state that
+    /// belonged to it.
+    ///
+    /// The annotation buffer is taken (not just read) and the inline stack is cleared, for
+    /// the same reason `flush_paragraph` does both: `pop_inline` measures spans against
+    /// `list_item_text`, which this method empties. Anything still referring to it after
+    /// the flush — a completed annotation left behind, or a span whose closing tag has not
+    /// arrived yet — would resolve against whatever text is buffered next and annotate an
+    /// unrelated node at meaningless offsets (task #727).
     fn flush_list_item(&mut self) {
         if !self.in_list_item {
             return;
         }
         self.in_list_item = false;
         let text = normalize_whitespace(&self.list_item_text);
+        let annotations = std::mem::take(&mut self.annotations);
         if !text.is_empty()
-            && let Some(ctx) = self.list_stack.last()
+            && let Some(list_idx) = self.list_stack.last().map(|ctx| ctx.node_idx)
         {
-            self.builder.push_list_item(ctx.node_idx, &text, None);
+            let item_idx = self.builder.push_list_item(list_idx, &text, annotations, None);
+            if let Some(ctx) = self.list_stack.last_mut() {
+                ctx.last_item_idx = Some(item_idx);
+            }
         }
         self.list_item_text.clear();
+        self.inline_stack.clear();
     }
 
     fn flush_definition_item(&mut self) {
@@ -1034,7 +1147,40 @@ fn normalize_whitespace(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::document_structure::{AnnotationKind, NodeContent};
+    use crate::types::document_structure::{AnnotationKind, NodeContent, NodeIndex};
+
+    /// Indices of every `List` node, in document order.
+    fn list_node_indices(doc: &DocumentStructure) -> Vec<usize> {
+        doc.nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, node)| matches!(node.content, NodeContent::List { .. }))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Texts of the `ListItem` children of the list node at `list_idx`, in child order.
+    fn list_item_texts(doc: &DocumentStructure, list_idx: usize) -> Vec<String> {
+        doc.nodes[list_idx]
+            .children
+            .iter()
+            .map(|child| match &doc.nodes[child.0 as usize].content {
+                NodeContent::ListItem { text } => text.clone(),
+                other => panic!("expected a ListItem child of list node {list_idx}, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Texts of every `Paragraph` node, in document order.
+    fn paragraph_texts(doc: &DocumentStructure) -> Vec<String> {
+        doc.nodes
+            .iter()
+            .filter_map(|node| match &node.content {
+                NodeContent::Paragraph { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
 
     #[test]
     fn test_headings() {
@@ -1151,6 +1297,308 @@ mod tests {
         assert_eq!(doc.nodes[0].children.len(), 3);
     }
 
+    /// Regression test for task #719: a `<ul>`/`<ol>` start tag only flushes the pending
+    /// paragraph buffer, not the pending list-item buffer. When a nested list opens while
+    /// the parent `<li>` still has unflushed text, that text is later flushed against
+    /// `list_stack.last()`, which by then points at the freshly-pushed *inner* list — so the
+    /// parent item is misattributed one level too deep, shifting every intermediate item down
+    /// and leaving the outermost list empty.
+    #[test]
+    fn test_nested_list_item_attaches_to_correct_list_level() {
+        let html = "<ul><li>L1<ul><li>L2<ul><li>L3</li></ul></li></ul></li></ul>";
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+
+        // Three List nodes and three ListItem nodes, six total.
+        assert_eq!(doc.len(), 6);
+
+        let lists: Vec<usize> = doc
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| matches!(n.content, NodeContent::List { .. }))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(lists.len(), 3, "expected exactly 3 List nodes, got {lists:?}");
+
+        let item_text = |idx: NodeIndex| match &doc.nodes[idx.0 as usize].content {
+            NodeContent::ListItem { text } => text.clone(),
+            other => panic!("Expected ListItem at {idx:?}, got {other:?}"),
+        };
+
+        // Each of the three list levels must hold exactly one item, and that item's text
+        // must match its own nesting depth (L1 in the outermost list, L2 in the middle
+        // list, L3 in the innermost list).
+        for (list_idx, expected_text) in lists.iter().zip(["L1", "L2", "L3"]) {
+            let list_node = &doc.nodes[*list_idx];
+            assert_eq!(
+                list_node.children.len(),
+                1,
+                "list node {list_idx} should have exactly 1 item, got {:?}",
+                list_node.children
+            );
+            assert_eq!(item_text(list_node.children[0]), expected_text);
+        }
+    }
+
+    /// Regression test for task #721: content that resumes in the outer `<li>` after a
+    /// sublist has closed must stay list-item content.
+    ///
+    /// `in_list_item` is a single bool, so the inner list's start and end handlers both
+    /// clear it while the outer item is still open; the trailing text then misses the
+    /// list-item branch of `handle_text` and lands in the paragraph buffer instead.
+    ///
+    /// Against the unfixed code the outer list holds only `["before text"]` and node 4 is
+    /// a `Paragraph` with text `"after text"`.
+    #[test]
+    fn test_text_after_sublist_returns_to_outer_list_item() {
+        let html = "<ul><li>before text<ul><li>child</li></ul>after text</li></ul>";
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+        assert_eq!(doc.len(), 5, "expected 2 List + 3 ListItem nodes");
+
+        let lists = list_node_indices(&doc);
+        assert_eq!(lists.len(), 2, "expected exactly 2 List nodes, got {lists:?}");
+
+        assert_eq!(
+            list_item_texts(&doc, lists[0]),
+            vec!["before text".to_string(), "after text".to_string()],
+            "text following the sublist must become a sibling item of the outer list"
+        );
+        assert_eq!(list_item_texts(&doc, lists[1]), vec!["child".to_string()]);
+
+        assert!(
+            paragraph_texts(&doc).is_empty(),
+            "trailing list-item text must not be emitted as a Paragraph, got {:?}",
+            paragraph_texts(&doc)
+        );
+    }
+
+    /// Task #721, three levels deep: each trailing run must rejoin the level whose item is
+    /// still open, not the level it was nested under.
+    ///
+    /// Against the unfixed code both trailing runs land in the same paragraph buffer and
+    /// are emitted as a single `Paragraph` with the concatenated text `"after L2after L1"`
+    /// (no separator — the two text nodes are adjacent once the tags between them are
+    /// consumed), the outer list holds only `["L1"]` and the middle list only `["L2"]`.
+    #[test]
+    fn test_trailing_text_after_sublist_rejoins_its_own_level() {
+        let html = "<ol><li>L1<ol><li>L2<ol><li>L3</li></ol>after L2</li></ol>after L1</li></ol>";
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+        assert_eq!(doc.len(), 8, "expected 3 List + 5 ListItem nodes");
+
+        let lists = list_node_indices(&doc);
+        assert_eq!(lists.len(), 3, "expected exactly 3 List nodes, got {lists:?}");
+        for list_idx in &lists {
+            assert!(
+                matches!(doc.nodes[*list_idx].content, NodeContent::List { ordered: true }),
+                "list node {list_idx} must stay ordered"
+            );
+        }
+
+        assert_eq!(
+            list_item_texts(&doc, lists[0]),
+            vec!["L1".to_string(), "after L1".to_string()]
+        );
+        assert_eq!(
+            list_item_texts(&doc, lists[1]),
+            vec!["L2".to_string(), "after L2".to_string()]
+        );
+        assert_eq!(list_item_texts(&doc, lists[2]), vec!["L3".to_string()]);
+
+        assert!(
+            paragraph_texts(&doc).is_empty(),
+            "no trailing run may become a Paragraph, got {:?}",
+            paragraph_texts(&doc)
+        );
+    }
+
+    /// Task #721 on pretty-printed markup, which is what DOCX/ODT/email HTML actually looks
+    /// like. Two things must hold at once: the whitespace between `</ul>` and `</li>` in the
+    /// first item must not mint an empty list item now that it is buffered as item text, and
+    /// the real trailing text `E` in the second item must become an item of the outer list.
+    ///
+    /// Against the unfixed code the outer list holds only `["A", "C"]` and a `Paragraph` with
+    /// text `"E"` exists.
+    #[test]
+    fn test_pretty_printed_sublist_keeps_trailing_text_without_empty_items() {
+        let html = r#"<ul>
+  <li>A
+    <ul>
+      <li>B</li>
+    </ul>
+  </li>
+  <li>C
+    <ul>
+      <li>D</li>
+    </ul>
+    E
+  </li>
+</ul>"#;
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+
+        let lists = list_node_indices(&doc);
+        assert_eq!(lists.len(), 3, "expected exactly 3 List nodes, got {lists:?}");
+
+        assert_eq!(
+            list_item_texts(&doc, lists[0]),
+            vec!["A".to_string(), "C".to_string(), "E".to_string()],
+            "trailing text after the second sublist must join the outer list"
+        );
+        assert_eq!(list_item_texts(&doc, lists[1]), vec!["B".to_string()]);
+        assert_eq!(list_item_texts(&doc, lists[2]), vec!["D".to_string()]);
+
+        assert!(
+            paragraph_texts(&doc).is_empty(),
+            "trailing list-item text must not be emitted as a Paragraph, got {:?}",
+            paragraph_texts(&doc)
+        );
+        assert_eq!(
+            doc.len(),
+            8,
+            "whitespace-only content between </ul> and </li> must not mint an empty ListItem"
+        );
+    }
+
+    /// Regression test for task #727: `flush_list_item` dropped `self.annotations` on the
+    /// floor, so inline formatting inside an `<li>` never reached the `ListItem` node.
+    ///
+    /// Against the unfixed code the item's `annotations` is empty.
+    #[test]
+    fn test_list_item_keeps_its_inline_annotations() {
+        let html = "<ul><li>alpha <strong>bold</strong></li></ul>";
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+
+        let item = doc
+            .nodes
+            .iter()
+            .find(|node| matches!(node.content, NodeContent::ListItem { .. }))
+            .expect("expected a ListItem node");
+        assert!(
+            matches!(&item.content, NodeContent::ListItem { text } if text == "alpha bold"),
+            "unexpected item text: {:?}",
+            item.content
+        );
+        assert_eq!(
+            item.annotations.len(),
+            1,
+            "the item's <strong> must survive the flush, got {:?}",
+            item.annotations
+        );
+        assert_eq!(item.annotations[0].kind, AnnotationKind::Bold);
+        assert_eq!(item.annotations[0].start, 6);
+        assert_eq!(item.annotations[0].end, 10);
+    }
+
+    /// Task #727, the worse half: because the annotation buffer was never cleared either,
+    /// a list item's annotations stayed pending and were claimed by the next node that
+    /// flushed, landing on unrelated text at offsets that mean nothing there.
+    ///
+    /// Against the unfixed code the trailing paragraph carries `Bold { start: 6, end: 10 }`
+    /// — the offsets of "bold" inside the list item, which in "Trailing sentence text."
+    /// mark "ng s".
+    #[test]
+    fn test_list_item_annotations_do_not_leak_into_the_next_paragraph() {
+        let html = "<ul><li>alpha <strong>bold</strong></li></ul>Trailing sentence text.";
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+
+        let para = doc
+            .nodes
+            .iter()
+            .find(|node| matches!(&node.content, NodeContent::Paragraph { text } if text == "Trailing sentence text."))
+            .expect("expected the trailing text to become a Paragraph");
+        assert!(
+            para.annotations.is_empty(),
+            "list-item formatting must not be re-attributed to the following paragraph, got {:?}",
+            para.annotations
+        );
+    }
+
+    /// Task #727, half-open spans: `pop_inline` measures against whichever buffer is live,
+    /// so an inline element left unclosed when the item flushed would close against the
+    /// *next* buffer. Clearing the inline stack alongside the annotation buffer (what
+    /// `flush_paragraph` already does) is what stops it.
+    ///
+    /// Against the unfixed code the trailing paragraph carries `Bold { start: 6, end: 17 }`,
+    /// i.e. "ng sentence" of "Trailing sentence" rendered bold.
+    #[test]
+    fn test_unclosed_inline_in_a_list_item_does_not_annotate_later_text() {
+        let html = "<ul><li>alpha <strong>bold</li></ul>Trailing sentence</strong>";
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+
+        let para = doc
+            .nodes
+            .iter()
+            .find(|node| matches!(&node.content, NodeContent::Paragraph { text } if text == "Trailing sentence"))
+            .expect("expected the trailing text to become a Paragraph");
+        assert!(
+            para.annotations.is_empty(),
+            "an inline span left open in a list item must not close against later text, got {:?}",
+            para.annotations
+        );
+    }
+
+    /// Regression test for task #728: `push_list` parents through the section/container
+    /// stack, so a `<ul>` nested inside an `<li>` became a root-level sibling of the outer
+    /// list instead of a child of the item containing it.
+    ///
+    /// Against the unfixed code the inner list's `parent` is `None` and
+    /// `body_roots().count()` is 2.
+    #[test]
+    fn test_sublist_becomes_a_child_of_its_list_item() {
+        let html = "<ul><li>parent<ul><li>child</li></ul>tail</li></ul>";
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+
+        let lists = list_node_indices(&doc);
+        assert_eq!(lists.len(), 2, "expected exactly 2 List nodes, got {lists:?}");
+        assert_eq!(
+            list_item_texts(&doc, lists[0]),
+            vec!["parent".to_string(), "tail".to_string()]
+        );
+        assert_eq!(list_item_texts(&doc, lists[1]), vec!["child".to_string()]);
+
+        let parent_item = doc.nodes[lists[0]].children[0];
+        assert_eq!(
+            doc.nodes[lists[1]].parent,
+            Some(parent_item),
+            "the sublist must hang off the <li> it is written inside, not off the document root"
+        );
+        assert_eq!(
+            doc.nodes[parent_item.0 as usize].children,
+            vec![NodeIndex(lists[1] as u32)],
+            "the containing item must own the sublist"
+        );
+        assert_eq!(doc.body_roots().count(), 1, "only the outer list may be a root node");
+    }
+
+    /// Task #728 with no text before the sublist: there is no `ListItem` to parent under,
+    /// and minting an empty one is explicitly unwanted (see
+    /// `test_pretty_printed_sublist_keeps_trailing_text_without_empty_items`). The sublist
+    /// falls back to the enclosing `List` so it still stays inside the list subtree.
+    ///
+    /// Against the unfixed code the inner list's `parent` is `None`.
+    #[test]
+    fn test_textless_item_sublist_stays_inside_the_outer_list() {
+        let html = "<ul><li>first</li><li><ul><li>child</li></ul></li></ul>";
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+
+        let lists = list_node_indices(&doc);
+        assert_eq!(lists.len(), 2, "expected exactly 2 List nodes, got {lists:?}");
+        assert_eq!(
+            doc.nodes[lists[1]].parent,
+            Some(NodeIndex(lists[0] as u32)),
+            "a sublist in a text-less item must not become a root-level sibling"
+        );
+        assert_eq!(doc.body_roots().count(), 1, "only the outer list may be a root node");
+    }
+
     #[test]
     fn test_ordered_list() {
         let html = "<ol><li>First</li><li>Second</li></ol>";
@@ -1174,6 +1622,44 @@ mod tests {
             }
             other => panic!("Expected Table, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_nested_table_is_flattened_into_the_enclosing_cell() {
+        let html = "<table><tr><td>A1</td><td>A2</td></tr><tr><td><table><tr><td>N1</td><td>N2</td></tr></table></td><td>B2</td></tr><tr><td>C1</td><td>C2</td></tr></table>";
+        let doc = build_document_structure(html);
+        assert!(doc.validate().is_ok());
+        assert_eq!(doc.nodes.len(), 1, "got {:?}", doc.nodes);
+        match &doc.nodes[0].content {
+            NodeContent::Table { grid } => {
+                assert_eq!(grid.rows, 3);
+                assert_eq!(grid.cols, 2);
+                let texts: Vec<&str> = grid.cells.iter().map(|c| c.content.as_str()).collect();
+                assert!(texts.contains(&"A1"), "got {texts:?}");
+                assert!(texts.contains(&"C2"), "got {texts:?}");
+                assert!(
+                    texts.iter().any(|t| t.contains("N1") && t.contains("N2")),
+                    "got {texts:?}"
+                );
+            }
+            other => panic!("Expected Table, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_heading_line_breaks_become_newlines_without_sentinels() {
+        let html = "<h2><br/><br/>CHAPTER I.</h2><h1>PRIDE<br/>and<br/>PREJUDICE</h1>";
+        let doc = build_document_structure(html);
+        let headings: Vec<String> = doc
+            .nodes
+            .iter()
+            .filter_map(|node| match &node.content {
+                NodeContent::Heading { text, .. } => Some(text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headings, vec!["CHAPTER I.", "PRIDE\nand\nPREJUDICE"]);
+        assert!(headings.iter().all(|h| !h.contains('\x01')));
     }
 
     #[test]

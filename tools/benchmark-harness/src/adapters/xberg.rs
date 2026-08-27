@@ -4,12 +4,15 @@
 //! - Native, layout, PaddleOCR, Sceptre, and candle OCR pipelines
 //! - Single-file and batch extraction modes
 //! - JSON envelope parsing (ExtractEnvelope and BatchEnvelope)
+//! - PDF backend selection (`XbergPdfBackend`): `Native` (default) or `Pdfium` (opt-in only,
+//!   named explicitly via `--frameworks`; the pdfium shared library is not bundled in benchmark
+//!   images yet)
 
 use crate::{
     adapter::declared_ocr_language_policy,
     adapters::subprocess::SubprocessAdapter,
     error::Result,
-    types::{BatchCapability, BatchEntryPoint, BatchTimingScope, OutputFormat, XbergPipeline},
+    types::{BatchCapability, BatchEntryPoint, BatchTimingScope, OutputFormat, XbergPdfBackend, XbergPipeline},
 };
 use std::{
     ffi::OsStr,
@@ -95,12 +98,46 @@ fn pipeline_requires_ocr(pipeline: XbergPipeline) -> bool {
     !matches!(pipeline, XbergPipeline::Baseline | XbergPipeline::Layout)
 }
 
+/// Builds the framework name for a pipeline/format/batch/pdf-backend combination.
+///
+/// `XbergPdfBackend::Native` must keep producing exactly today's name (no suffix) so existing
+/// committed results under `tools/benchmark-harness/results/` stay comparable. Only a non-default
+/// backend earns a `-pdfium` suffix, inserted before the `-batch` suffix.
+fn xberg_framework_name(
+    pipeline: XbergPipeline,
+    output_format: OutputFormat,
+    batch: bool,
+    pdf_backend: XbergPdfBackend,
+) -> String {
+    let format_slug = match output_format {
+        OutputFormat::Markdown => "markdown",
+        OutputFormat::Plaintext => "plaintext",
+    };
+    let pdf_backend_suffix = match pdf_backend {
+        XbergPdfBackend::Native => "",
+        XbergPdfBackend::Pdfium => "-pdfium",
+    };
+    if batch {
+        format!(
+            "xberg-{}-{}{}-batch",
+            format_slug,
+            pipeline.as_str(),
+            pdf_backend_suffix
+        )
+    } else {
+        format!("xberg-{}-{}{}", format_slug, pipeline.as_str(), pdf_backend_suffix)
+    }
+}
+
 /// Creates a Xberg adapter for the given pipeline and configuration.
 ///
 /// # Arguments
 /// * `pipeline` - The pipeline variant (baseline, layout, paddle-ocr)
 /// * `output_format` - Output format for extraction (markdown or plaintext)
 /// * `batch` - Whether to use batch extraction mode
+/// * `pdf_backend` - PDF engine to select via `--pdf-backend`. `Native` reproduces today's
+///   behavior and framework name exactly; `Pdfium` appends a `-pdfium` suffix to the framework
+///   name so it never collides with (or silently replaces) an existing `Native` cohort.
 ///
 /// # Returns
 /// * `Ok(SubprocessAdapter)` - Configured adapter ready for extraction
@@ -110,6 +147,7 @@ pub fn create_xberg_adapter(
     output_format: OutputFormat,
     batch: bool,
     ocr_enabled: bool,
+    pdf_backend: XbergPdfBackend,
 ) -> Result<SubprocessAdapter> {
     if !ocr_enabled && pipeline_requires_ocr(pipeline) {
         return Err(crate::Error::Config(format!(
@@ -203,17 +241,9 @@ pub fn create_xberg_adapter(
     }
 
     args.push("--pdf-backend".to_string());
-    args.push("pdf-oxide".to_string());
+    args.push(pdf_backend.as_str().to_string());
 
-    let format_slug = match output_format {
-        OutputFormat::Markdown => "markdown",
-        OutputFormat::Plaintext => "plaintext",
-    };
-    let framework_name = if batch {
-        format!("xberg-{}-{}-batch", format_slug, pipeline.as_str())
-    } else {
-        format!("xberg-{}-{}", format_slug, pipeline.as_str())
-    };
+    let framework_name = xberg_framework_name(pipeline, output_format, batch, pdf_backend);
     // Derive the benchmarkable format list from xberg's own MIME registry so it never drifts from
     // what xberg can actually extract (a stale hardcoded list silently filtered out fixtures for
     // formats like fb2/eml/msg/rst/org/latex/typst/docbook/tsv, which xberg fully supports).
@@ -491,9 +521,55 @@ mod tests {
         assert_eq!(args[config_index + 1], TESSERACT_BENCHMARK_CONFIG_JSON);
     }
 
+    /// The native leg must keep producing exactly today's framework name, or existing committed
+    /// results under `tools/benchmark-harness/results/` stop being comparable to new runs.
+    #[test]
+    fn native_pdf_backend_keeps_todays_framework_name() {
+        for (batch, expected) in [
+            (false, "xberg-markdown-baseline"),
+            (true, "xberg-markdown-baseline-batch"),
+        ] {
+            assert_eq!(
+                xberg_framework_name(
+                    XbergPipeline::Baseline,
+                    OutputFormat::Markdown,
+                    batch,
+                    XbergPdfBackend::Native
+                ),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn pdfium_pdf_backend_gets_a_distinct_suffixed_framework_name() {
+        for (batch, expected) in [
+            (false, "xberg-markdown-baseline-pdfium"),
+            (true, "xberg-markdown-baseline-pdfium-batch"),
+        ] {
+            assert_eq!(
+                xberg_framework_name(
+                    XbergPipeline::Baseline,
+                    OutputFormat::Markdown,
+                    batch,
+                    XbergPdfBackend::Pdfium
+                ),
+                expected
+            );
+        }
+        assert_eq!(XbergPdfBackend::Native.as_str(), "native");
+        assert_eq!(XbergPdfBackend::Pdfium.as_str(), "pdfium");
+    }
+
     #[test]
     fn ocr_only_pipeline_is_rejected_when_ocr_is_disabled() {
-        let error = match create_xberg_adapter(XbergPipeline::PaddleOcr, OutputFormat::Markdown, false, false) {
+        let error = match create_xberg_adapter(
+            XbergPipeline::PaddleOcr,
+            OutputFormat::Markdown,
+            false,
+            false,
+            XbergPdfBackend::Native,
+        ) {
             Ok(_) => panic!("OCR-only adapter should not be created when OCR is disabled"),
             Err(error) => error,
         };

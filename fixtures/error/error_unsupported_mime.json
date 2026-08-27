@@ -7,7 +7,7 @@
 		"title": "Error when extracting with unsupported MIME type",
 		"description": "Error when extracting with unsupported MIME type",
 		"presentation": {
-			"files": [{ "field": "/bytes", "path": "test_documents/text/plain.txt" }]
+			"files": [{ "field": "/bytes", "path": "text/plain.txt" }]
 		},
 		"side_effects": "safe"
 	},

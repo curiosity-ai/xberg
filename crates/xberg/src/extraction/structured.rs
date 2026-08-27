@@ -74,6 +74,8 @@ pub struct JsonExtractionConfig {
     /// When `true`, field values are annotated with their JSON type.
     pub include_type_info: bool,
     /// When `true`, nested objects are flattened into dot-separated key paths.
+    /// When `false`, each nested object is retained as compact JSON under its
+    /// parent path in [`StructuredDataResult::flattened`].
     pub flatten_nested_objects: bool,
     /// Additional field-name patterns (exact match, case-insensitive) treated as text fields.
     pub custom_text_field_patterns: Vec<String>,
@@ -227,6 +229,15 @@ fn extract_from_json_value(
 ) -> Vec<String> {
     match value {
         serde_json::Value::Object(obj) => {
+            if !config.flatten_nested_objects && !path.is_empty() {
+                let rendered = if config.include_type_info {
+                    format!("{} (object): {}", path, value)
+                } else {
+                    format!("{}: {}", path, value)
+                };
+                return vec![rendered];
+            }
+
             let mut text_parts = Vec::new();
             for (key, val) in obj {
                 let base_len = path.len();
@@ -587,6 +598,26 @@ mod tests {
         let result = parse_json(json.as_bytes(), None).unwrap();
         assert!(result.content.contains("\"name\": \"Alice\""));
         assert!(result.content.contains("\"email\": \"alice@example.com\""));
+        assert_eq!(
+            result.flattened,
+            vec!["user.name: Alice", "user.email: alice@example.com"]
+        );
+    }
+
+    #[test]
+    fn should_preserve_nested_json_objects_when_flattening_is_disabled() {
+        let json = r#"{"user": {"name": "Alice", "email": "alice@example.com"}}"#;
+        let config = JsonExtractionConfig {
+            flatten_nested_objects: false,
+            ..Default::default()
+        };
+
+        let result = parse_json(json.as_bytes(), Some(config)).expect("nested JSON must parse");
+
+        assert_eq!(
+            result.flattened,
+            vec![r#"user: {"name":"Alice","email":"alice@example.com"}"#]
+        );
     }
 
     #[test]

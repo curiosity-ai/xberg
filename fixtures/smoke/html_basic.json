@@ -13,7 +13,7 @@
           "path": "results[0].tables",
           "item": "table",
           "fields": [
-            "rows"
+            "cells"
           ],
           "display": true
         }

@@ -28,7 +28,11 @@ pub mod backend;
 pub mod candle;
 #[cfg(feature = "ner-onnx")]
 pub mod gline;
-#[cfg(all(feature = "ner-llm", not(all(target_os = "android", target_arch = "x86_64"))))]
+#[cfg(all(
+    feature = "ner-llm",
+    not(target_arch = "wasm32"),
+    not(all(target_os = "android", target_arch = "x86_64"))
+))]
 pub mod llm;
 pub mod offsets;
 
@@ -37,6 +41,7 @@ pub use backend::NerBackend;
 use crate::Result;
 use crate::types::entity::Entity;
 
+#[cfg(feature = "ner-onnx")]
 use std::path::PathBuf;
 
 /// Eagerly download a NER model into the Hugging Face Hub cache.
@@ -50,33 +55,16 @@ pub fn download_model(name: &str, cache_dir: Option<PathBuf>) -> crate::Result<P
     gline::download_model(name, cache_dir)
 }
 
-#[cfg(not(feature = "ner-onnx"))]
-pub fn download_model(_name: &str, _cache_dir: Option<PathBuf>) -> crate::Result<PathBuf> {
-    Err(crate::XbergError::Other(
-        "ner-onnx feature not available on this target".into(),
-    ))
-}
-
 /// Pinned default NER model identifier.
 #[cfg(feature = "ner-onnx")]
 pub fn default_model_name() -> &'static str {
     gline::DEFAULT_MODEL_NAME
 }
 
-#[cfg(not(feature = "ner-onnx"))]
-pub fn default_model_name() -> &'static str {
-    "gliner-stub"
-}
-
 /// All NER models xberg knows about (used by `--all-ner-models`).
 #[cfg(feature = "ner-onnx")]
 pub fn known_models() -> &'static [&'static str] {
     gline::KNOWN_MODELS
-}
-
-#[cfg(not(feature = "ner-onnx"))]
-pub fn known_models() -> &'static [&'static str] {
-    &[]
 }
 
 /// Expected GLiNER cache artifacts for manifest tooling.

@@ -10,12 +10,13 @@
 !Cargo.toml
 !Cargo.lock
 !crates/xberg/
-!crates/ttf-parser-compat/
 !crates/xberg-gliner/
 !crates/xberg-cli/
 !crates/xberg-tesseract/
 !crates/xberg-paddle-ocr/
 !crates/xberg-candle-ocr/
+!crates/xberg-pdfium-render/
+!crates/xberg-native-pdf/
 !crates/xberg-ffi/
 !crates/xberg-libheif/
 !crates/xberg-libwpd/

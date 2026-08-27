@@ -1,4 +1,4 @@
-//! Main PDF-to-Markdown pipeline orchestrator (oxide backend).
+//! Main PDF-to-Markdown pipeline orchestrator (native backend).
 
 use std::borrow::Cow;
 
@@ -25,6 +25,23 @@ use super::types::{LayoutHint, PdfParagraph};
 
 const SPARSE_REPEATED_TIER_MIN_PAGES: usize = 2;
 const SPARSE_FONT_TIER_CLUSTER_COUNT: usize = 2;
+/// Font-size "same tier" tolerance (absolute, in the unit `font_size` happens to carry —
+/// points for native PDFs, a render-DPI-dependent pixel measurement for OCR segments).
+///
+/// This IS scale-dependent, and a naive ratio-of-centroid conversion was tried and
+/// reverted: forcing `cluster_font_sizes(_, 2)` on a sparse (<5 block) document routinely
+/// produces two centroids that are themselves not tight (e.g. a genuine 22pt/21pt/12pt
+/// three-tier native document forced into k=2 merges 22 and 21 into one ~21.7 centroid).
+/// The tight 0.5pt absolute tolerance deliberately rejects that merge as "not narrow
+/// enough" via `has_only_two_narrow_font_tiers`, which is what keeps a non-repeated 21pt
+/// "Display prose" line (see `test_build_heading_map_sparse_multi_page_does_not_promote_
+/// non_repeated_intermediate_tier`) out of the repeated-heading cluster. A ratio tolerance
+/// wide enough to be useful for OCR pixel noise (e.g. 5% of a ~21px cluster) is also wide
+/// enough to swallow that native 0.667pt merge slop, which flips `find_heading_level` from
+/// `None` to `Some(2)` for the 21pt line and regresses that guard. No tolerance value is
+/// simultaneously tight enough to guard native merge slop and loose enough for OCR pixel
+/// noise, because both slop magnitudes scale with the *same* input (the forced-k=2
+/// centroid), so this stays absolute — see the report for the full trade-off. ~keep
 const SPARSE_FONT_TIER_TOLERANCE: f32 = 0.5;
 // A tier repeated at the top of multiple pages represents peer sections, not a
 // unique document title; reserve H1 for a title and emit these sections as H2. ~keep
@@ -202,7 +219,7 @@ fn build_heading_map(
         };
 
         let clusters = cluster_font_sizes(&all_blocks, effective_k)?;
-        let mut map = assign_heading_levels_smart(&clusters, MIN_HEADING_FONT_RATIO, MIN_HEADING_FONT_GAP);
+        let mut map = assign_heading_levels_smart(&clusters, MIN_HEADING_FONT_RATIO);
 
         let has_any_heading = map.iter().any(|(_, level)| level.is_some());
         if !has_any_heading && !heuristic_pages.is_empty() {
@@ -219,6 +236,8 @@ fn build_heading_map(
 
                 if median > 0.0
                     && first_font >= median * 1.2
+                    // Absolute-unit match tolerance; kept as-is for the same reason
+                    // `SPARSE_FONT_TIER_TOLERANCE` was kept absolute — see its doc comment.
                     && let Some(entry) = map.iter_mut().find(|(fs, _)| (*fs - first_font).abs() < 0.5)
                 {
                     entry.1 = Some(1);
@@ -810,9 +829,395 @@ fn segments_to_paragraphs(
     let segments = order_segments_in_reading_frames(segments);
     let mut paragraphs = blocks_to_paragraphs(segments, heading_map, paragraph_gap_ys);
     apply_text_repair_to_structure_tree_paragraphs(&mut paragraphs, true);
+    reattach_detached_list_markers(&mut paragraphs, DetachedMarkerFrame::Native);
     merge_continuation_paragraphs(&mut paragraphs);
     synchronize_paragraph_text_metadata(&mut paragraphs);
     paragraphs
+}
+
+/// Master switch for [`reattach_detached_list_markers`].
+///
+/// Flip this single constant to `false` to build a control binary that differs
+/// from the shipped one only in this behaviour; nothing else guards the pass.
+const REATTACH_DETACHED_LIST_MARKERS: bool = true;
+
+/// Suppress heading promotion for a fragment whose text starts lowercase or with
+/// a sentence-continuation word (#712).
+///
+/// This is the fabrication signature of the OCR mid-line paragraph break: when
+/// `font_change` (`(line.font_size - prev.font_size).abs() > 1.5`) splits a
+/// physical line on intra-line ascender/descender noise, the stray tail
+/// fragment almost always starts mid-sentence -- lowercase, or with "is", "of",
+/// "and", and the like -- because a real sentence or heading boundary does not
+/// land there. That stray fragment's own (noise-inflated) font size is then
+/// read as `first.font_size` for the *next* paragraph and can clear the
+/// heading-distance gate in [`super::classify::find_heading_level`], fabricating
+/// a heading out of a sentence fragment (e.g. `### storage.`,
+/// `### groundwork for future developments. Over time,`). Reuses
+/// [`super::classify::starts_with_lowercase_or_continuation`], the same guard
+/// the rescue pass already trusts for the identical judgment, so this adds no
+/// new heuristic surface. Flip to `false` to restore pre-#712 behaviour.
+const SUPPRESS_LOWERCASE_START_HEADINGS: bool = true;
+
+/// How closely a detached marker's baseline must agree with the baseline of the
+/// body line it is claimed to belong to, as a multiple of the larger of the two
+/// font sizes. Scale-free by construction, so it behaves identically on
+/// point-scale native input and on OCR font sizes of a different magnitude.
+const DETACHED_MARKER_BASELINE_TOLERANCE_FONT_FACTOR: f32 = 0.6;
+
+/// Largest hanging indent, measured from the marker's right edge to the body
+/// line's left edge, as a multiple of the body font size. Real hanging indents
+/// run a quarter to half an inch; this admits those while refusing to pair a
+/// marker in one column with a body in another.
+const DETACHED_MARKER_MAX_INDENT_FONT_FACTOR: f32 = 6.0;
+
+/// Largest overlap tolerated in the other direction, as a multiple of the body
+/// font size, so a marker whose measured width slightly overruns the body's
+/// left edge still pairs.
+const DETACHED_MARKER_MAX_OVERLAP_FONT_FACTOR: f32 = 0.5;
+
+/// How many paragraphs ahead of a detached marker its body may sit. A marker
+/// *column* emits every marker before any body ("(a)", "(b)", "(c)", then three
+/// bodies), so the body is not necessarily the next paragraph.
+///
+/// Also reused by the OCR layout route's `adapters::reattach_ocr_layout_list_markers`.
+pub(super) const DETACHED_MARKER_MAX_LOOKAHEAD: usize = 8;
+
+/// Minimum word count of the body paragraph. Excludes single-token neighbours,
+/// which is what a marker-shaped table column looks like.
+///
+/// `pub(super)` so `adapters::accepts_marker_run_body` (#729) can reuse it for
+/// the marker-run/body-run pairing phase of `adapters::reattach_ocr_layout_list_markers`.
+pub(super) const DETACHED_MARKER_MIN_BODY_WORDS: usize = 2;
+
+/// Whether the two detached-list-marker reattachment passes (this module's
+/// [`detached_list_marker`] and `adapters::ocr_detached_list_marker`) reject a
+/// lone `*` and a bracketed integer `[N]` as marker paragraphs, on top of the
+/// general [`is_bare_list_marker`] test.
+///
+/// Both shapes are ambiguous specifically in the *detached* (cross-paragraph)
+/// case, where the marker paragraph can be reattached to a body many
+/// paragraphs away: a standalone `*` line is also a bare multiplication sign
+/// in isolated mathematical prose, and `[N]` is the standard printed
+/// paragraph-number notation in reference works (e.g. Jung's Collected
+/// Works), not a list marker. Reattaching either turns unrelated prose into a
+/// fabricated list item. Flip to `false` to restore the pre-tightening
+/// behaviour where both are accepted. Deliberately does NOT touch
+/// `is_bare_list_marker` itself, which stays available to the *same-line*
+/// split-marker cases in `blocks_to_paragraphs` and `finalize_paragraph`,
+/// where the marker and body are already adjacent segments on one physical
+/// line and this cross-paragraph ambiguity does not arise. ~keep
+const EXCLUDE_AMBIGUOUS_DETACHED_MARKERS: bool = true;
+
+/// Whether `text` is a marker shape that is ambiguous enough to reject in the
+/// *detached* (cross-paragraph) reattachment passes even though
+/// [`is_bare_list_marker`] accepts it. See [`EXCLUDE_AMBIGUOUS_DETACHED_MARKERS`].
+fn is_ambiguous_detached_marker(text: &str) -> bool {
+    let t = text.trim();
+    if t == "*" {
+        return true;
+    }
+    if let Some(inner) = t.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        return !inner.is_empty() && inner.chars().all(|character| character.is_ascii_digit());
+    }
+    false
+}
+
+/// Narrower sibling of [`is_bare_list_marker`] used only by the two detached
+/// (cross-paragraph) reattachment passes -- this module's
+/// [`detached_list_marker`] and `adapters::ocr_detached_list_marker`. See
+/// [`EXCLUDE_AMBIGUOUS_DETACHED_MARKERS`] for why the two predicates
+/// deliberately differ.
+pub(super) fn is_bare_detached_list_marker(text: &str) -> bool {
+    is_bare_list_marker(text) && !(EXCLUDE_AMBIGUOUS_DETACHED_MARKERS && is_ambiguous_detached_marker(text))
+}
+
+/// Which reading frame [`accepts_detached_list_marker`] should compare geometry in.
+///
+/// `Native` is the pre-#760 behaviour: it reuses each segment's own
+/// `rotation_degrees` via [`SegmentData::upright_baseline`] /
+/// [`SegmentData::upright_advance_extent`], unchanged. `OcrOnPage` is the OCR
+/// route's correction (#760): OCR segments always carry `rotation_degrees ==
+/// 0.0` -- `rotation_degrees` on native text encodes that TEXT RUN's own
+/// orientation on the page, and OCR's raster boxes have no analogous per-run
+/// signal, so `adapters::make_ocr_pdf_line` hardcodes `0.0` -- but on a page
+/// with a PDF `/Rotate`, the OCR raster stays MediaBox-oriented by design, so a
+/// rotated page's segment `x`/`y`/`width`/`height` sit in the RASTER frame while
+/// this predicate needs the UPRIGHT reading frame. `OcrOnPage(degrees)`
+/// recovers that frame locally, from the page's own `/Rotate` value, without
+/// writing anything back onto [`SegmentData`].
+///
+/// Writing the correction onto `SegmentData::rotation_degrees` globally instead
+/// was tried and rejected: it silently activates roughly 82 other
+/// `is_unrotated()` / `has_same_rotation()` / `upright_*()` call sites across 10
+/// files, all written for native text's TEXT-LOCAL-ADVANCE convention (`width`
+/// is the run's advance along its own baseline), which OCR's axis-aligned boxes
+/// do not satisfy -- it regressed `ocr_test_rotated_90` (word count 15 -> 13,
+/// glued "conversion toJSON") and scrambled `ocr_test_rotated_270`'s reading
+/// order entirely. Keeping the correction local to this one predicate, computed
+/// fresh from the raw fields on every call, avoids all of that blast radius.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum DetachedMarkerFrame {
+    /// Native PDF text: defer to the segment's own `rotation_degrees`.
+    Native,
+    /// OCR route on a page whose PDF `/Rotate` is `degrees` (0/90/180/270).
+    ///
+    /// Only ever constructed from the OCR adapters, so on a feature set without
+    /// OCR this variant is genuinely dead -- the `Native` arm still carries the
+    /// whole native structure-tree path. `-D warnings` on the narrow `pdf` leg
+    /// turns that into a hard error, so silence it exactly there rather than
+    /// splitting the enum. ~keep
+    #[cfg_attr(not(any(feature = "ocr", feature = "ocr-pipeline")), allow(dead_code))]
+    OcrOnPage(u32),
+}
+
+impl DetachedMarkerFrame {
+    /// The baseline coordinate to compare, in this frame.
+    ///
+    /// The OCR arms are measured against fixture `ordinance_2197` (`/Rotate
+    /// 270`), tesseract backend, except `90`, which mirrors `270` by symmetry
+    /// and has no fixture measurement backing it -- see this type's doc
+    /// comment. `180` is confirmed a no-op: it falls through to the same
+    /// `baseline_y` read as the unrotated default.
+    fn baseline(self, segment: &SegmentData) -> f32 {
+        match self {
+            Self::Native => segment.upright_baseline(),
+            // Measured: the FAR raster-x edge (`x + width`), not the near edge
+            // (`x`) -- the far edge discriminates correct marker/body pairs
+            // from wrong ones (delta 0-1 vs 215 against an 18-wide tolerance);
+            // the near edge cannot (75-76 vs 139).
+            Self::OcrOnPage(270) => segment.x + segment.width,
+            // UNVERIFIED: derived by mirroring the 270 case (the near edge
+            // instead of the far edge, matching the opposite rotation
+            // handedness), not measured against any fixture.
+            Self::OcrOnPage(90) => segment.x,
+            Self::OcrOnPage(_) => segment.baseline_y,
+        }
+    }
+
+    /// `(start, end)` along the reading direction, in this frame.
+    fn advance_extent(self, segment: &SegmentData) -> (f32, f32) {
+        match self {
+            Self::Native => segment.upright_advance_extent(),
+            // Measured: the advance axis runs along -y on a 270-rotated page,
+            // and the reading-order START is the FAR raster-y edge
+            // (`y + height`), not the near edge -- omitting the raster-y
+            // extent mirrors the span ([-y, -y+height] instead of
+            // [-(y+height), -y]) and inverts the indent test.
+            Self::OcrOnPage(270) => (-(segment.y + segment.height), -segment.y),
+            // UNVERIFIED: derived by mirroring the 270 case (the advance axis
+            // runs along +y instead of -y, so the near/far roles swap and no
+            // negation is needed), not measured against any fixture.
+            Self::OcrOnPage(90) => (segment.y, segment.y + segment.height),
+            Self::OcrOnPage(_) => (segment.x, segment.x + segment.width),
+        }
+    }
+}
+
+/// Reattach a list marker that was emitted as a paragraph of its own to the
+/// body line it belongs to.
+///
+/// A hanging-indent list puts its markers in a narrow left column and its item
+/// text in a wide right column. Both OCR block segmentation and some native
+/// producers treat those columns as separate blocks, so the markers arrive as
+/// isolated single-segment paragraphs — sometimes the whole marker column
+/// ahead of the whole text column — and every item loses the only evidence that
+/// it is an item. `finalize_paragraph`'s `starts_with_split_list_marker` already
+/// handles the case where the marker and the body ended up in the *same*
+/// paragraph; this handles the case where they did not.
+///
+/// Pairing is by *baseline*, not by adjacency, which is what makes a marker
+/// column recoverable: "(a)", "(b)", "(c)" each match the body line they share a
+/// baseline with regardless of how many paragraphs sit between them.
+///
+/// Deliberately narrow, because this pass is shared with native extraction:
+/// - The marker paragraph must be exactly one line holding exactly one segment
+///   whose whole text is a bare marker ([`is_bare_detached_list_marker`]) —
+///   prose can never produce that, so flowing text has nothing here to match.
+///   Narrower than the general [`is_bare_list_marker`]: see
+///   [`EXCLUDE_AMBIGUOUS_DETACHED_MARKERS`].
+/// - The body must not already be a heading or a list item, and its first line
+///   must not already start with a marker.
+/// - The body must be strictly to the right of the marker, within one hanging
+///   indent, on the same baseline, in the same rotation frame.
+/// - The body must carry at least [`DETACHED_MARKER_MIN_BODY_WORDS`] words.
+///
+/// Everything is expressed relative to font size, so the OCR route (whose
+/// geometry may be in a different unit space) and the native route (points) get
+/// the same behaviour.
+pub(super) fn reattach_detached_list_markers(paragraphs: &mut Vec<PdfParagraph>, frame: DetachedMarkerFrame) {
+    if !REATTACH_DETACHED_LIST_MARKERS || paragraphs.len() < 2 {
+        return;
+    }
+
+    let mut consumed = vec![false; paragraphs.len()];
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
+
+    for marker_index in 0..paragraphs.len() {
+        if consumed[marker_index] {
+            continue;
+        }
+        let Some(marker) = detached_list_marker(&paragraphs[marker_index]) else {
+            continue;
+        };
+        let limit = (marker_index + 1 + DETACHED_MARKER_MAX_LOOKAHEAD).min(paragraphs.len());
+        let body_index = (marker_index + 1..limit).find(|&candidate| {
+            !consumed[candidate] && accepts_detached_list_marker(&paragraphs[candidate], &marker, frame)
+        });
+        let Some(body_index) = body_index else {
+            continue;
+        };
+        consumed[marker_index] = true;
+        consumed[body_index] = true;
+        pairs.push((marker_index, body_index));
+    }
+
+    if pairs.is_empty() {
+        return;
+    }
+
+    for (marker_index, body_index) in &pairs {
+        let Some(marker_segment) = paragraphs[*marker_index]
+            .lines
+            .first()
+            .and_then(|line| line.segments.first())
+            .cloned()
+        else {
+            continue;
+        };
+        let marker_bbox = paragraphs[*marker_index].block_bbox;
+        let body = &mut paragraphs[*body_index];
+        if let Some(line) = body.lines.first_mut() {
+            line.segments.insert(0, marker_segment);
+        }
+        body.is_list_item = true;
+        body.block_bbox = match (body.block_bbox, marker_bbox) {
+            (Some(body_bbox), Some(marker_bbox)) => Some((
+                body_bbox.0.min(marker_bbox.0),
+                body_bbox.1.min(marker_bbox.1),
+                body_bbox.2.max(marker_bbox.2),
+                body_bbox.3.max(marker_bbox.3),
+            )),
+            (bbox @ Some(_), None) | (None, bbox @ Some(_)) => bbox,
+            (None, None) => None,
+        };
+        // Text is rebuilt from `lines` downstream (see
+        // `synchronize_paragraph_text_metadata`); a stale cached string here
+        // would silently win over the segment we just spliced in.
+        body.text.clear();
+        body.word_count = PdfParagraph::compute_word_count("", &body.lines);
+    }
+
+    let mut index = 0usize;
+    paragraphs.retain(|_| {
+        let keep = !pairs.iter().any(|(marker_index, _)| *marker_index == index);
+        index += 1;
+        keep
+    });
+}
+
+/// The lone segment of a paragraph that is nothing but a list marker.
+fn detached_list_marker(paragraph: &PdfParagraph) -> Option<SegmentData> {
+    if paragraph.heading_level.is_some() || paragraph.is_list_item || paragraph.is_code_block || paragraph.is_formula {
+        return None;
+    }
+    let [line] = paragraph.lines.as_slice() else {
+        return None;
+    };
+    let [segment] = line.segments.as_slice() else {
+        return None;
+    };
+    if !is_bare_detached_list_marker(&segment.text) {
+        return None;
+    }
+    let geometry_is_usable = segment.x.is_finite()
+        && segment.width.is_finite()
+        && segment.width >= 0.0
+        && segment.font_size.is_finite()
+        && segment.font_size > 0.0
+        && segment.upright_baseline().is_finite();
+    geometry_is_usable.then(|| segment.clone())
+}
+
+/// Whether `paragraph` is the body line the detached `marker` belongs to.
+///
+/// Also reused by the OCR layout route's own reattachment pass
+/// (`adapters::reattach_ocr_layout_list_markers`) -- this body-side test has no
+/// dependency on how the marker paragraph itself was classified, only on the
+/// candidate body's own shape, so it applies identically to both routes once
+/// given the right [`DetachedMarkerFrame`] (#760): the OCR route passes
+/// `OcrOnPage`, native passes `Native`. See that function's doc comment for why
+/// the marker-side test (`detached_list_marker`, below) is NOT similarly
+/// shared.
+pub(super) fn accepts_detached_list_marker(
+    paragraph: &PdfParagraph,
+    marker: &SegmentData,
+    frame: DetachedMarkerFrame,
+) -> bool {
+    if paragraph.heading_level.is_some()
+        || paragraph.is_list_item
+        || paragraph.is_code_block
+        || paragraph.is_formula
+        || paragraph.is_page_furniture
+    {
+        return false;
+    }
+    let Some(first_line) = paragraph.lines.first() else {
+        return false;
+    };
+    if first_line.segments.is_empty() {
+        return false;
+    }
+    let first_line_text = first_line
+        .segments
+        .iter()
+        .map(|segment| segment.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    if looks_like_list_item(&first_line_text) || is_bare_list_marker(&first_line_text) {
+        return false;
+    }
+
+    let body_words = paragraph
+        .lines
+        .iter()
+        .flat_map(|line| line.segments.iter())
+        .flat_map(|segment| segment.text.split_whitespace())
+        .count();
+    if body_words < DETACHED_MARKER_MIN_BODY_WORDS {
+        return false;
+    }
+
+    let Some(anchor) = first_line.segments.first() else {
+        return false;
+    };
+    if !anchor.has_same_rotation(marker) {
+        return false;
+    }
+    let font_size = anchor.font_size.max(marker.font_size);
+    if !font_size.is_finite() || font_size <= 0.0 {
+        return false;
+    }
+
+    let baseline_delta = (frame.baseline(anchor) - frame.baseline(marker)).abs();
+    if !baseline_delta.is_finite() || baseline_delta > font_size * DETACHED_MARKER_BASELINE_TOLERANCE_FONT_FACTOR {
+        return false;
+    }
+
+    let body_left = first_line
+        .segments
+        .iter()
+        .map(|segment| frame.advance_extent(segment).0)
+        .fold(f32::INFINITY, f32::min);
+    let (marker_start, marker_end) = frame.advance_extent(marker);
+    if !body_left.is_finite() || !marker_start.is_finite() || !marker_end.is_finite() {
+        return false;
+    }
+    let indent = body_left - marker_end;
+    body_left > marker_start
+        && indent >= -(font_size * DETACHED_MARKER_MAX_OVERLAP_FONT_FACTOR)
+        && indent <= font_size * DETACHED_MARKER_MAX_INDENT_FONT_FACTOR
 }
 
 /// Repair reading order inside maximal rotated runs without touching upright
@@ -1136,7 +1541,22 @@ const PARAGRAPH_GAP_HEIGHT_FACTOR: f32 = 1.5;
 const PARAGRAPH_BREAK_LEADING_MULTIPLE: f32 = 1.5;
 const INLINE_STYLE_BASELINE_TOLERANCE: f32 = 0.5;
 const INLINE_STYLE_MAX_FORWARD_GAP_FONT_FACTOR: f32 = 1.0;
+const INLINE_FONT_SIZE_MAX_FORWARD_GAP_FONT_FACTOR: f32 = 1.5;
 const INLINE_STYLE_MAX_OVERLAP_FONT_FACTOR: f32 = 0.15;
+
+/// Multiple of font size within which two consecutive lines' right edges must
+/// agree for the second to read as the wrapped tail of a heading, rather than
+/// unrelated content that merely follows it.
+///
+/// A heading that wraps mid-sentence fills its first physical line out to the
+/// text column's right margin before continuing below, so the wrapped line and
+/// its continuation land their right edges close together; a heading followed
+/// by unrelated content (a callout, a new paragraph) has no reason to share
+/// that edge and typically differs by far more. Two font-size widths is
+/// generous enough to absorb ordinary word-wrap slack -- the space left unused
+/// because the next word did not fit -- without also treating a long heading
+/// followed by a much shorter, unrelated line as a wrap. See #1467.
+const HEADING_WRAP_RIGHT_EDGE_TOLERANCE_FONT_FACTOR: f32 = 2.0;
 
 /// Detect paragraph-break y-positions from horizontal whitespace bands.
 ///
@@ -1299,10 +1719,21 @@ fn blocks_to_paragraphs(
             false
         } else {
             let prev = current_lines.last().unwrap();
-            let font_change = (line.font_size - prev.font_size).abs() > 1.5;
+            let font_change = (line.font_size - prev.font_size).abs() > 1.5
+                && !is_inline_style_transition(
+                    current_is_single_visual_line,
+                    prev,
+                    line,
+                    INLINE_FONT_SIZE_MAX_FORWARD_GAP_FONT_FACTOR,
+                );
             let role_change = line.assigned_role != prev.assigned_role;
-            let bold_change =
-                line.is_bold != prev.is_bold && !is_inline_style_transition(current_is_single_visual_line, prev, line);
+            let bold_change = line.is_bold != prev.is_bold
+                && !is_inline_style_transition(
+                    current_is_single_visual_line,
+                    prev,
+                    line,
+                    INLINE_STYLE_MAX_FORWARD_GAP_FONT_FACTOR,
+                );
             let rotation_change = !line.has_same_rotation(prev);
             let starts_new_line = rotation_change
                 || (line.upright_baseline() - prev.upright_baseline()).abs() > INLINE_STYLE_BASELINE_TOLERANCE;
@@ -1323,6 +1754,23 @@ fn blocks_to_paragraphs(
             // prose beginning with a bare year — "2024 was een druk jaar" — does not
             // break its paragraph. See #1386. ~keep
             let starts_section = starts_new_line && super::classify::is_numbered_section_heading(&line.text);
+            // A numbered section heading also always ENDS the element it opens: without
+            // this term nothing else distinguishes a heading from the body text that
+            // follows it when both share font size, weight, role and line spacing --
+            // exactly the shape of a bold-only page in #1467, where the heading and the
+            // callout beneath it are otherwise identical on every signal this grouper
+            // checks. `starts_section` (above) only fires while classifying the
+            // heading's OWN line and cannot see forward to close it once it opens; this
+            // looks backward at `prev` instead. Restricting to `current_lines.len() ==
+            // 1` scopes the break to the line directly after the heading, so a
+            // paragraph that is already several lines long is untouched, and
+            // `heading_wraps_onto` exempts a heading that is itself still wrapping onto
+            // its next physical line rather than handing off to unrelated content. See
+            // #1467. ~keep
+            let follows_section = starts_new_line
+                && current_lines.len() == 1
+                && super::classify::is_numbered_section_heading(&prev.text)
+                && !heading_wraps_onto(prev, line);
             let crossed_gap = paragraph_gap_ys.iter().any(|&gap_y| {
                 let previous_baseline = prev.upright_baseline();
                 let current_baseline = line.upright_baseline();
@@ -1333,7 +1781,14 @@ fn blocks_to_paragraphs(
                 };
                 gap_y < upper && gap_y > lower
             });
-            rotation_change || font_change || role_change || bold_change || is_list || starts_section || crossed_gap
+            rotation_change
+                || font_change
+                || role_change
+                || bold_change
+                || is_list
+                || starts_section
+                || follows_section
+                || crossed_gap
         };
 
         if should_break && !current_lines.is_empty() {
@@ -1371,7 +1826,12 @@ fn blocks_to_paragraphs(
 ///
 /// PDF glyph runs can overlap slightly because of font metrics. Larger
 /// overlaps, reverse ordering, and wide gaps remain structural boundaries.
-fn is_inline_style_transition(current_is_single_visual_line: bool, previous: &SegmentData, next: &SegmentData) -> bool {
+fn is_inline_style_transition(
+    current_is_single_visual_line: bool,
+    previous: &SegmentData,
+    next: &SegmentData,
+    max_forward_gap_font_factor: f32,
+) -> bool {
     if !current_is_single_visual_line
         || previous.is_monospace
         || next.is_monospace
@@ -1407,7 +1867,36 @@ fn is_inline_style_transition(current_is_single_visual_line: bool, previous: &Se
     let advance_gap = next_start - previous_end;
     next_start >= previous_start
         && advance_gap >= -(font_size * INLINE_STYLE_MAX_OVERLAP_FONT_FACTOR)
-        && advance_gap <= font_size * INLINE_STYLE_MAX_FORWARD_GAP_FONT_FACTOR
+        && advance_gap <= font_size * max_forward_gap_font_factor
+}
+
+/// Whether `line` reads as the wrapped continuation of the numbered-heading
+/// line `prev`, rather than a new, unrelated line that happens to follow it.
+///
+/// Both lines' right edges (`upright_advance_extent().1` -- the same geometry
+/// [`is_inline_style_transition`] uses for its own right-edge test) are
+/// compared: a heading that wraps mid-sentence fills its column before
+/// continuing below, so its right edge and the next line's right edge land
+/// within [`HEADING_WRAP_RIGHT_EDGE_TOLERANCE_FONT_FACTOR`] font-sizes of each
+/// other. A short heading followed by unrelated content has no reason to share
+/// that edge, so the two lines' right edges typically differ by far more.
+/// Reused from [`super::paragraphs::merge_continuation_paragraphs`] so the
+/// grouper's split and the merge pass's guard agree on the same wrap
+/// exemption. See #1467.
+pub(super) fn heading_wraps_onto(prev: &SegmentData, line: &SegmentData) -> bool {
+    if !prev.has_same_rotation(line) {
+        return false;
+    }
+    if !prev.font_size.is_finite() || !line.font_size.is_finite() {
+        return false;
+    }
+    let (_, prev_end) = prev.upright_advance_extent();
+    let (_, line_end) = line.upright_advance_extent();
+    if !prev_end.is_finite() || !line_end.is_finite() {
+        return false;
+    }
+    let tolerance = HEADING_WRAP_RIGHT_EDGE_TOLERANCE_FONT_FACTOR * prev.font_size.max(line.font_size).max(1.0);
+    (prev_end - line_end).abs() <= tolerance
 }
 
 /// Reconstruct PdfLine objects from a flat list of SegmentData, grouping by baseline_y.
@@ -1597,7 +2086,10 @@ fn finalize_paragraph(
 
     let mut heading_level = super::classify::find_heading_level(first.font_size, heading_map, gap_info);
     if heading_level.is_some()
-        && (word_count > 20 || super::layout_classify::is_separator_text(trimmed) || page_number_like)
+        && (word_count > 20
+            || super::layout_classify::is_separator_text(trimmed)
+            || page_number_like
+            || (SUPPRESS_LOWERCASE_START_HEADINGS && super::classify::starts_with_lowercase_or_continuation(trimmed)))
     {
         heading_level = None;
     }
@@ -1644,9 +2136,16 @@ fn finalize_paragraph(
 
     if heading_level.is_none() {
         let min_heading_threshold = body_font_size * super::constants::MIN_HEADING_FONT_RATIO;
+        // `first.font_size >= min_heading_threshold` already implies
+        // `first.font_size > body_font_size + 0.5` for every realistic body font size:
+        // `body * MIN_HEADING_FONT_RATIO > body + 0.5` reduces to `body > 0.5 / (RATIO - 1) ≈ 3.33`
+        // (in whatever unit `font_size` is — points or OCR render pixels), and no real body-text
+        // cluster is that small. An explicit `+ 0.5` absolute-unit check was previously required
+        // here too; it was redundant on point-scale input and, being absolute, would have been
+        // both too-permissive at pixel scale and too-strict on a hypothetically tiny render, so
+        // it has been removed rather than converted. ~keep
         if body_font_size > 0.0
             && first.font_size >= min_heading_threshold
-            && first.font_size > body_font_size + 0.5
             && word_count <= super::constants::MAX_BOLD_HEADING_WORD_COUNT
             && lines.len() <= 2
             && !trimmed.ends_with(':')
@@ -1716,7 +2215,7 @@ fn finalize_paragraph(
 /// marker ("1.", "a)", "(2)", "•") and the item body arrive as separate
 /// spans on the same line. `looks_like_list_item` rejects those markers
 /// because it requires trailing text; this predicate accepts them.
-fn is_bare_list_marker(text: &str) -> bool {
+pub(super) fn is_bare_list_marker(text: &str) -> bool {
     let t = text.trim();
     if t.is_empty() || t.chars().count() > 5 {
         return false;
@@ -1728,7 +2227,11 @@ fn is_bare_list_marker(text: &str) -> bool {
 }
 
 /// Check if text starts with a common list marker.
-fn looks_like_list_item(text: &str) -> bool {
+///
+/// Also consulted by the OCR+layout paragraph route (`extractors::pdf::ocr`), which has
+/// no list classification of its own: reusing this predicate keeps the two routes from
+/// drifting into two different notions of what a list marker is.
+pub(crate) fn looks_like_list_item(text: &str) -> bool {
     let t = text.trim_start();
 
     if t.starts_with('•') || t.starts_with('·') || t.starts_with('◦') || t.starts_with('▪') {
@@ -1753,12 +2256,53 @@ fn looks_like_list_item(text: &str) -> bool {
     let Some(marker) = super::list_marker::parse_ordered_list_marker(t) else {
         return false;
     };
+    let Some(first_content_char) = t.get(marker.content_start..).and_then(|content| content.chars().next()) else {
+        return false;
+    };
     marker.has_content
         && marker.has_separator
         && !is_probable_author_byline(t)
-        && t.get(marker.content_start..)
-            .and_then(|content| content.chars().next())
-            .is_some_and(char::is_alphabetic)
+        && first_content_char.is_alphabetic()
+        && !is_inline_parenthesized_quantity(t, &marker, first_content_char)
+}
+
+/// Reject a line-leading `(N)` when it reads as a mid-sentence quantity
+/// clarification -- "Two\n(2) additional on-street parking spaces" wraps onto
+/// a physical line that *starts* with `(2)`, which is shaped identically to a
+/// genuine numbered marker like `(2) Second item`.
+///
+/// The distinguishing signal is capitalization plus how the marker was
+/// separated from its content:
+///
+/// - A **newline** between the marker and its content (`"(2)\nsecond item"`)
+///   means the marker arrived as its own text run, glued to the next run by
+///   line reconstruction rather than by the source author -- that shape is
+///   trusted regardless of case, exactly as it always has been.
+/// - A plain **space** on the same physical line, followed by a **lowercase**
+///   word (`"(2) additional …"`, `"(7) on-street …"`), is the shape of a
+///   number spelled out in prose ("Two (2) additional…") that happens to
+///   start a wrapped line. A genuine enumerated item is a new sentence and so
+///   starts with a capital letter (`"(2) Second point."`); this heuristic
+///   costs nothing there.
+///
+/// Scoped to `(`-parenthesized **numeric** markers only: `(a)`/`(b)`/`(c)` are
+/// this same ordinance's genuine sub-item markers (never quantity
+/// clarifications, since nobody writes "two (b) items"), and non-parenthesized
+/// families (`"1. "`, `"[1] "`) have no equivalent English idiom that produces
+/// this false positive, so they are left untouched.
+fn is_inline_parenthesized_quantity(
+    t: &str,
+    marker: &super::list_marker::OrderedListMarker,
+    first_content_char: char,
+) -> bool {
+    if !t.starts_with('(') || marker.numeric_value.is_none() {
+        return false;
+    }
+    let separator_region = t.get(..marker.content_start).unwrap_or("");
+    if separator_region.contains(['\n', '\r']) {
+        return false;
+    }
+    !first_content_char.is_uppercase()
 }
 
 /// Whether a single-capital marker is more likely the first author initial.
@@ -1822,8 +2366,8 @@ fn is_structural_heading_word(text: &str) -> bool {
 
 /// Build a structured `InternalDocument` from pre-extracted per-page segments.
 ///
-/// This is the oxide-backend entry point. It accepts segments already extracted
-/// via `oxide::hierarchy::extract_all_segments` and runs the same font-clustering,
+/// This is the native-backend entry point. It accepts segments already extracted
+/// via `native::hierarchy::extract_all_segments` and runs the same font-clustering,
 /// heading-classification, paragraph-assembly, and post-processing stages without
 /// requiring a PDF document.
 ///
@@ -1840,6 +2384,7 @@ pub(crate) struct SegmentStructureConfig<'a> {
     pub include_headers: bool,
     pub include_footers: bool,
     pub include_footnotes: bool,
+    pub include_watermarks: bool,
     pub used_structure_tree: bool,
     pub image_positions: &'a [(u32, u32)],
     pub images: Option<&'a [crate::types::ExtractedImage]>,
@@ -1885,6 +2430,7 @@ pub(crate) fn extract_document_structure_from_segments(
         include_headers,
         include_footers,
         include_footnotes,
+        include_watermarks,
         used_structure_tree,
         image_positions,
         images,
@@ -1909,7 +2455,7 @@ pub(crate) fn extract_document_structure_from_segments(
     tracing::debug!(
         page_count,
         used_structure_tree,
-        "oxide structure pipeline: starting from pre-extracted segments"
+        "native structure pipeline: starting from pre-extracted segments"
     );
 
     let struct_tree_results: Vec<Option<Vec<PdfParagraph>>> = vec![None; page_count];
@@ -1928,7 +2474,7 @@ pub(crate) fn extract_document_structure_from_segments(
             .map(|(size, _)| *size);
         tracing::debug!(
             heading_map_len = heading_map.len(),
-            "oxide structure pipeline: heading map from structure tree"
+            "native structure pipeline: heading map from structure tree"
         );
         (heading_map, doc_body_font_size)
     } else {
@@ -1967,7 +2513,7 @@ pub(crate) fn extract_document_structure_from_segments(
         #[allow(clippy::needless_range_loop)]
         for page_idx in 0..page_count {
             if cancel_token.is_some_and(|t| t.is_cancelled()) {
-                tracing::debug!(page_idx, "oxide structure pipeline: cancelled during table page prep");
+                tracing::debug!(page_idx, "native structure pipeline: cancelled during table page prep");
                 break;
             }
             let Some(hints) = hints_pages.get(page_idx) else {
@@ -1989,7 +2535,7 @@ pub(crate) fn extract_document_structure_from_segments(
             if words.is_empty() {
                 tracing::trace!(
                     page = page_idx,
-                    "oxide layout table extraction: no words from segments, skipping"
+                    "native layout table extraction: no words from segments, skipping"
                 );
                 continue;
             }
@@ -2013,7 +2559,7 @@ pub(crate) fn extract_document_structure_from_segments(
                     page = page_idx,
                     word_count = words.len(),
                     page_height,
-                    "oxide layout table extraction: page prepared"
+                    "native layout table extraction: page prepared"
                 );
                 table_pages.push(TablePageData {
                     page_idx,
@@ -2214,7 +2760,7 @@ pub(crate) fn extract_document_structure_from_segments(
                 } else {
                     for tp in &table_pages {
                         if cancel_token.is_some_and(|t| t.is_cancelled()) {
-                            tracing::debug!("oxide structure pipeline: cancelled during heuristic table extraction");
+                            tracing::debug!("native structure pipeline: cancelled during heuristic table extraction");
                             break;
                         }
                         let hints = &hints_pages[tp.page_idx];
@@ -2232,7 +2778,7 @@ pub(crate) fn extract_document_structure_from_segments(
             } else {
                 for tp in &table_pages {
                     if cancel_token.is_some_and(|t| t.is_cancelled()) {
-                        tracing::debug!("oxide structure pipeline: cancelled during heuristic table extraction");
+                        tracing::debug!("native structure pipeline: cancelled during heuristic table extraction");
                         break;
                     }
                     let hints = &hints_pages[tp.page_idx];
@@ -2252,7 +2798,7 @@ pub(crate) fn extract_document_structure_from_segments(
         #[cfg(not(feature = "layout-detection"))]
         for tp in &table_pages {
             if cancel_token.is_some_and(|t| t.is_cancelled()) {
-                tracing::debug!("oxide structure pipeline: cancelled during heuristic table extraction");
+                tracing::debug!("native structure pipeline: cancelled during heuristic table extraction");
                 break;
             }
             let hints = &hints_pages[tp.page_idx];
@@ -2274,7 +2820,7 @@ pub(crate) fn extract_document_structure_from_segments(
         // missed on otherwise Table-region-free pages.
         for (page_idx, words, page_height, synthetic_hints) in &geometric_table_pages {
             if cancel_token.is_some_and(|t| t.is_cancelled()) {
-                tracing::debug!("oxide structure pipeline: cancelled during geometric table fallback");
+                tracing::debug!("native structure pipeline: cancelled during geometric table fallback");
                 break;
             }
             let before = layout_tables.len();
@@ -2303,7 +2849,7 @@ pub(crate) fn extract_document_structure_from_segments(
 
     tracing::debug!(
         layout_tables_found = layout_tables.len(),
-        "oxide layout table extraction complete"
+        "native layout table extraction complete"
     );
 
     #[cfg(feature = "layout-detection")]
@@ -2318,7 +2864,7 @@ pub(crate) fn extract_document_structure_from_segments(
         native_tables = tables.len(),
         emitted_tables = emitted_tables.len(),
         pages_with_bboxes = extracted_table_bboxes_by_page.len(),
-        "oxide table bbox suppression map built"
+        "native table bbox suppression map built"
     );
 
     #[cfg(feature = "layout-detection")]
@@ -2337,7 +2883,7 @@ pub(crate) fn extract_document_structure_from_segments(
                                 .iter()
                                 .filter(|v| **v == super::regions::layout_validation::RegionValidation::Empty)
                                 .count(),
-                            "oxide layout validation: found empty regions"
+                            "native layout validation: found empty regions"
                         );
                     }
                     map.insert(page_idx, validations);
@@ -2441,7 +2987,9 @@ pub(crate) fn extract_document_structure_from_segments(
         mark_cross_page_repeating_text(&mut all_page_paragraphs, &page_heights);
         mark_cross_page_repeating_short_text(&mut all_page_paragraphs);
     }
-    mark_arxiv_noise(&mut all_page_paragraphs);
+    if !include_watermarks {
+        mark_arxiv_noise(&mut all_page_paragraphs);
+    }
     recover_headings_from_outline(&mut all_page_paragraphs, outline_entries);
     // Runs after heading recovery (so recovered headings are excluded) and
     // immediately before the deletion pass it feeds. It needs every page in
@@ -2473,7 +3021,7 @@ pub(crate) fn extract_document_structure_from_segments(
     tracing::debug!(
         total_paragraphs,
         heading_map_len = heading_map.len(),
-        "oxide structure pipeline: paragraph extraction complete, assembling document"
+        "native structure pipeline: paragraph extraction complete, assembling document"
     );
 
     let effective_image_positions = if inject_placeholders { image_positions } else { &[] };
@@ -2497,7 +3045,7 @@ pub(crate) fn extract_document_structure_from_segments(
 
     tracing::debug!(
         elements = doc.elements.len(),
-        "oxide structure pipeline: assembly complete"
+        "native structure pipeline: assembly complete"
     );
 
     Ok(doc)
@@ -2505,7 +3053,7 @@ pub(crate) fn extract_document_structure_from_segments(
 
 /// Maximum vertical gap (PDF points) between one fragment's bottom edge and the
 /// next fragment's top edge for the two to be considered the same physical
-/// table split by `oxide::table`'s row-gap clustering.
+/// table split by `native::table`'s row-gap clustering.
 const TABLE_STITCH_Y_GAP_TOLERANCE_PTS: f64 = 4.0;
 /// Maximum difference in a chain's shared left/right edge for two fragments to
 /// be considered the same table (rather than two unrelated tables that happen
@@ -2513,22 +3061,22 @@ const TABLE_STITCH_Y_GAP_TOLERANCE_PTS: f64 = 4.0;
 const TABLE_STITCH_X_TOLERANCE_PTS: f64 = 6.0;
 /// Bound on fragments merged into one stitched chain. Real continuation splits
 /// rarely exceed a handful of fragments; this caps the (already page-scoped,
-/// already `oxide::table::MAX_REGIONS_PER_PAGE`-bounded) chain walk.
+/// already `native::table::MAX_REGIONS_PER_PAGE`-bounded) chain walk.
 const TABLE_STITCH_MAX_CHAIN_FRAGMENTS: usize = 12;
 /// Bound on additional data rows the trailing-continuation recovery pass will
 /// attempt to pull from raw page segments below a stitched chain's last known
 /// fragment. Keeps the scan from reading arbitrarily far down the page.
 const TABLE_STITCH_TRAILING_RECOVERY_MAX_ROWS: usize = 6;
 /// Row-gap multiplier used to split recovered trailing words into per-entity
-/// bands. Mirrors `oxide::table::cluster_words_into_vertical_regions`'s
+/// bands. Mirrors `native::table::cluster_words_into_vertical_regions`'s
 /// `row_gap_split`; reimplemented here because that clustering helper is
-/// private to the `oxide::table` module, which this pass cannot depend on.
+/// private to the `native::table` module, which this pass cannot depend on.
 const TABLE_STITCH_TRAILING_ROW_GAP_MULTIPLIER: f32 = 1.8;
 
-/// Stitch table fragments that `oxide::table`'s row-gap region clustering split
+/// Stitch table fragments that `native::table`'s row-gap region clustering split
 /// out of one physical table back into a single table.
 ///
-/// `oxide::table::cluster_words_into_vertical_regions` splits a page's words
+/// `native::table::cluster_words_into_vertical_regions` splits a page's words
 /// into regions at any row-gap exceeding `median_height * 1.8`. A table whose
 /// header wraps onto several lines, or whose rows are visually separated by
 /// generous line spacing, can land in several such regions — each one then
@@ -2548,7 +3096,7 @@ const TABLE_STITCH_TRAILING_ROW_GAP_MULTIPLIER: f32 = 1.8;
 /// Bounded to avoid quadratic blowup: fragments are grouped by page first (an
 /// `O(n)` pass), and each page's fragment list is walked once after an
 /// `O(m log m)` sort, with the inner chain-adjacency check bounded by
-/// `TABLE_STITCH_MAX_CHAIN_FRAGMENTS`. `oxide::table::MAX_REGIONS_PER_PAGE`
+/// `TABLE_STITCH_MAX_CHAIN_FRAGMENTS`. `native::table::MAX_REGIONS_PER_PAGE`
 /// already caps how many fragments a single page can contribute.
 fn stitch_fragmented_tables(
     tables: Vec<crate::types::Table>,
@@ -2714,7 +3262,7 @@ fn merge_table_chain(chain: Vec<crate::types::Table>, all_page_segments: &[Vec<S
 
 /// Recover trailing data rows that never became their own table fragment.
 ///
-/// `oxide::table`'s region clustering sometimes merges the last entities of a
+/// `native::table`'s region clustering sometimes merges the last entities of a
 /// fragmented table into a region with unrelated following content (or drops
 /// them entirely when the merged region fails `post_process_table`
 /// validation), so those rows leak into the document as plain paragraph text
@@ -3221,7 +3769,7 @@ fn fused_text_repairs(text: &str) -> Cow<'_, str> {
 
 /// Deduplicate tables that overlap on the same page.
 ///
-/// When both native oxide detection and layout-based table extraction produce tables
+/// When both native detection and layout-based table extraction produce tables
 /// for the same region, they can overlap. Tables at index `< native_count` are native;
 /// the rest are layout (TATR/SLANeXT) tables. Complete side-by-side layout replacements
 /// are selected atomically before ordinary pairwise arbitration. Outside those replacements,
@@ -3719,7 +4267,7 @@ fn canonical_table_order(left: &crate::types::Table, right: &crate::types::Table
 /// This must run **before** `retain_page_furniture_safely`, which physically
 /// removes furniture paragraphs via `.retain()`. Un-marking here ensures that
 /// user-opted-in header/footer/footnote paragraphs survive that pass.
-fn un_mark_layout_furniture_per_config(
+pub(crate) fn un_mark_layout_furniture_per_config(
     paragraphs: &mut [PdfParagraph],
     include_headers: bool,
     include_footers: bool,
@@ -4125,6 +4673,18 @@ fn document_content_width(all_pages: &[Vec<PdfParagraph>]) -> f32 {
         .filter(|right| *right > 0.0)
         .fold(0.0_f32, f32::max);
     if widest > 0.0 { widest } else { FALLBACK_PAGE_WIDTH_PTS }
+}
+
+/// Apply the structure pipeline's cross-page repeating-text policy to pages that
+/// were already classified by another source, such as OCR layout detection. ~keep
+#[cfg(any(feature = "ocr", feature = "ocr-pipeline"))]
+pub(crate) fn strip_repeating_text_from_pages(pages: &mut [Vec<PdfParagraph>], page_heights: &[f32]) {
+    mark_cross_page_repeating_text(pages, page_heights);
+    mark_cross_page_repeating_short_text(pages);
+    for page in pages.iter_mut() {
+        retain_page_furniture_safely(page);
+    }
+    deduplicate_paragraphs(pages);
 }
 
 /// Filter page furniture paragraphs with a safety valve.
@@ -6299,6 +6859,428 @@ mod tests {
         );
     }
 
+    /// Regression for #1467: a numbered section heading, followed by unrelated
+    /// bold text at the same size, weight and line spacing, is welded to it.
+    /// Every other break signal is false here -- `font_change`, `role_change`
+    /// and `bold_change` all compare equal values, `crossed_gap` has no gaps to
+    /// find, and `looks_like_list_item` deliberately rejects numbered section
+    /// headings -- so only `follows_section` (backed by `heading_wraps_onto`
+    /// ruling out a mid-heading wrap) can separate them. Run through
+    /// `segments_to_paragraphs`, not `blocks_to_paragraphs`: the continuation
+    /// merge that runs immediately afterward would silently re-join exactly
+    /// this split unless it also refuses to absorb a heading it did not open.
+    #[test]
+    fn numbered_section_heading_is_split_from_the_callout_that_follows_it() {
+        let heading = SegmentData {
+            is_bold: true,
+            font_size: 12.0,
+            height: 12.0,
+            y: 700.0 - 12.0,
+            ..column_seg("1.1.1 Pictogrammen in het installatievoorschrift", 72.0, 170.0, 700.0)
+        };
+        let callout = SegmentData {
+            is_bold: true,
+            font_size: 12.0,
+            height: 12.0,
+            y: 684.0 - 12.0,
+            ..column_seg("VOORZICHTIG / BELANGRIJK", 72.0, 90.0, 684.0)
+        };
+        let body1 = SegmentData {
+            is_bold: true,
+            font_size: 12.0,
+            height: 12.0,
+            y: 668.0 - 12.0,
+            ..column_seg("Procedures die niet worden opgevolgd kunnen letsel", 72.0, 190.0, 668.0)
+        };
+        let body2 = SegmentData {
+            is_bold: true,
+            font_size: 12.0,
+            height: 12.0,
+            y: 652.0 - 12.0,
+            ..column_seg("of schade veroorzaken aan de installatie of de", 72.0, 190.0, 652.0)
+        };
+        let body3 = SegmentData {
+            is_bold: true,
+            font_size: 12.0,
+            height: 12.0,
+            y: 636.0 - 12.0,
+            ..column_seg("gebruiker van het toestel indien genegeerd", 72.0, 190.0, 636.0)
+        };
+
+        let paragraphs = segments_to_paragraphs(vec![heading, callout, body1, body2, body3], &[(12.0, None)], &[]);
+
+        assert_eq!(
+            paragraphs.len(),
+            2,
+            "the numbered heading must split from the callout and body text that follow it"
+        );
+        assert_eq!(
+            paragraph_segment_text(&paragraphs[0]),
+            "1.1.1 Pictogrammen in het installatievoorschrift",
+            "the heading must be its own element, not fused with the callout"
+        );
+        assert_eq!(
+            paragraph_segment_text(&paragraphs[1]),
+            "VOORZICHTIG / BELANGRIJK Procedures die niet worden opgevolgd kunnen letsel \
+             of schade veroorzaken aan de installatie of de gebruiker van het toestel indien genegeerd",
+            "the callout and following body text must survive as a separate element from the heading"
+        );
+    }
+
+    /// The wrap control for #1467: a numbered heading long enough to reach the
+    /// column's right edge, continuing onto a second, unnumbered physical line,
+    /// must stay ONE element -- splitting a heading from its own wrapped tail
+    /// would be worse than the original defect. This is what
+    /// `heading_wraps_onto` exists to rule out: without it, `follows_section`
+    /// would fire on every numbered heading regardless of whether the next line
+    /// is unrelated content or the heading's own continuation, and this
+    /// specific line pair -- same font, same weight, same one-line-height
+    /// spacing as the #1467 defect -- would be split into two paragraphs.
+    #[test]
+    fn heading_wrapping_onto_its_next_line_stays_one_paragraph() {
+        let heading_start = column_seg(
+            "1.1.1 Een Zeer Lange Sectietitel Die Helemaal Doorloopt Tot De",
+            72.0,
+            460.0,
+            700.0,
+        );
+        let heading_continuation = column_seg("Rechterkantlijn Van Deze Kolom", 72.0, 450.0, 684.0);
+
+        let paragraphs = segments_to_paragraphs(vec![heading_start, heading_continuation], &[(11.0, None)], &[]);
+
+        assert_eq!(
+            paragraphs.len(),
+            1,
+            "a heading wrapping onto its own next line must not be split from itself"
+        );
+    }
+
+    /// The prose control for #1467: three ordinary wrapped lines with no
+    /// numbering and no sentence terminator must stay ONE paragraph, exactly as
+    /// before this change -- `follows_section` never fires here because
+    /// `is_numbered_section_heading` is false for all three lines.
+    #[test]
+    fn wrapped_prose_lines_without_a_terminator_stay_one_paragraph() {
+        let segments = vec![
+            body_line_seg("The committee reviewed the annual budget", 700.0),
+            body_line_seg("report and discussed the proposed changes", 686.0),
+            body_line_seg("before adjourning the meeting for the day", 672.0),
+        ];
+
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &[]);
+
+        assert_eq!(
+            paragraphs.len(),
+            1,
+            "wrapped prose with no sentence terminator must stay one paragraph"
+        );
+        assert_eq!(
+            paragraph_segment_text(&paragraphs[0]),
+            "The committee reviewed the annual budget report and discussed the proposed changes \
+             before adjourning the meeting for the day"
+        );
+    }
+
+    /// Helper: one segment of a hanging-indent column, 11pt on an 11pt line.
+    fn column_seg(text: &str, x: f32, width: f32, baseline_y: f32) -> SegmentData {
+        SegmentData {
+            text: text.to_string(),
+            x,
+            y: baseline_y - 11.0,
+            width,
+            height: 11.0,
+            font_size: 11.0,
+            is_bold: false,
+            is_italic: false,
+            is_monospace: false,
+            baseline_y,
+            rotation_degrees: 0.0,
+            assigned_role: None,
+        }
+    }
+
+    /// The shape measured on `test_documents/pdf_scanned/ordinance_2197_scanned.pdf`
+    /// (tesseract): the marker column is a separate block from the text column, so
+    /// every marker arrives as its own paragraph and the whole marker run precedes
+    /// the whole text run. Pairing must therefore be by baseline, not adjacency.
+    #[test]
+    fn detached_marker_column_is_reattached_to_the_body_sharing_its_baseline() {
+        let segments = vec![
+            column_seg("(a)", 72.0, 14.0, 700.0),
+            column_seg("(b)", 72.0, 14.0, 660.0),
+            column_seg("(c)", 72.0, 14.0, 620.0),
+            column_seg("A ten foot wide minimum buffer along the lot line", 110.0, 300.0, 700.0),
+            column_seg(
+                "Ten foot wide minimum buffers along Lake Pointe Parkway",
+                110.0,
+                300.0,
+                660.0,
+            ),
+            column_seg(
+                "Required buffers may include the pedestrian walkway",
+                110.0,
+                300.0,
+                620.0,
+            ),
+        ];
+        let gap_ys = compute_paragraph_gap_ys(&segments);
+
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys);
+
+        assert_eq!(
+            paragraphs.len(),
+            3,
+            "each detached marker must be folded into the body line it shares a baseline with"
+        );
+        assert_eq!(
+            paragraph_segment_text(&paragraphs[0]),
+            "(a) A ten foot wide minimum buffer along the lot line"
+        );
+        assert_eq!(
+            paragraph_segment_text(&paragraphs[1]),
+            "(b) Ten foot wide minimum buffers along Lake Pointe Parkway"
+        );
+        assert_eq!(
+            paragraph_segment_text(&paragraphs[2]),
+            "(c) Required buffers may include the pedestrian walkway"
+        );
+    }
+
+    /// Reattachment is only worth anything if the body is then *classified* as a
+    /// list item; the marker text alone changes no downstream element kind.
+    #[test]
+    fn bodies_that_absorb_a_detached_marker_become_list_items() {
+        let segments = vec![
+            column_seg("(a)", 72.0, 14.0, 700.0),
+            column_seg("(b)", 72.0, 14.0, 660.0),
+            column_seg("(c)", 72.0, 14.0, 620.0),
+            column_seg("A ten foot wide minimum buffer along the lot line", 110.0, 300.0, 700.0),
+            column_seg(
+                "Ten foot wide minimum buffers along Lake Pointe Parkway",
+                110.0,
+                300.0,
+                660.0,
+            ),
+            column_seg(
+                "Required buffers may include the pedestrian walkway",
+                110.0,
+                300.0,
+                620.0,
+            ),
+        ];
+        let gap_ys = compute_paragraph_gap_ys(&segments);
+
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys);
+
+        assert_eq!(
+            paragraphs.iter().filter(|paragraph| paragraph.is_list_item).count(),
+            3,
+            "a body that absorbed its marker must classify as a list item"
+        );
+    }
+
+    /// TASK #722 follow-up: a lone `*` and a bracketed integer `[N]` must NOT be
+    /// treated as detached list markers -- `*` is also a multiplication sign in
+    /// isolated math prose, and `[N]` is standard printed paragraph-number
+    /// notation (e.g. Jung's Collected Works), not a marker. The other three
+    /// marker families must keep reattaching exactly as before.
+    #[test]
+    fn ambiguous_detached_markers_are_excluded_while_unambiguous_ones_still_reattach() {
+        let segments = vec![
+            column_seg("*", 72.0, 14.0, 700.0),
+            column_seg("[42]", 72.0, 20.0, 660.0),
+            column_seg("-", 72.0, 14.0, 620.0),
+            column_seg("(1)", 72.0, 14.0, 580.0),
+            column_seg("1.", 72.0, 14.0, 540.0),
+            column_seg(
+                "A times B is a well known identity in group theory here",
+                110.0,
+                300.0,
+                700.0,
+            ),
+            column_seg(
+                "This paragraph number precedes ordinary book prose here",
+                110.0,
+                300.0,
+                660.0,
+            ),
+            column_seg(
+                "Dash marker prose gets folded into its own body text",
+                110.0,
+                300.0,
+                620.0,
+            ),
+            column_seg(
+                "Parenthesised marker prose gets folded into its own body",
+                110.0,
+                300.0,
+                580.0,
+            ),
+            column_seg(
+                "Numbered marker prose gets folded into its own body",
+                110.0,
+                300.0,
+                540.0,
+            ),
+        ];
+        let gap_ys = compute_paragraph_gap_ys(&segments);
+
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys);
+
+        assert_eq!(
+            paragraphs.len(),
+            7,
+            "the '*' and '[42]' markers must stay detached (2 extra paragraphs); the other three must reattach"
+        );
+
+        let texts: Vec<String> = paragraphs.iter().map(paragraph_segment_text).collect();
+        assert!(
+            texts.iter().any(|text| text == "*"),
+            "a lone '*' must remain its own paragraph, not fold into the math prose below it: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "[42]"),
+            "a bracketed integer must remain its own paragraph, not fold into the following prose: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.starts_with("- Dash marker")),
+            "a dash marker must still reattach to its body: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.starts_with("(1) Parenthesised marker")),
+            "a parenthesised marker must still reattach to its body: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.starts_with("1. Numbered marker")),
+            "a '1.' marker must still reattach to its body: {texts:?}"
+        );
+    }
+
+    /// Helper: a segment carrying raw OCR raster geometry (`rotation_degrees ==
+    /// 0.0`, as every OCR segment does -- see `adapters::make_ocr_pdf_line`),
+    /// with `y == baseline_y` (also always true for OCR segments -- both fields
+    /// are set from the same hOCR line-box value).
+    fn ocr_raster_seg(text: &str, x: f32, y: f32, width: f32, height: f32, font_size: f32) -> SegmentData {
+        SegmentData {
+            text: text.to_string(),
+            x,
+            y,
+            width,
+            height,
+            font_size,
+            is_bold: false,
+            is_italic: false,
+            is_monospace: false,
+            baseline_y: y,
+            rotation_degrees: 0.0,
+            assigned_role: None,
+        }
+    }
+
+    /// #760: `DetachedMarkerFrame::OcrOnPage(270)` must accept the
+    /// marker/body pair whose geometry was measured on fixture `ordinance_2197`
+    /// (`/Rotate 270`, tesseract) -- marker `y=2378.0 h=65.0`, body `y=1324.0
+    /// h=933.0`, both at `font_size=30.0` (chosen so the tolerance,
+    /// `30.0 * DETACHED_MARKER_BASELINE_TOLERANCE_FONT_FACTOR`, is `18.0`, and
+    /// the max indent, `30.0 * DETACHED_MARKER_MAX_INDENT_FONT_FACTOR`, is
+    /// `180.0` -- both match the values reported against the fixture). `x`/
+    /// `width` are constructed, not measured, so the two segments' corrected-270
+    /// baseline (`x + width`) coincide (delta `0.0`), isolating the advance/
+    /// indent half of the fix: `frame.advance_extent()` gives marker
+    /// `(-2443.0, -2378.0)` and body `(-2257.0, -1324.0)`, so
+    /// `indent = body_left - marker_end = -2257.0 - (-2378.0) = 121.0`, within
+    /// `[-15.0, 180.0]`.
+    ///
+    /// `DetachedMarkerFrame::Native` is, for an OCR segment, byte-for-byte the
+    /// pre-#760 behaviour (`upright_baseline()`/`upright_advance_extent()`
+    /// short-circuit on `rotation_degrees == 0.0` to the raw `baseline_y`/
+    /// `(x, x + width)` -- exactly what unfixed `accepts_detached_list_marker`
+    /// read, since it had no frame parameter at all). Against that frame this
+    /// same pair is REJECTED at the baseline gate: `|2378.0 - 1324.0| == 1054.0`
+    /// (within the 1049..1922 range measured on the real fixture) against a
+    /// tolerance of `18.0` -- the indent check is never reached.
+    #[test]
+    fn ocr_frame_270_accepts_the_measured_pair_that_the_native_frame_rejects() {
+        let marker = ocr_raster_seg("(a)", 3317.0, 2378.0, 100.0, 65.0, 30.0);
+        let body_segment = ocr_raster_seg("Buffer requirement", 3367.0, 1324.0, 50.0, 933.0, 30.0);
+        let body = para(vec![line(vec![body_segment])]);
+
+        assert!(
+            !accepts_detached_list_marker(&body, &marker, DetachedMarkerFrame::Native),
+            "Native frame must reject the pair: baseline delta 1054.0 exceeds tolerance 18.0"
+        );
+        assert!(
+            accepts_detached_list_marker(&body, &marker, DetachedMarkerFrame::OcrOnPage(270)),
+            "OcrOnPage(270) must accept the pair: baseline delta 0.0, indent 121.0 <= 180.0"
+        );
+    }
+
+    /// #760: pins the exact corrected-frame values for a 270-rotated page, so a
+    /// future change to the formula shows up here directly rather than only
+    /// through the pass/fail outcome above.
+    #[test]
+    fn ocr_frame_270_baseline_and_advance_extent_match_the_measured_formula() {
+        let marker = ocr_raster_seg("(a)", 3317.0, 2378.0, 100.0, 65.0, 30.0);
+        let body_segment = ocr_raster_seg("Buffer requirement", 3367.0, 1324.0, 50.0, 933.0, 30.0);
+        let frame = DetachedMarkerFrame::OcrOnPage(270);
+
+        assert_eq!(frame.baseline(&marker), 3417.0, "far raster-x edge (x + width)");
+        assert_eq!(frame.baseline(&body_segment), 3417.0, "far raster-x edge (x + width)");
+        assert_eq!(
+            frame.advance_extent(&marker),
+            (-2443.0, -2378.0),
+            "advance runs along -y; start is the FAR raster-y edge -(y + height)"
+        );
+        assert_eq!(
+            frame.advance_extent(&body_segment),
+            (-2257.0, -1324.0),
+            "advance runs along -y; start is the FAR raster-y edge -(y + height)"
+        );
+    }
+
+    /// #760: `180` is confirmed a no-op for the OCR rotation correction -- both
+    /// helpers on `DetachedMarkerFrame::OcrOnPage(180)` must read the same raw
+    /// fields as the unrotated default, matching `Native`'s behaviour for an
+    /// unrotated (`rotation_degrees == 0.0`) OCR segment exactly.
+    #[test]
+    fn ocr_frame_180_is_a_no_op() {
+        let segment = ocr_raster_seg("text", 100.0, 700.0, 40.0, 10.0, 11.0);
+
+        assert_eq!(
+            DetachedMarkerFrame::OcrOnPage(180).baseline(&segment),
+            DetachedMarkerFrame::Native.baseline(&segment)
+        );
+        assert_eq!(
+            DetachedMarkerFrame::OcrOnPage(180).advance_extent(&segment),
+            DetachedMarkerFrame::Native.advance_extent(&segment)
+        );
+    }
+
+    /// Precision guard (passes with and without the reattachment pass). A bare
+    /// marker must not adopt an indented block on a *different* baseline: that is
+    /// an ordinary following paragraph, not the marker's own item text.
+    #[test]
+    fn a_bare_marker_does_not_adopt_a_block_on_another_baseline() {
+        let segments = vec![
+            column_seg("(a)", 72.0, 14.0, 700.0),
+            column_seg(
+                "An indented block that begins on the next line entirely",
+                110.0,
+                300.0,
+                660.0,
+            ),
+        ];
+        let gap_ys = compute_paragraph_gap_ys(&segments);
+
+        let paragraphs = segments_to_paragraphs(segments, &[(11.0, None)], &gap_ys);
+
+        assert_eq!(paragraphs.len(), 2, "baseline agreement is what licenses reattachment");
+        assert!(
+            !paragraphs[1].is_list_item,
+            "a block on its own baseline must not be turned into a list item"
+        );
+    }
+
     /// Helper: create a segment with positional data.
     fn seg(text: &str, x: f32, width: f32) -> SegmentData {
         SegmentData {
@@ -6350,6 +7332,46 @@ mod tests {
             .expect("inline bold annotation should be preserved");
         assert_eq!(element.text, "plain bold tail");
         assert_eq!((bold.start, bold.end), (6, 10));
+    }
+
+    #[test]
+    fn same_baseline_font_size_transition_stays_in_one_paragraph() {
+        let mut chapter_number = inline_seg("13.", 28.35, 803.043, false);
+        chapter_number.width = 17.58;
+        chapter_number.font_size = 14.0;
+        let mut title = inline_seg("Productkaart vlgs. bijlage IV", 64.35, 803.043, false);
+        title.width = 248.03;
+
+        let paragraphs = blocks_to_paragraphs(vec![chapter_number, title], &[], &[]);
+
+        assert_eq!(paragraphs.len(), 1);
+        assert_eq!(paragraph_text(&paragraphs[0]), "13. Productkaart vlgs. bijlage IV");
+    }
+
+    #[test]
+    fn distant_same_baseline_font_size_transition_remains_a_boundary() {
+        let mut heading = inline_seg("Heading", 10.0, 100.0, false);
+        heading.font_size = 14.0;
+        let body = inline_seg("body", 100.0, 100.0, false);
+
+        let paragraphs = blocks_to_paragraphs(vec![heading, body], &[], &[]);
+
+        assert_eq!(paragraphs.len(), 2);
+        assert_eq!(paragraph_text(&paragraphs[0]), "Heading");
+        assert_eq!(paragraph_text(&paragraphs[1]), "body");
+    }
+
+    #[test]
+    fn different_baseline_font_size_transition_remains_a_boundary() {
+        let mut heading = inline_seg("Heading", 10.0, 100.0, false);
+        heading.font_size = 14.0;
+        let body = inline_seg("body", 10.0, 80.0, false);
+
+        let paragraphs = blocks_to_paragraphs(vec![heading, body], &[], &[]);
+
+        assert_eq!(paragraphs.len(), 2);
+        assert_eq!(paragraph_text(&paragraphs[0]), "Heading");
+        assert_eq!(paragraph_text(&paragraphs[1]), "body");
     }
 
     #[test]
@@ -8144,6 +9166,24 @@ where new shares are issued;";
         );
     }
 
+    /// #712: a fragment whose text starts lowercase must not be promoted to a
+    /// heading even when its font size matches a heading centroid exactly. This is
+    /// the fabrication signature the OCR mid-line `font_change` break produces --
+    /// see `SUPPRESS_LOWERCASE_START_HEADINGS`'s doc comment. Against unfixed code
+    /// (`SUPPRESS_LOWERCASE_START_HEADINGS = false`) this asserts
+    /// `para.heading_level == None` and fails with `para.heading_level == Some(2)`.
+    #[test]
+    fn test_finalize_paragraph_suppresses_heading_for_lowercase_start_fragment() {
+        let heading_map = vec![(12.0, Some(2)), (9.0, None)];
+        let gap_info = crate::pdf::structure::classify::precompute_gap_info(&heading_map);
+        let seg = seg_at("storage.", 10.0, 700.0, 12.0, false);
+        let para = finalize_paragraph(&[&seg], &heading_map, &gap_info).expect("paragraph");
+        assert_eq!(
+            para.heading_level, None,
+            "a lowercase-starting fragment must not become a heading"
+        );
+    }
+
     /// Paragraph carrying real geometry, for the page-number validation tests.
     /// `y` is a PDF-space bottom coordinate on a 792pt page.
     fn positioned_para(text: &str, x: f32, y: f32) -> PdfParagraph {
@@ -8274,6 +9314,67 @@ where new shares are issued;";
             title_entry.unwrap().1,
             Some(1),
             "14pt title in a 5-paragraph doc must get heading_level=1; got: {heading_map:?}"
+        );
+    }
+
+    /// Real Tesseract hOCR `x_fsize` values measured at 300 DPI against
+    /// `test_documents/images_extra/ocr_image.tiff`: a 21px body cluster and a 23px
+    /// secondary tier (ratio 23/21 = 1.095, which fails `MIN_HEADING_FONT_RATIO`, but
+    /// 23 >= 21 + 1.5 clears the old absolute `MIN_HEADING_FONT_GAP` floor). `font_size`
+    /// on OCR segments is a render-DPI-dependent pixel measurement, not points, so an
+    /// absolute-unit gap calibrated for typographic points misfires here.
+    ///
+    /// Fails without the fix: `assign_heading_levels_smart` used to compute
+    /// `heading_threshold = (21.0 * 1.15).min(21.0 + 1.5) = 22.5`, and 23.0 >= 22.5, so
+    /// the 23px cluster got `Some(1)` and this document ended up with a spurious
+    /// heading instead of the all-body map asserted here.
+    #[test]
+    fn test_build_heading_map_pixel_scale_ratio_gate_rejects_subhead_noise() {
+        let all_page_segments = vec![vec![
+            seg_with_font("Subhead-looking line", 23.0),
+            seg_with_font("Body paragraph one with real running text.", 21.0),
+            seg_with_font("Body paragraph two with real running text.", 21.0),
+            seg_with_font("Body paragraph three with real running text.", 21.0),
+            seg_with_font("Body paragraph four with real running text.", 21.0),
+        ]];
+        let struct_tree_results = vec![None];
+        let heuristic_pages = vec![0usize];
+
+        let (heading_map, _) = build_heading_map(&all_page_segments, &struct_tree_results, &heuristic_pages, 4)
+            .expect("build_heading_map must succeed");
+
+        assert!(
+            heading_map.iter().all(|(_, level)| level.is_none()),
+            "a 23px cluster over a 21px body (ratio 1.095) must not be promoted to a heading; got: {heading_map:?}"
+        );
+    }
+
+    /// Same shape as `test_build_heading_map_pixel_scale_ratio_gate_rejects_subhead_noise`
+    /// but at the native point-scale reference (body=10pt) that `MIN_HEADING_FONT_RATIO`'s
+    /// and the old `MIN_HEADING_FONT_GAP`'s doc comments both cite: `10 * 1.15 == 10 + 1.5
+    /// == 11.5`, so removing the gap term changes nothing here. Does not fail without the
+    /// fix (old and new formulas agree at this exact reference point) — it pins the native
+    /// crossover behavior the fix is designed to preserve.
+    #[test]
+    fn test_build_heading_map_native_reference_body_boundary_still_promotes() {
+        let all_page_segments = vec![vec![
+            seg_with_font("Boundary Heading", 11.5),
+            seg_with_font("Body paragraph one with real running text.", 10.0),
+            seg_with_font("Body paragraph two with real running text.", 10.0),
+            seg_with_font("Body paragraph three with real running text.", 10.0),
+            seg_with_font("Body paragraph four with real running text.", 10.0),
+        ]];
+        let struct_tree_results = vec![None];
+        let heuristic_pages = vec![0usize];
+
+        let (heading_map, _) = build_heading_map(&all_page_segments, &struct_tree_results, &heuristic_pages, 4)
+            .expect("build_heading_map must succeed");
+
+        let heading_entry = heading_map.iter().find(|(fs, _)| (*fs - 11.5).abs() < 0.01);
+        assert_eq!(
+            heading_entry.map(|(_, level)| *level),
+            Some(Some(1)),
+            "11.5pt over a 10pt body sits exactly on the ratio boundary and must still promote; got: {heading_map:?}"
         );
     }
 
@@ -8623,7 +9724,7 @@ where new shares are issued;";
 
 #[cfg(test)]
 mod list_marker_tests {
-    use super::{is_bare_list_marker, looks_like_list_item};
+    use super::{is_bare_detached_list_marker, is_bare_list_marker, looks_like_list_item};
 
     #[test]
     fn bare_markers_are_detected() {
@@ -8645,6 +9746,42 @@ mod list_marker_tests {
         assert!(!is_bare_list_marker("(appendix)"));
         assert!(!is_bare_list_marker("Item"));
         assert!(!is_bare_list_marker(""));
+    }
+
+    /// The general [`is_bare_list_marker`] still accepts a lone `*` and a
+    /// bracketed integer -- only the narrower detached-reattachment predicate
+    /// rejects them. See `EXCLUDE_AMBIGUOUS_DETACHED_MARKERS`.
+    #[test]
+    fn detached_predicate_rejects_the_ambiguous_shapes_the_general_one_still_accepts() {
+        assert!(
+            is_bare_list_marker("*"),
+            "general predicate must still accept a lone '*'"
+        );
+        assert!(
+            is_bare_list_marker("[42]"),
+            "general predicate must still accept a bracketed integer"
+        );
+        assert!(
+            !is_bare_detached_list_marker("*"),
+            "a lone '*' is also a multiplication sign; the detached pass must reject it"
+        );
+        assert!(
+            !is_bare_detached_list_marker("[42]"),
+            "a bracketed integer is a printed paragraph number; the detached pass must reject it"
+        );
+    }
+
+    /// Every shape the task's evidence names as "good, keep" must survive the
+    /// tightening on the detached-reattachment predicate.
+    #[test]
+    fn detached_predicate_still_accepts_the_unambiguous_shapes() {
+        assert!(is_bare_detached_list_marker("-"));
+        assert!(is_bare_detached_list_marker("–"));
+        assert!(is_bare_detached_list_marker("—"));
+        assert!(is_bare_detached_list_marker("(1)"));
+        assert!(is_bare_detached_list_marker("(k)"));
+        assert!(is_bare_detached_list_marker("1."));
+        assert!(is_bare_detached_list_marker("f."));
     }
 
     #[test]
@@ -8690,6 +9827,41 @@ mod list_marker_tests {
         assert!(!looks_like_list_item("—\t\nbody"));
         assert!(!looks_like_list_item("–\n8 show the remaining figures"));
         assert!(!looks_like_list_item("—continuation"));
+    }
+
+    /// #### FAILS against unfixed code
+    /// Both assertions currently evaluate to `true` (unfixed
+    /// `looks_like_list_item` accepts any `(N) <alphabetic>` line), so
+    /// `assert!(!looks_like_list_item(...))` panics with `assertion failed:
+    /// !looks_like_list_item("(2) additional on-street parallel parking
+    /// spaces")` (and the `(7)` sibling) on unfixed code.
+    #[test]
+    fn parenthesized_quantity_clarifications_are_not_list_items() {
+        assert!(!looks_like_list_item(
+            "(2) additional on-street parallel parking spaces"
+        ));
+        assert!(!looks_like_list_item("(7) on-street spaces on Lake Pointe Parkway"));
+        assert!(!looks_like_list_item("(3) additional off-street spaces"));
+        assert!(!looks_like_list_item("(9) exceptions apply"));
+    }
+
+    /// Lettered sub-items in parentheses are genuine markers in this same
+    /// ordinance and must survive the quantity-clarification heuristic above
+    /// (it is scoped to *numeric* parenthesized markers only).
+    #[test]
+    fn parenthesized_letter_markers_remain_list_items() {
+        assert!(looks_like_list_item("(a) Front setback: 25'"));
+        assert!(looks_like_list_item("(b) Side setback: 0'/6'"));
+        assert!(looks_like_list_item("(c) Street side setback: Lot 1 - 15'"));
+    }
+
+    /// A capitalized, space-separated numeric parenthesized marker is a
+    /// genuine enumerated item (a new sentence), not a quantity
+    /// clarification, and must still be accepted.
+    #[test]
+    fn capitalized_parenthesized_numeric_markers_remain_list_items() {
+        assert!(looks_like_list_item("(1) First point"));
+        assert!(looks_like_list_item("(2) Second point"));
     }
 
     #[test]

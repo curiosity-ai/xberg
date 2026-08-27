@@ -5,7 +5,7 @@ Future<void> main() async {
   final config = await createExtractionConfigFromJson(json: '{}');
   final result = await XbergBridge.extract(
     const ExtractInput(kind: ExtractInputKind.uri, uri: 'document.pdf'),
-    config,
+    config: config,
   );
 
   final metadata = result.results.first.metadata;

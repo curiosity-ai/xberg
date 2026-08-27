@@ -44,7 +44,9 @@ const FOOTER_MIN_ALPHA_PERCENT: usize = 70;
 #[cfg(feature = "pdf")]
 use super::hierarchy::SegmentData;
 
-/// Convert a PDF `SegmentData` to an `HocrWord` for table reconstruction.
+/// Convert a PDF `SegmentData` to an `HocrWord` for table reconstruction, adding
+/// `advance_offset`/`top_offset` to the segment's upright-frame position before
+/// clamping to the unsigned `HocrWord` fields.
 ///
 /// `SegmentData` uses PDF coordinates (y=0 at bottom, increases upward).
 /// `HocrWord` uses image coordinates (y=0 at top, increases downward).
@@ -56,15 +58,31 @@ use super::hierarchy::SegmentData;
 /// columns along the wrong axes. [`SegmentData::upright_origin`] rotates the
 /// origin back into the segment's own reading frame (identity for the
 /// unrotated case, matching the plain x/y this replaced) so the row/column
-/// clustering downstream in `oxide::table::cluster_words_into_vertical_regions`
+/// clustering downstream in `native::table::cluster_words_into_vertical_regions`
 /// operates on the table's actual advance/cross axes instead of the page's.
+///
+/// Standalone calls (no sibling segments) always pass `(0.0, 0.0)` offsets: a
+/// single segment can never be lifted relative to a run it isn't part of.
+/// Only [`segments_to_words`] computes a real offset, from the whole page.
+///
+/// GH#1358: a rotated run's advance/cross can be negative for every word on
+/// the page (e.g. `-90` gives `advance == -y`; `180` gives `advance == -x` and
+/// `cross == -y`), and a per-word `.max(0.0)` clamp saturates every one of
+/// them onto the same `0`, collapsing a table's columns and/or rows and
+/// making it single-column/single-row — which downstream clustering then
+/// rejects outright. `rotation_lifts_for_page` computes, once per rotation
+/// group sharing a page, the amount needed to lift that group's *minimum*
+/// advance/top to zero; adding it here before the per-word clamp preserves
+/// the run's relative geometry instead of destroying it. Unrotated content
+/// and any rotation whose minimum is already non-negative gets `(0.0, 0.0)`
+/// here, leaving this identical to the unlifted computation.
 #[cfg(feature = "pdf")]
-pub(crate) fn segment_to_hocr_word(seg: &SegmentData, page_height: f32) -> HocrWord {
+fn segment_to_hocr_word_lifted(seg: &SegmentData, page_height: f32, advance_offset: f32, top_offset: f32) -> HocrWord {
     let (advance, cross) = seg.upright_origin();
-    let top_image = (page_height - (cross + seg.height)).round().max(0.0) as u32;
+    let top_image = (page_height - (cross + seg.height) + top_offset).round().max(0.0) as u32;
     HocrWord {
         text: seg.text.clone(),
-        left: advance.round().max(0.0) as u32,
+        left: (advance + advance_offset).round().max(0.0) as u32,
         top: top_image,
         width: seg.width.round().max(0.0) as u32,
         height: seg.height.round().max(0.0) as u32,
@@ -78,18 +96,38 @@ pub(crate) fn segment_to_hocr_word(seg: &SegmentData, page_height: f32) -> HocrW
 /// shared baseline + font). For table cell matching, each word needs its own
 /// bounding box so it can be assigned to the correct column/cell.
 ///
-/// Single-word segments use `segment_to_hocr_word` directly (fast path).
+/// Single-word segments use `segment_to_hocr_word_lifted` directly (fast path).
 /// Multi-word segments get proportional bbox estimation per word based on
 /// byte offset within the segment text.
+///
+/// See [`segment_to_hocr_word_lifted`] for why a standalone call always lifts by
+/// `(0.0, 0.0)`.
 #[cfg(feature = "pdf")]
 pub(crate) fn split_segment_to_words(seg: &SegmentData, page_height: f32) -> Vec<HocrWord> {
+    split_segment_to_words_lifted(seg, page_height, 0.0, 0.0)
+}
+
+/// Like [`split_segment_to_words`], with the same `advance_offset`/
+/// `top_offset` lift documented on [`segment_to_hocr_word_lifted`].
+#[cfg(feature = "pdf")]
+fn split_segment_to_words_lifted(
+    seg: &SegmentData,
+    page_height: f32,
+    advance_offset: f32,
+    top_offset: f32,
+) -> Vec<HocrWord> {
     let trimmed = seg.text.trim();
     if trimmed.is_empty() {
         return Vec::new();
     }
 
     if !trimmed.contains(char::is_whitespace) {
-        return vec![segment_to_hocr_word(seg, page_height)];
+        return vec![segment_to_hocr_word_lifted(
+            seg,
+            page_height,
+            advance_offset,
+            top_offset,
+        )];
     }
 
     let text = &seg.text;
@@ -98,13 +136,13 @@ pub(crate) fn split_segment_to_words(seg: &SegmentData, page_height: f32) -> Vec
         return Vec::new();
     }
 
-    // See `segment_to_hocr_word` for why the segment's own upright frame
+    // See `segment_to_hocr_word_lifted` for why the segment's own upright frame
     // (rather than raw page-space x/y) is used here: `advance` is the
     // position along the run's reading axis, which per-word interpolation
     // below advances along via `frac_start * seg.width` — consistent
     // whether or not the run is rotated.
     let (advance, cross) = seg.upright_origin();
-    let top_image = (page_height - (cross + seg.height)).round().max(0.0) as u32;
+    let top_image = (page_height - (cross + seg.height) + top_offset).round().max(0.0) as u32;
     let seg_height = seg.height.round().max(0.0) as u32;
 
     let mut words = Vec::new();
@@ -121,7 +159,7 @@ pub(crate) fn split_segment_to_words(seg: &SegmentData, page_height: f32) -> Vec
 
         words.push(HocrWord {
             text: word.to_string(),
-            left: (advance + frac_start * seg.width).round().max(0.0) as u32,
+            left: (advance + advance_offset + frac_start * seg.width).round().max(0.0) as u32,
             top: top_image,
             width: (frac_width * seg.width).round().max(1.0) as u32,
             height: seg_height,
@@ -132,15 +170,110 @@ pub(crate) fn split_segment_to_words(seg: &SegmentData, page_height: f32) -> Vec
     words
 }
 
+/// Per-rotation lift computed once for a page's segments (GH#1358).
+///
+/// Holds, for one `rotation_degrees` value, how far that group's advance and
+/// top must be translated so its minimum lands at `0.0` — the "lift the whole
+/// frame" fix: computing the minimum over the *run* first (rather than
+/// clamping each word independently) preserves relative spacing between
+/// words instead of collapsing every negative value onto the same floor.
+#[cfg(feature = "pdf")]
+struct RotationLift {
+    rotation_degrees: f32,
+    advance_offset: f32,
+    top_offset: f32,
+}
+
+/// Computes [`RotationLift`]s for every distinct rotation present in
+/// `segments`, restricted to rotated content.
+///
+/// Unrotated segments are deliberately excluded: their advance/cross already
+/// equal ordinary page-space x/y, so lifting them would translate normal,
+/// already-correct page content by a constant offset instead of fixing
+/// anything. A rotation's lift is `0.0` on an axis whose minimum is already
+/// non-negative, so a page whose rotated content never goes negative (the
+/// `+90` case is non-negative on both axes for real page content) gets
+/// `(0.0, 0.0)` here and this function is a no-op for it — unchanged
+/// behavior from before this fix.
+#[cfg(feature = "pdf")]
+fn rotation_lifts_for_page(segments: &[SegmentData], page_height: f32) -> Vec<RotationLift> {
+    let mut lifts: Vec<RotationLift> = Vec::new();
+    for seg in segments {
+        if seg.is_unrotated() {
+            continue;
+        }
+        let (advance, cross) = seg.upright_origin();
+        let top = page_height - (cross + seg.height);
+        match lifts
+            .iter_mut()
+            .find(|lift| (lift.rotation_degrees - seg.rotation_degrees).abs() <= f32::EPSILON)
+        {
+            Some(lift) => {
+                lift.advance_offset = lift.advance_offset.min(advance);
+                lift.top_offset = lift.top_offset.min(top);
+            }
+            None => lifts.push(RotationLift {
+                rotation_degrees: seg.rotation_degrees,
+                advance_offset: advance,
+                top_offset: top,
+            }),
+        }
+    }
+    for lift in &mut lifts {
+        lift.advance_offset = (-lift.advance_offset).max(0.0);
+        lift.top_offset = (-lift.top_offset).max(0.0);
+    }
+    lifts
+}
+
+#[cfg(feature = "pdf")]
+fn lift_for_rotation(lifts: &[RotationLift], rotation_degrees: f32) -> (f32, f32) {
+    lifts
+        .iter()
+        .find(|lift| (lift.rotation_degrees - rotation_degrees).abs() <= f32::EPSILON)
+        .map(|lift| (lift.advance_offset, lift.top_offset))
+        .unwrap_or((0.0, 0.0))
+}
+
+/// Whether any rotated group on this page needed [`rotation_lifts_for_page`]
+/// to translate it into non-negative image space.
+///
+/// `HocrWord` carries no rotation field, so once words are built there is no
+/// way to tell, from a table region alone, whether its geometry came from a
+/// translated rotated frame. Callers that compute a page-space bounding box
+/// from `HocrWord`s (`native::table::region_bounding_box`) must ask this
+/// *before* that conversion and, if true, not trust that bounding box as
+/// page-space: `region_bounding_box`'s inversion only cancels out to real
+/// page coordinates for the unrotated identity mapping, so a lifted frame's
+/// `left`/`top` fed through it back-projects to a rectangle in no page
+/// coordinate system at all — which would then be compared against real
+/// `SegmentData::x`/`y` by `filter_segments_by_table_bboxes` and could delete
+/// unrelated prose it spuriously overlaps. See GH#1358.
+#[cfg(feature = "pdf")]
+pub(crate) fn page_has_lifted_rotation_frame(segments: &[SegmentData], page_height: f32) -> bool {
+    rotation_lifts_for_page(segments, page_height)
+        .iter()
+        .any(|lift| lift.advance_offset > 0.0 || lift.top_offset > 0.0)
+}
+
 /// Convert a page's segments to word-level `HocrWord`s for table extraction.
 ///
 /// Splits multi-word segments into individual words with proportional bounding
 /// boxes, ensuring each word can be independently matched to table cells.
+///
+/// GH#1358: before per-segment conversion, computes each rotation's page-wide
+/// lift (see [`rotation_lifts_for_page`]) so a rotated table's columns/rows
+/// survive into `HocrWord`'s unsigned fields instead of collapsing onto a
+/// shared clamp floor.
 #[cfg(feature = "pdf")]
 pub(crate) fn segments_to_words(segments: &[SegmentData], page_height: f32) -> Vec<HocrWord> {
+    let lifts = rotation_lifts_for_page(segments, page_height);
     segments
         .iter()
-        .flat_map(|seg| split_segment_to_words(seg, page_height))
+        .flat_map(|seg| {
+            let (advance_offset, top_offset) = lift_for_rotation(&lifts, seg.rotation_degrees);
+            split_segment_to_words_lifted(seg, page_height, advance_offset, top_offset)
+        })
         .collect()
 }
 
@@ -152,7 +285,7 @@ pub(crate) fn segments_to_words(segments: &[SegmentData], page_height: f32) -> V
 /// sub-lines into one header row here, and reused by
 /// [`super::structure::pipeline`]'s table-continuation stitching to collapse
 /// a whole table fragment (whose rows are word-wrapped sub-lines of a single
-/// logical row, once `oxide::table`'s row-gap clustering has split one
+/// logical row, once `native::table`'s row-gap clustering has split one
 /// physical table into several fragments) into one row when the fragments are
 /// stitched back together.
 pub(crate) fn merge_rows_columnwise(rows: &[Vec<String>], column_count: usize) -> Vec<String> {
@@ -191,25 +324,63 @@ pub(crate) fn post_process_table(
     layout_guided: bool,
     allow_single_column: bool,
 ) -> Option<Vec<Vec<String>>> {
-    let min_columns = if allow_single_column {
+    let min_columns = min_columns_for(layout_guided, allow_single_column);
+    post_process_table_inner(table, min_columns, layout_guided, None)
+}
+
+/// Like [`post_process_table`], but also keeps `column_positions` — the column
+/// x-positions [`crate::table_core::reconstruct_table_with_columns`] returned alongside
+/// the grid — in lockstep with any column this cleanup removes.
+///
+/// `merge_header_only_column` and `prune_spurious_interior_column` both drop a column
+/// from the table (a header-only track with no supporting data, or a single stray
+/// footer word). Without this, a caller that hands `column_positions` to a
+/// column-index-keyed consumer *after* post-processing — e.g.
+/// `is_well_formed_borderless_table`'s straddled-boundary check — keeps testing a
+/// boundary for a column that no longer exists in the cleaned grid. That boundary
+/// reads as clean whitespace (nothing was ever assigned to the column that got
+/// dropped), which dilutes the straddle ratio and can let a borderless candidate pass
+/// a gate it should have failed (xberg-io/xberg#863).
+pub(crate) fn post_process_table_with_columns(
+    table: Vec<Vec<String>>,
+    layout_guided: bool,
+    allow_single_column: bool,
+    column_positions: &mut Vec<u32>,
+) -> Option<Vec<Vec<String>>> {
+    let min_columns = min_columns_for(layout_guided, allow_single_column);
+    post_process_table_inner(table, min_columns, layout_guided, Some(column_positions))
+}
+
+fn min_columns_for(layout_guided: bool, allow_single_column: bool) -> usize {
+    if allow_single_column {
         1
     } else if layout_guided {
         2
     } else {
         3
-    };
-    post_process_table_inner(table, min_columns, layout_guided)
+    }
 }
 
 fn post_process_table_inner(
     mut table: Vec<Vec<String>>,
     min_columns: usize,
     layout_guided: bool,
+    mut column_positions: Option<&mut Vec<u32>>,
 ) -> Option<Vec<Vec<String>>> {
     table.retain(|row| row.iter().any(|cell| !cell.trim().is_empty()));
     if table.is_empty() {
+        tracing::debug!(
+            target: "xberg::table_reconstruct",
+            reason = "empty_after_retain",
+            rows = 0,
+            cols = 0,
+            "post_process_table_inner: rejected table"
+        );
         return None;
     }
+
+    let rejection_rows = table.len();
+    let rejection_cols = table.first().map_or(0, Vec::len);
 
     let mut non_empty = 0usize;
     let mut long_cells = 0usize;
@@ -241,17 +412,55 @@ fn post_process_table_inner(
                     })
                     .count();
                 if long_cells_100 * 10 > non_empty * 7 {
+                    tracing::debug!(
+                        target: "xberg::table_reconstruct",
+                        reason = "prose_long_cells_100_ratio",
+                        long_cells_100,
+                        non_empty,
+                        limit_numerator = 7,
+                        limit_denominator = 10,
+                        rows = rejection_rows,
+                        cols = rejection_cols,
+                        "post_process_table_inner: rejected table"
+                    );
                     return None;
                 }
             }
             if total_chars / non_empty > 80 {
+                tracing::debug!(
+                    target: "xberg::table_reconstruct",
+                    reason = "prose_avg_chars_layout_guided",
+                    avg_chars = total_chars / non_empty,
+                    limit = 80,
+                    rows = rejection_rows,
+                    cols = rejection_cols,
+                    "post_process_table_inner: rejected table"
+                );
                 return None;
             }
         } else {
             if long_cells * 2 > non_empty {
+                tracing::debug!(
+                    target: "xberg::table_reconstruct",
+                    reason = "prose_long_cells_ratio",
+                    long_cells,
+                    non_empty,
+                    rows = rejection_rows,
+                    cols = rejection_cols,
+                    "post_process_table_inner: rejected table"
+                );
                 return None;
             }
             if total_chars / non_empty > 50 {
+                tracing::debug!(
+                    target: "xberg::table_reconstruct",
+                    reason = "prose_avg_chars",
+                    avg_chars = total_chars / non_empty,
+                    limit = 50,
+                    rows = rejection_rows,
+                    cols = rejection_cols,
+                    "post_process_table_inner: rejected table"
+                );
                 return None;
             }
         }
@@ -259,6 +468,15 @@ fn post_process_table_inner(
 
     let col_count = table.first().map_or(0, Vec::len);
     if col_count < min_columns {
+        tracing::debug!(
+            target: "xberg::table_reconstruct",
+            reason = "min_columns",
+            col_count,
+            min_columns,
+            rows = rejection_rows,
+            cols = col_count,
+            "post_process_table_inner: rejected table"
+        );
         return None;
     }
 
@@ -277,6 +495,15 @@ fn post_process_table_inner(
 
     if header_rows.is_empty() {
         if data_rows.len() < 2 {
+            tracing::debug!(
+                target: "xberg::table_reconstruct",
+                reason = "insufficient_data_rows_no_header",
+                data_row_count = data_rows.len(),
+                min_required = 2,
+                rows = data_rows.len(),
+                cols = col_count,
+                "post_process_table_inner: rejected table"
+            );
             return None;
         }
         header_rows.push(data_rows[0].clone());
@@ -286,6 +513,13 @@ fn post_process_table_inner(
     let column_count = header_rows.first().or_else(|| data_rows.first()).map_or(0, Vec::len);
 
     if column_count == 0 {
+        tracing::debug!(
+            target: "xberg::table_reconstruct",
+            reason = "zero_column_count",
+            rows = header_rows.len() + data_rows.len(),
+            cols = column_count,
+            "post_process_table_inner: rejected table"
+        );
         return None;
     }
 
@@ -296,6 +530,14 @@ fn post_process_table_inner(
     processed.extend(data_rows);
 
     if processed.len() <= 1 {
+        tracing::debug!(
+            target: "xberg::table_reconstruct",
+            reason = "processed_too_short",
+            rows = processed.len(),
+            cols = processed.first().map_or(0, Vec::len),
+            min_required_rows = 2,
+            "post_process_table_inner: rejected table"
+        );
         return None;
     }
 
@@ -307,21 +549,35 @@ fn post_process_table_inner(
             .all(|row| row.get(col).is_none_or(|cell| cell.trim().is_empty()));
 
         if data_empty {
-            merge_header_only_column(&mut processed, col, header_text);
+            merge_header_only_column(&mut processed, col, header_text, column_positions.as_deref_mut());
         } else {
             col += 1;
         }
 
         if processed.is_empty() || processed[0].is_empty() {
+            tracing::debug!(
+                target: "xberg::table_reconstruct",
+                reason = "processed_emptied_during_merge",
+                rows = processed.len(),
+                cols = processed.first().map_or(0, Vec::len),
+                "post_process_table_inner: rejected table"
+            );
             return None;
         }
     }
 
     if processed[0].len() < 2 || processed.len() <= 1 {
+        tracing::debug!(
+            target: "xberg::table_reconstruct",
+            reason = "insufficient_columns_or_rows_after_merge",
+            rows = processed.len(),
+            cols = processed[0].len(),
+            "post_process_table_inner: rejected table"
+        );
         return None;
     }
 
-    prune_spurious_interior_column(&mut processed, layout_guided);
+    prune_spurious_interior_column(&mut processed, layout_guided, column_positions);
 
     let data_row_count = processed.len() - 1;
     if data_row_count > 0 {
@@ -336,6 +592,18 @@ fn post_process_table_inner(
                 empty_count * 4 > data_row_count * 3
             };
             if too_sparse {
+                tracing::debug!(
+                    target: "xberg::table_reconstruct",
+                    reason = "column_sparsity",
+                    col = c,
+                    empty_count,
+                    data_row_count,
+                    empty_ratio = empty_count as f64 / data_row_count as f64,
+                    limit = if layout_guided { 19.0 / 20.0 } else { 3.0 / 4.0 },
+                    rows = processed.len(),
+                    cols = processed[0].len(),
+                    "post_process_table_inner: rejected table"
+                );
                 return None;
             }
         }
@@ -355,6 +623,17 @@ fn post_process_table_inner(
                 filled * 5 < total_data_cells * 2
             };
             if too_sparse {
+                tracing::debug!(
+                    target: "xberg::table_reconstruct",
+                    reason = "overall_density",
+                    filled,
+                    total_data_cells,
+                    density = filled as f64 / total_data_cells as f64,
+                    limit = if layout_guided { 3.0 / 20.0 } else { 2.0 / 5.0 },
+                    rows = processed.len(),
+                    cols = processed[0].len(),
+                    "post_process_table_inner: rejected table"
+                );
                 return None;
             }
         }
@@ -386,6 +665,17 @@ fn post_process_table_inner(
             && non_empty_cells >= 6
             && single_word_cells * 100 > non_empty_cells * threshold
         {
+            tracing::debug!(
+                target: "xberg::table_reconstruct",
+                reason = "single_word_cell_ratio",
+                single_word_cells,
+                non_empty_cells,
+                ratio = single_word_cells as f64 / non_empty_cells as f64,
+                threshold,
+                rows = processed.len(),
+                cols = processed[0].len(),
+                "post_process_table_inner: rejected table"
+            );
             return None;
         }
     }
@@ -408,6 +698,17 @@ fn post_process_table_inner(
             }
         }
         if eligible_rows >= 3 && flow_rows * 10 > eligible_rows * 6 {
+            tracing::debug!(
+                target: "xberg::table_reconstruct",
+                reason = "column_text_flow",
+                flow_rows,
+                eligible_rows,
+                ratio = flow_rows as f64 / eligible_rows as f64,
+                limit = 0.6,
+                rows = processed.len(),
+                cols = processed[0].len(),
+                "post_process_table_inner: rejected table"
+            );
             return None;
         }
     }
@@ -431,6 +732,15 @@ fn post_process_table_inner(
                 .fold(0.0_f64, f64::max);
             let dominant_threshold = if layout_guided { 0.92 } else { 0.85 };
             if max_col_share > dominant_threshold {
+                tracing::debug!(
+                    target: "xberg::table_reconstruct",
+                    reason = "content_asymmetry_dominant_column",
+                    max_col_share,
+                    dominant_threshold,
+                    rows = processed.len(),
+                    cols = processed[0].len(),
+                    "post_process_table_inner: rejected table"
+                );
                 return None;
             }
 
@@ -444,6 +754,18 @@ fn post_process_table_inner(
                     let empty_ratio = empty_in_col as f64 / data_row_count as f64;
 
                     if char_share < 0.15 && empty_ratio > 0.5 {
+                        tracing::debug!(
+                            target: "xberg::table_reconstruct",
+                            reason = "content_asymmetry_sparse_column",
+                            col = c,
+                            char_share,
+                            empty_ratio,
+                            char_share_limit = 0.15,
+                            empty_ratio_limit = 0.5,
+                            rows = processed.len(),
+                            cols = processed[0].len(),
+                            "post_process_table_inner: rejected table"
+                        );
                         return None;
                     }
                 }
@@ -473,6 +795,17 @@ fn post_process_table_inner(
             }
         }
         if eligible_transitions >= 3 && continuation_count * 10 > eligible_transitions * 4 {
+            tracing::debug!(
+                target: "xberg::table_reconstruct",
+                reason = "row_continuation_flow",
+                continuation_count,
+                eligible_transitions,
+                ratio = continuation_count as f64 / eligible_transitions as f64,
+                limit = 0.4,
+                rows = processed.len(),
+                cols = processed[0].len(),
+                "post_process_table_inner: rejected table"
+            );
             return None;
         }
     }
@@ -491,6 +824,17 @@ fn post_process_table_inner(
                 && filled_cells * 100 > total_data_cells * 80
                 && looks_like_prose_in_columns(&processed[1..], num_cols)
             {
+                tracing::debug!(
+                    target: "xberg::table_reconstruct",
+                    reason = "prose_in_columns_dense",
+                    filled_cells,
+                    total_data_cells,
+                    fill_ratio = filled_cells as f64 / total_data_cells as f64,
+                    limit = 0.8,
+                    rows = processed.len(),
+                    cols = num_cols,
+                    "post_process_table_inner: rejected table"
+                );
                 return None;
             }
         }
@@ -534,6 +878,17 @@ fn post_process_table_inner(
                         .count();
                     let fill_rate = filled_cells as f64 / total_data_cells as f64;
                     if fill_rate > 0.75 {
+                        tracing::debug!(
+                            target: "xberg::table_reconstruct",
+                            reason = "uniform_column_prose",
+                            min_avg,
+                            max_avg,
+                            fill_rate,
+                            fill_rate_limit = 0.75,
+                            rows = processed.len(),
+                            cols = num_cols,
+                            "post_process_table_inner: rejected table"
+                        );
                         return None;
                     }
                 }
@@ -551,6 +906,13 @@ fn post_process_table_inner(
             normalize_data_cell(cell);
         }
     }
+
+    tracing::debug!(
+        target: "xberg::table_reconstruct",
+        rows = processed.len(),
+        cols = processed[0].len(),
+        "post_process_table_inner: accepted table"
+    );
 
     Some(processed)
 }
@@ -626,7 +988,11 @@ fn row_shapes_match(left: &[String], right: &[String]) -> bool {
 /// Remove one empty-header interior track that only catches a stray word in a
 /// large, otherwise dense layout-guided table. Such tracks arise when a footer
 /// word has an x-position that does not occur in the table body.
-fn prune_spurious_interior_column(table: &mut [Vec<String>], layout_guided: bool) -> bool {
+fn prune_spurious_interior_column(
+    table: &mut [Vec<String>],
+    layout_guided: bool,
+    column_positions: Option<&mut Vec<u32>>,
+) -> bool {
     let Some(header) = table.first() else {
         return false;
     };
@@ -670,6 +1036,7 @@ fn prune_spurious_interior_column(table: &mut [Vec<String>], layout_guided: bool
     }
 
     merge_interior_column(table, *column);
+    drop_column_position(column_positions, *column);
     true
 }
 
@@ -1454,7 +1821,12 @@ fn looks_like_declaration_head(head: &str) -> bool {
     identifiers >= 2
 }
 
-fn merge_header_only_column(table: &mut [Vec<String>], col: usize, header_text: String) {
+fn merge_header_only_column(
+    table: &mut [Vec<String>],
+    col: usize,
+    header_text: String,
+    column_positions: Option<&mut Vec<u32>>,
+) {
     if table.is_empty() || table[0].is_empty() {
         return;
     }
@@ -1464,6 +1836,7 @@ fn merge_header_only_column(table: &mut [Vec<String>], col: usize, header_text: 
         for row in table.iter_mut() {
             row.remove(col);
         }
+        drop_column_position(column_positions, col);
         return;
     }
 
@@ -1481,6 +1854,7 @@ fn merge_header_only_column(table: &mut [Vec<String>], col: usize, header_text: 
                 for row in table.iter_mut() {
                     row.remove(col);
                 }
+                drop_column_position(column_positions, col);
                 return;
             }
         }
@@ -1497,12 +1871,26 @@ fn merge_header_only_column(table: &mut [Vec<String>], col: usize, header_text: 
             for row in table.iter_mut() {
                 row.remove(col);
             }
+            drop_column_position(column_positions, col);
             return;
         }
     }
 
     for row in table.iter_mut() {
         row.remove(col);
+    }
+    drop_column_position(column_positions, col);
+}
+
+/// Remove the column-position entry for a column that just got dropped from the table
+/// grid, keeping the two in lockstep for callers that index `column_positions` by
+/// column after post-processing (xberg-io/xberg#863). A no-op when the caller isn't
+/// tracking positions, or `col` is already out of bounds.
+fn drop_column_position(column_positions: Option<&mut Vec<u32>>, col: usize) {
+    if let Some(positions) = column_positions
+        && col < positions.len()
+    {
+        positions.remove(col);
     }
 }
 
@@ -1741,7 +2129,7 @@ mod tests {
             "end".into(),
         ];
 
-        assert!(prune_spurious_interior_column(&mut table, true));
+        assert!(prune_spurious_interior_column(&mut table, true, None));
         assert_eq!(table[0].len(), 6);
         assert!(
             table
@@ -1761,7 +2149,7 @@ mod tests {
         }
         table.last_mut().expect("data row")[3] = "Y".into();
 
-        assert!(!prune_spurious_interior_column(&mut table, true));
+        assert!(!prune_spurious_interior_column(&mut table, true, None));
         assert_eq!(table[0].len(), 7);
         assert_eq!(table[0][3], "Optional flag");
     }
@@ -1784,7 +2172,7 @@ mod tests {
             "end".into(),
         ];
 
-        assert!(!prune_spurious_interior_column(&mut table, true));
+        assert!(!prune_spurious_interior_column(&mut table, true, None));
         assert_eq!(table[0].len(), 7);
         assert_eq!(table[middle][3], "sustained");
     }
@@ -1799,7 +2187,7 @@ mod tests {
             }
         }
 
-        assert!(!prune_spurious_interior_column(&mut table, true));
+        assert!(!prune_spurious_interior_column(&mut table, true, None));
         assert_eq!(table[0].len(), 8);
     }
 

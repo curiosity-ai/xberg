@@ -3,7 +3,59 @@
 //! Defines PDF extraction options including metadata handling, image extraction,
 //! password management, and hierarchy extraction for document structure analysis.
 
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
+
+/// PDF extraction backend selection.
+///
+/// Controls which engine parses and renders PDF documents. Wire format is
+/// snake_case in all serializers (JSON, TOML, YAML). Defaults to
+/// [`PdfBackend::Native`] -- selecting anything else never changes behavior
+/// for a caller who does not opt in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PdfBackend {
+    /// xberg's own pure-Rust PDF engine (default), `crates/xberg-native-pdf`.
+    #[default]
+    Native,
+    /// pdfium -- Google's PDFium engine, gated behind the `pdf-pdfium` Cargo
+    /// feature (#700 added the selection level; #702 added the extraction
+    /// engine, `extractors::pdf::pdfium_engine`, deliberately smaller in scope
+    /// than `Native` -- see that module's doc comment for exactly what it
+    /// extracts). A build without the `pdf-pdfium` feature rejects this at the
+    /// CLI validation layer rather than silently falling back to `Native`.
+    /// A build *with* the feature still enforces the selection at extraction
+    /// time (`extractors::pdf::PdfExtractor::extract_core`), because that is
+    /// the one dispatch point every caller -- CLI, library use, API/MCP
+    /// servers, language bindings -- passes through; see that function's doc
+    /// comment for why the enforcement lives there and not only in CLI
+    /// validation.
+    Pdfium,
+}
+
+impl std::str::FromStr for PdfBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().replace('-', "_").as_str() {
+            // No alias for the pre-1.1.0 spelling: the rename is deliberate and a silently
+            // accepted old name would keep it alive in configs indefinitely. ~keep
+            "native" => Ok(Self::Native),
+            "pdfium" => Ok(Self::Pdfium),
+            other => Err(format!("unknown PDF backend '{other}'; expected: native, pdfium")),
+        }
+    }
+}
+
+impl fmt::Display for PdfBackend {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PdfBackend::Native => write!(f, "native"),
+            PdfBackend::Pdfium => write!(f, "pdfium"),
+        }
+    }
+}
 
 /// PDF-specific configuration.
 #[cfg(feature = "pdf")]
@@ -15,9 +67,9 @@ pub struct PdfConfig {
 
     /// Extract tables from PDF.
     ///
-    /// When `true` (default), runs pdf_oxide's native grid detector and, if it
+    /// When `true` (default), runs the native engine's grid detector and, if it
     /// finds nothing, falls back to the heuristic text-layer reconstruction in
-    /// `pdf::oxide::table::extract_tables_heuristic`. Set to `false` to skip
+    /// `pdf::native::table::extract_tables_heuristic`. Set to `false` to skip
     /// both passes — `tables` will then be empty in the result.
     #[serde(default = "default_true")]
     pub extract_tables: bool,
@@ -40,11 +92,17 @@ pub struct PdfConfig {
     pub extract_annotations: bool,
 
     /// Top margin fraction (0.0–1.0) of page height to exclude headers/running heads.
+    /// Ignored when `ContentFilterConfig.include_headers` is `true`.
+    /// Effective nonzero margins require per-page OCR so geometry can be filtered;
+    /// document-capable OCR backends use their image-processing path in that case.
     /// Default: 0.06 (6%)
     #[serde(default)]
     pub top_margin_fraction: Option<f32>,
 
     /// Bottom margin fraction (0.0–1.0) of page height to exclude footers/page numbers.
+    /// Ignored when `ContentFilterConfig.include_footers` is `true`.
+    /// Effective nonzero margins require per-page OCR so geometry can be filtered;
+    /// document-capable OCR backends use their image-processing path in that case.
     /// Default: 0.05 (5%)
     #[serde(default)]
     pub bottom_margin_fraction: Option<f32>,
@@ -60,11 +118,12 @@ pub struct PdfConfig {
     pub allow_single_column_tables: bool,
 
     /// Perform OCR on inline images extracted from PDF pages and attach the
-    /// recognized text to each `ExtractedImage.ocr_result`. Requires Tesseract
-    /// to be available; if `ExtractionConfig.ocr` is `None` the extractor
-    /// falls back to `TesseractConfig::default()`. Per-image failures degrade
-    /// gracefully (the image is returned without OCR text rather than failing
-    /// the whole extraction). Default: `false`.
+    /// recognized text to each `ExtractedImage.ocr_result`. Uses the backend
+    /// selected by `ExtractionConfig.ocr`, or the default OCR backend when no
+    /// OCR configuration is supplied. Requires the `ocr` or `ocr-pipeline`
+    /// feature. Per-image failures degrade gracefully (the image is returned
+    /// without OCR text rather than failing the whole extraction). Default:
+    /// `false`.
     #[serde(default)]
     pub ocr_inline_images: bool,
 
@@ -94,6 +153,15 @@ pub struct PdfConfig {
     /// `Auto` alone does not turn reordering on. Defaults to `false`.
     #[serde(default)]
     pub reading_order: bool,
+
+    /// Which engine parses and renders this PDF.
+    ///
+    /// Defaults to [`PdfBackend::Native`]. Selecting [`PdfBackend::Pdfium`]
+    /// requires the `pdf-pdfium` feature and is rejected otherwise; the
+    /// pdfium engine is also deliberately narrower in scope than `Native` --
+    /// see [`PdfBackend`] and `extractors::pdf::pdfium_engine` for details.
+    #[serde(default)]
+    pub backend: PdfBackend,
 }
 
 /// Hierarchy extraction configuration for PDF text structure analysis.
@@ -109,7 +177,7 @@ pub struct HierarchyConfig {
 
     /// Number of font size clusters to use for hierarchy levels (1-7)
     ///
-    /// Default: 6, which provides H1-H6 heading levels with body text.
+    /// Default: 3, which provides two heading levels plus body text.
     /// Larger values create more fine-grained hierarchy levels.
     #[serde(default = "default_k_clusters")]
     pub k_clusters: usize,
@@ -135,8 +203,63 @@ impl Default for PdfConfig {
             ocr_inline_images: false,
             extract_form_fields: true,
             reading_order: false,
+            backend: PdfBackend::default(),
         }
     }
+}
+
+#[cfg(feature = "pdf")]
+impl PdfConfig {
+    /// Validate PDF-specific extraction settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::XbergError::Validation`] when a configured page margin is
+    /// non-finite or outside `[0.0, 1.0]`, when hierarchy clustering requests
+    /// fewer than one or more than seven clusters, or when an enabled option is
+    /// unavailable in the current feature set.
+    pub fn validate(&self) -> crate::Result<()> {
+        validate_margin_fraction("pdf_options.top_margin_fraction", self.top_margin_fraction)?;
+        validate_margin_fraction("pdf_options.bottom_margin_fraction", self.bottom_margin_fraction)?;
+
+        if let Some(hierarchy) = &self.hierarchy
+            && !(1..=7).contains(&hierarchy.k_clusters)
+        {
+            return Err(crate::XbergError::validation(format!(
+                "pdf_options.hierarchy.k_clusters must be between 1 and 7 inclusive, got {}",
+                hierarchy.k_clusters
+            )));
+        }
+
+        #[cfg(not(feature = "layout-detection"))]
+        if self.reading_order {
+            return Err(crate::XbergError::validation(
+                "pdf_options.reading_order requires the layout-detection feature",
+            ));
+        }
+
+        #[cfg(not(any(feature = "ocr", feature = "ocr-pipeline")))]
+        if self.ocr_inline_images {
+            return Err(crate::XbergError::validation(
+                "pdf_options.ocr_inline_images requires the ocr or ocr-pipeline feature",
+            ));
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "pdf")]
+fn validate_margin_fraction(field: &str, value: Option<f32>) -> crate::Result<()> {
+    if let Some(value) = value
+        && (!value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(crate::XbergError::validation(format!(
+            "{field} must be finite and between 0.0 and 1.0 inclusive, got {value}"
+        )));
+    }
+
+    Ok(())
 }
 
 impl Default for HierarchyConfig {
@@ -159,10 +282,97 @@ fn default_k_clusters() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg(all(feature = "pdf", not(feature = "layout-detection")))]
+    fn should_reject_reading_order_without_layout_detection() {
+        let config = PdfConfig {
+            reading_order: true,
+            ..Default::default()
+        };
+
+        let error = config.validate().expect_err("unsupported reading order must fail");
+        assert!(error.to_string().contains("layout-detection"));
+    }
+
+    #[test]
+    #[cfg(all(feature = "pdf", not(any(feature = "ocr", feature = "ocr-pipeline"))))]
+    fn should_reject_inline_image_ocr_without_ocr_support() {
+        let config = PdfConfig {
+            ocr_inline_images: true,
+            ..Default::default()
+        };
+
+        let error = config.validate().expect_err("unsupported inline image OCR must fail");
+        assert!(error.to_string().contains("ocr or ocr-pipeline"));
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn should_reject_non_finite_or_out_of_range_pdf_margins() {
+        for (field, top_margin_fraction, bottom_margin_fraction) in [
+            ("top_margin_fraction", Some(f32::NAN), None),
+            ("top_margin_fraction", Some(f32::INFINITY), None),
+            ("top_margin_fraction", Some(-0.01), None),
+            ("top_margin_fraction", Some(1.01), None),
+            ("bottom_margin_fraction", None, Some(f32::NEG_INFINITY)),
+            ("bottom_margin_fraction", None, Some(-0.01)),
+            ("bottom_margin_fraction", None, Some(1.01)),
+        ] {
+            let config = PdfConfig {
+                top_margin_fraction,
+                bottom_margin_fraction,
+                ..PdfConfig::default()
+            };
+
+            let error = config.validate().expect_err("invalid PDF margin must be rejected");
+            assert!(
+                error.to_string().contains(field),
+                "error must identify {field}, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn should_accept_inclusive_pdf_margin_bounds() {
+        for value in [0.0, 1.0] {
+            let config = PdfConfig {
+                top_margin_fraction: Some(value),
+                bottom_margin_fraction: Some(value),
+                ..PdfConfig::default()
+            };
+
+            config.validate().expect("inclusive PDF margin bound must be valid");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn should_reject_hierarchy_cluster_count_outside_supported_range() {
+        for k_clusters in [0, 8] {
+            let config = PdfConfig {
+                hierarchy: Some(HierarchyConfig {
+                    k_clusters,
+                    ..HierarchyConfig::default()
+                }),
+                ..PdfConfig::default()
+            };
+
+            let error = config
+                .validate()
+                .expect_err("unsupported hierarchy cluster count must be rejected");
+            assert!(
+                error.to_string().contains("k_clusters"),
+                "error must identify k_clusters, got: {error}"
+            );
+        }
+    }
+
     #[test]
     #[cfg(feature = "pdf")]
     fn test_hierarchy_config_default() {
-        use super::*;
         let config = HierarchyConfig::default();
         assert!(config.enabled);
         assert_eq!(config.k_clusters, 3);
@@ -172,7 +382,6 @@ mod tests {
     #[test]
     #[cfg(feature = "pdf")]
     fn test_hierarchy_config_disabled() {
-        use super::*;
         let config = HierarchyConfig {
             enabled: false,
             k_clusters: 3,
@@ -186,7 +395,6 @@ mod tests {
     #[test]
     #[cfg(feature = "pdf")]
     fn test_pdf_config_custom_margins() {
-        use super::*;
         let config = PdfConfig {
             extract_images: false,
             extract_tables: true,
@@ -200,6 +408,7 @@ mod tests {
             ocr_inline_images: false,
             extract_form_fields: true,
             reading_order: false,
+            backend: PdfBackend::Native,
         };
         assert_eq!(config.top_margin_fraction, Some(0.10));
         assert_eq!(config.bottom_margin_fraction, Some(0.08));
@@ -208,7 +417,6 @@ mod tests {
     #[test]
     #[cfg(feature = "pdf")]
     fn pdf_config_omitting_extract_form_fields_defaults_to_true() {
-        use super::*;
         let json = r#"{"extract_tables": true, "extract_metadata": true}"#;
         let config: PdfConfig = serde_json::from_str(json).unwrap();
         assert!(
@@ -220,7 +428,6 @@ mod tests {
     #[test]
     #[cfg(feature = "pdf")]
     fn pdf_config_omitting_reading_order_defaults_to_false() {
-        use super::*;
         // reading_order uses `#[serde(default)]` (bool default = false).
         let json = r#"{"extract_tables": true, "extract_metadata": true}"#;
         let config: PdfConfig = serde_json::from_str(json).unwrap();
@@ -230,7 +437,6 @@ mod tests {
     #[test]
     #[cfg(feature = "pdf")]
     fn pdf_config_new_fields_round_trip() {
-        use super::*;
         let config = PdfConfig {
             extract_form_fields: false,
             reading_order: true,
@@ -240,5 +446,88 @@ mod tests {
         let deserialized: PdfConfig = serde_json::from_str(&json).unwrap();
         assert!(!deserialized.extract_form_fields);
         assert!(deserialized.reading_order);
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn pdf_config_omitting_backend_defaults_to_native() {
+        let json = r#"{"extract_tables": true, "extract_metadata": true}"#;
+        let config: PdfConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            config.backend,
+            PdfBackend::Native,
+            "omitted backend must default to native -- no build's behavior may change unless a caller opts in"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn pdf_backend_round_trips_through_json_as_snake_case() {
+        let config = PdfConfig {
+            backend: PdfBackend::Pdfium,
+            ..PdfConfig::default()
+        };
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            json.get("backend").and_then(|v| v.as_str()),
+            Some("pdfium"),
+            "wire format must be snake_case, got {json}"
+        );
+        let deserialized: PdfConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(deserialized.backend, PdfBackend::Pdfium);
+    }
+
+    #[test]
+    fn pdf_backend_from_str_is_case_insensitive() {
+        assert_eq!("native".parse::<PdfBackend>().unwrap(), PdfBackend::Native);
+        assert_eq!("NATIVE".parse::<PdfBackend>().unwrap(), PdfBackend::Native);
+        assert_eq!("pdfium".parse::<PdfBackend>().unwrap(), PdfBackend::Pdfium);
+        assert_eq!("PDFium".parse::<PdfBackend>().unwrap(), PdfBackend::Pdfium);
+    }
+
+    /// The pre-1.1.0 spelling must be REJECTED, not silently accepted.
+    ///
+    /// This is a breaking change made on purpose: an alias would keep the old name alive in
+    /// user configs forever, which is the opposite of the rename's point. A caller who set
+    /// `backend = "pdf_oxide"` gets an error naming the valid values rather than a silent
+    /// behaviour they did not ask for.
+    #[test]
+    fn pdf_backend_from_str_rejects_the_pre_rename_spelling() {
+        for old in ["pdf_oxide", "pdf-oxide", "PDF-OXIDE"] {
+            let error = old.parse::<PdfBackend>().unwrap_err();
+            assert!(
+                error.contains("native"),
+                "rejecting {old} must point at the new name, got: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn pdf_backend_from_str_rejects_unknown_value_and_lists_valid_ones() {
+        let error = "xyz".parse::<PdfBackend>().unwrap_err();
+        assert!(error.contains("native"), "error must list native, got: {error}");
+        assert!(error.contains("pdfium"), "error must list pdfium, got: {error}");
+    }
+
+    /// Documents the known gap from `fixture_config_round_trip.rs`: `PdfConfig` does not
+    /// carry `#[serde(deny_unknown_fields)]` (only `ExtractionConfig` and
+    /// `UrlExtractionConfig` do, repo-wide), so a plausible-but-wrong nested key --
+    /// someone reasonably guessing the field is called `pdf_backend`, mirroring the
+    /// top-level CLI flag and JSON key, rather than the actual wire name `backend` --
+    /// silently parses and the setting never applies; `backend` quietly stays at its
+    /// default (`Native`) with no warning. This test is a regression net: if `PdfConfig`
+    /// ever gains `deny_unknown_fields`, this assertion starts failing (the typo becomes a
+    /// hard parse error) and should be deleted in the same change.
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn pdf_config_typod_backend_key_is_silently_dropped() {
+        let json = serde_json::json!({"extract_tables": true, "pdf_backend": "pdfium"});
+        let config: PdfConfig = serde_json::from_value(json).expect("an unknown key must not be a parse error today");
+        assert_eq!(
+            config.backend,
+            PdfBackend::Native,
+            "the wrong key 'pdf_backend' (the correct wire name is 'backend') must be silently \
+             ignored, leaving backend at its default"
+        );
     }
 }

@@ -54,6 +54,21 @@ use roxmltree::Node;
 use std::io::Read;
 use zip::ZipArchive;
 
+/// Maximum bytes read from any single metadata entry (`docProps/core.xml`,
+/// `docProps/app.xml`, `docProps/custom.xml`, or ODF's `meta.xml`).
+///
+/// `ZipBombValidator::validate`, called once at archive open by every caller of
+/// this module (DOCX/PPTX/XLSX and ODT/ODP/ODS extractors), already bounds every
+/// entry's *declared* uncompressed size via the central directory. That is not
+/// the same guarantee: the ZIP format's declared uncompressed-size field is
+/// metadata the decompressor never enforces while streaming, so a crafted entry
+/// can declare a tiny size while its real deflate stream expands far past it.
+/// This constant instead bounds the actual bytes pulled out via `Read::take`,
+/// independent of what the header claimed. Matches DOCX's per-file cap
+/// (`crate::extraction::docx::MAX_UNCOMPRESSED_FILE_SIZE`, 100 MiB) for
+/// consistency across the codebase's ZIP-container metadata readers.
+const MAX_METADATA_ENTRY_SIZE: u64 = 100 * 1024 * 1024;
+
 /// Read a ZIP archive entry to a `String`.
 ///
 /// Returns `Ok(Some(content))` if the entry exists and was read successfully,
@@ -71,9 +86,10 @@ pub(crate) fn read_zip_entry_to_string<R: Read + std::io::Seek>(
     display_name: &str,
 ) -> Result<Option<String>> {
     match archive.by_name(entry_path) {
-        Ok(mut file) => {
+        Ok(file) => {
             let mut content = String::new();
-            file.read_to_string(&mut content)
+            file.take(MAX_METADATA_ENTRY_SIZE)
+                .read_to_string(&mut content)
                 .map_err(|e| XbergError::parsing(format!("Failed to read {display_name}: {e}")))?;
             Ok(Some(content))
         }

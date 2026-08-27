@@ -15,6 +15,17 @@ use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
+const USE_CACHE_BACKEND_OPTION: &str = "use_cache";
+
+fn select_output_ocr_elements(
+    elements: Option<Vec<crate::types::OcrElement>>,
+    config: &OcrConfig,
+) -> Option<Vec<crate::types::OcrElement>> {
+    let options = config.element_config.as_ref()?;
+    let selected = options.select_elements(elements.as_deref().unwrap_or_default());
+    (!selected.is_empty()).then_some(selected)
+}
+
 use crate::ocr::types::TesseractConfig as InternalTesseractConfig;
 
 /// Native Tesseract OCR backend.
@@ -92,7 +103,42 @@ impl TesseractBackend {
             internal.auto_rotate = true;
         }
         internal.tessdata_path = config.tessdata_path.clone();
+        internal.source_dpi = Self::source_dpi_from_backend_options(config);
+        if let Some(use_cache) = Self::use_cache_from_backend_options(config) {
+            internal.use_cache = use_cache;
+        }
         internal
+    }
+
+    /// Read the per-call result-cache override from `backend_options`.
+    ///
+    /// This keeps callers that only need a cold Tesseract invocation from
+    /// materializing `tesseract_config`, which would make automatic whole-image
+    /// PSM selection and its sparse-image fallback look explicitly configured.
+    fn use_cache_from_backend_options(config: &OcrConfig) -> Option<bool> {
+        config
+            .backend_options
+            .as_ref()
+            .and_then(|options| options.get(USE_CACHE_BACKEND_OPTION))
+            .and_then(serde_json::Value::as_bool)
+    }
+
+    /// Read the per-call source-resolution hint out of `backend_options`.
+    ///
+    /// Mirrors `PaddleOcrBackend::page_rotation_degrees_from_backend_options`: an absent,
+    /// malformed, or non-positive value is treated as "unknown" rather than as an error, so
+    /// callers that never set the hint (standalone image OCR, other backends' tests reusing this
+    /// config) keep the historical 72-DPI assumption and nothing about their behaviour changes.
+    ///
+    /// Non-finite and non-positive values are rejected because they would propagate into the
+    /// `target_dpi / source_dpi` scale factor as a NaN or a negative resize.
+    fn source_dpi_from_backend_options(config: &OcrConfig) -> Option<f64> {
+        config
+            .backend_options
+            .as_ref()
+            .and_then(|options| options.get(crate::core::config::ocr::SOURCE_DPI_BACKEND_OPTION))
+            .and_then(serde_json::Value::as_f64)
+            .filter(|dpi| dpi.is_finite() && *dpi > 0.0)
     }
 
     /// Get cached available languages, lazily querying Tesseract if needed.
@@ -263,9 +309,11 @@ impl OcrBackend for TesseractBackend {
             .to_string();
 
         let pre_formatted = extract_pre_formatted_metadata(&mut ocr_result.metadata);
+        let image_preprocessing = extract_image_preprocessing_metadata(&mut ocr_result.metadata);
 
         let processing_warnings = warnings_from_ocr_metadata(&ocr_result.metadata);
         strip_ocr_scratch_metadata_keys(&mut ocr_result.metadata);
+        let ocr_elements = select_output_ocr_elements(ocr_result.ocr_elements.take(), config);
 
         let mut additional = AHashMap::new();
         for (key, value) in ocr_result.metadata {
@@ -285,6 +333,7 @@ impl OcrBackend for TesseractBackend {
                     .and_then(|t| t.cells.first().map(|row| row.len() as u32)),
             })),
             output_format: pre_formatted,
+            image_preprocessing,
             additional,
             ..Default::default()
         };
@@ -299,7 +348,7 @@ impl OcrBackend for TesseractBackend {
                 .enumerate()
                 .map(|(index, t)| convert_ocr_table(index, t))
                 .collect(),
-            ocr_elements: ocr_result.ocr_elements,
+            ocr_elements,
             ocr_internal_document: ocr_result.internal_document,
             processing_warnings,
             ..Default::default()
@@ -359,9 +408,11 @@ impl OcrBackend for TesseractBackend {
             .to_string();
 
         let pre_formatted = extract_pre_formatted_metadata(&mut ocr_result.metadata);
+        let image_preprocessing = extract_image_preprocessing_metadata(&mut ocr_result.metadata);
 
         let processing_warnings = warnings_from_ocr_metadata(&ocr_result.metadata);
         strip_ocr_scratch_metadata_keys(&mut ocr_result.metadata);
+        let ocr_elements = select_output_ocr_elements(ocr_result.ocr_elements.take(), config);
 
         let mut additional = AHashMap::new();
         for (key, value) in ocr_result.metadata {
@@ -381,6 +432,7 @@ impl OcrBackend for TesseractBackend {
                     .and_then(|t| t.cells.first().map(|row| row.len() as u32)),
             })),
             output_format: pre_formatted,
+            image_preprocessing,
             additional,
             ..Default::default()
         };
@@ -395,7 +447,7 @@ impl OcrBackend for TesseractBackend {
                 .enumerate()
                 .map(|(index, t)| convert_ocr_table(index, t))
                 .collect(),
-            ocr_elements: ocr_result.ocr_elements,
+            ocr_elements,
             ocr_internal_document: ocr_result.internal_document,
             processing_warnings,
             ..Default::default()
@@ -416,6 +468,19 @@ impl OcrBackend for TesseractBackend {
 
     fn supports_table_detection(&self) -> bool {
         true
+    }
+
+    /// Tesseract's mean per-word classifier confidence, 0-100, is validated to track
+    /// legibility: on a scanned ordinance, prose pages scored 89-95 and pure line-art
+    /// drawings scored 36-62. It is safe to use as an absolute quality gate.
+    fn confidence_semantics(&self) -> crate::plugins::ConfidenceSemantics {
+        crate::plugins::ConfidenceSemantics::Legibility { scale_max: 100.0 }
+    }
+
+    /// Measured on a `/Rotate 270` scanned ordinance: Tesseract reconstructs correct reading
+    /// order on the sideways raster outright, with no upright-render step required.
+    fn page_orientation_handling(&self) -> crate::plugins::PageOrientationHandling {
+        crate::plugins::PageOrientationHandling::SelfCorrecting
     }
 
     #[cfg_attr(alef, alef(skip))]
@@ -563,6 +628,19 @@ fn extract_pre_formatted_metadata(
     metadata
         .remove(PRE_FORMATTED_METADATA_KEY)
         .and_then(|v| v.as_str().map(str::to_string))
+}
+
+fn extract_image_preprocessing_metadata(
+    metadata: &mut std::collections::HashMap<String, serde_json::Value>,
+) -> Option<crate::types::ImagePreprocessingMetadata> {
+    let value = metadata.remove(crate::ocr_metadata_keys::OCR_IMAGE_PREPROCESSING_METADATA_KEY)?;
+    match serde_json::from_value(value) {
+        Ok(metadata) => Some(metadata),
+        Err(error) => {
+            tracing::warn!(%error, "discarding invalid OCR image preprocessing metadata");
+            None
+        }
+    }
 }
 
 /// Turn the OCR backend's metadata side-channel into the `ProcessingWarning`s a
@@ -887,6 +965,96 @@ mod tests {
         assert!(tess_config.enable_table_detection);
     }
 
+    /// The `source_dpi` hint the PDF OCR route stamps per page must survive the crossing into
+    /// the internal config — that is the whole delivery path, and it needs no change to the
+    /// `OcrBackend` trait because `backend_options` is already a documented per-call channel.
+    ///
+    /// Fails on unfixed code: `InternalTesseractConfig` has no `source_dpi` field, so this does
+    /// not compile. There is no expression of the value to assert against at all.
+    #[test]
+    fn should_read_source_dpi_hint_from_backend_options() {
+        let backend = TesseractBackend::new();
+        let ocr_config = OcrConfig {
+            backend: "tesseract".to_string(),
+            backend_options: Some(serde_json::json!({ "source_dpi": 150.0 })),
+            ..Default::default()
+        };
+
+        assert_eq!(backend.config_to_tesseract(&ocr_config).source_dpi, Some(150.0));
+    }
+
+    #[test]
+    fn should_read_result_cache_override_from_backend_options() {
+        let backend = TesseractBackend::new();
+        let ocr_config = OcrConfig {
+            backend: "tesseract".to_string(),
+            backend_options: Some(serde_json::json!({ "use_cache": false })),
+            ..Default::default()
+        };
+
+        assert!(!backend.config_to_tesseract(&ocr_config).use_cache);
+        assert!(ocr_config.tesseract_config.is_none());
+    }
+
+    #[test]
+    fn should_ignore_malformed_result_cache_override() {
+        let backend = TesseractBackend::new();
+        let ocr_config = OcrConfig {
+            backend: "tesseract".to_string(),
+            backend_options: Some(serde_json::json!({ "use_cache": "false" })),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            backend.config_to_tesseract(&ocr_config).use_cache,
+            InternalTesseractConfig::default().use_cache
+        );
+    }
+
+    /// Callers that do not know their image's resolution — standalone image OCR, plugin callers
+    /// handed arbitrary bytes — must keep reaching the historical 72-DPI assumption rather than
+    /// being given a fabricated value.
+    ///
+    /// Fails on unfixed code by not compiling; behaviourally this is the pre-existing contract,
+    /// pinned so the new hint cannot silently displace it.
+    #[test]
+    fn should_leave_source_dpi_unknown_when_no_hint_is_supplied() {
+        let backend = TesseractBackend::new();
+        let ocr_config = OcrConfig {
+            backend: "tesseract".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(backend.config_to_tesseract(&ocr_config).source_dpi, None);
+    }
+
+    /// A malformed or impossible hint is "unknown", not an error and not a poisoned scale
+    /// factor: a zero or negative DPI would make the resize factor infinite or negative, and a
+    /// string would silently become `None` anyway.
+    ///
+    /// Fails on unfixed code by not compiling.
+    #[test]
+    fn should_reject_non_positive_or_malformed_source_dpi_hints() {
+        let backend = TesseractBackend::new();
+        for hint in [
+            serde_json::json!({ "source_dpi": 0.0 }),
+            serde_json::json!({ "source_dpi": -150.0 }),
+            serde_json::json!({ "source_dpi": "150" }),
+        ] {
+            let ocr_config = OcrConfig {
+                backend: "tesseract".to_string(),
+                backend_options: Some(hint.clone()),
+                ..Default::default()
+            };
+
+            assert_eq!(
+                backend.config_to_tesseract(&ocr_config).source_dpi,
+                None,
+                "hint {hint} must be treated as unknown"
+            );
+        }
+    }
+
     #[test]
     fn test_config_to_tesseract_defaults_empty_language_to_eng() {
         let backend = TesseractBackend::new();
@@ -1148,6 +1316,47 @@ mod tests {
 
         assert_eq!(extracted.as_deref(), Some("markdown"));
         assert!(!metadata.contains_key(PRE_FORMATTED_METADATA_KEY));
+    }
+
+    #[test]
+    fn image_preprocessing_metadata_is_promoted_to_the_typed_document_field() {
+        let mut metadata = std::collections::HashMap::from([
+            (
+                crate::ocr_metadata_keys::OCR_IMAGE_PREPROCESSING_METADATA_KEY.to_string(),
+                serde_json::json!({
+                    "original_dimensions": [4, 4],
+                    "original_dpi": [72.0, 72.0],
+                    "target_dpi": 300,
+                    "scale_factor": 0.5,
+                    "auto_adjusted": false,
+                    "final_dpi": 36,
+                    "new_dimensions": [2, 2],
+                    "resample_method": "LANCZOS3",
+                    "dimension_clamped": true,
+                    "calculated_dpi": null,
+                    "skipped_resize": false,
+                    "resize_error": null
+                }),
+            ),
+            ("mean_text_conf".to_string(), serde_json::json!(98.5)),
+        ]);
+
+        let promoted =
+            extract_image_preprocessing_metadata(&mut metadata).expect("valid preprocessing metadata must be promoted");
+
+        assert_eq!(promoted.original_dimensions.width, 4);
+        assert_eq!(promoted.original_dimensions.height, 4);
+        assert_eq!(
+            promoted.new_dimensions.as_ref().map(|dimensions| dimensions.width),
+            Some(2)
+        );
+        assert_eq!(
+            promoted.new_dimensions.as_ref().map(|dimensions| dimensions.height),
+            Some(2)
+        );
+        assert!(promoted.dimension_clamped);
+        assert!(!metadata.contains_key(crate::ocr_metadata_keys::OCR_IMAGE_PREPROCESSING_METADATA_KEY));
+        assert_eq!(metadata.get("mean_text_conf"), Some(&serde_json::json!(98.5)));
     }
 
     /// #354 must not over-fire: genuine document metadata that happens to

@@ -8,7 +8,13 @@
 //! - Entity length validation
 //! - Path traversal detection
 
-#[cfg(any(feature = "archives", feature = "hwpx", feature = "iwork"))]
+#[cfg(any(
+    feature = "archives",
+    feature = "hwpx",
+    feature = "iwork",
+    feature = "office",
+    feature = "excel"
+))]
 use std::io::{Read, Seek};
 
 /// Configuration for security limits across extractors.
@@ -28,7 +34,7 @@ pub struct SecurityLimits {
     /// Maximum number of files in archive (10,000)
     pub max_files_in_archive: usize,
 
-    /// Maximum nesting depth for structures (100)
+    /// Maximum nesting depth for structures (1024)
     pub max_nesting_depth: usize,
 
     /// Maximum length of any single XML entity / attribute / token (1 MiB).
@@ -44,11 +50,43 @@ pub struct SecurityLimits {
     /// Maximum iterations per operation
     pub max_iterations: usize,
 
-    /// Maximum XML depth (100 levels)
+    /// Maximum XML depth (1024 levels)
     pub max_xml_depth: usize,
 
     /// Maximum cells per table (100,000)
     pub max_table_cells: usize,
+
+    /// Maximum number of pages (or slides, or frames) in a single document.
+    /// `None` means unlimited.
+    ///
+    /// Checked once the count is known and before any per-page work (OCR, layout
+    /// detection, rendering) starts. Byte-size limits do not bound page count: a
+    /// scanned page can compress to a few kilobytes, so a document well under
+    /// `max_content_size` or `max_archive_size` can still hold thousands of pages
+    /// of per-page work. Defaults to `None` (unlimited) because a real ceiling
+    /// here is workload-specific and a low default would silently reject
+    /// legitimate large documents; callers that want a ceiling set this
+    /// explicitly.
+    ///
+    /// Enforced for: PDF (`extractors::pdf`, page count via `xberg_native_pdf`/`lopdf`),
+    /// PPTX (`extraction::pptx`, slide count from the archive's slide parts),
+    /// Keynote (`extractors::iwork::keynote`, slide count from `Index/Slide-*.iwa`
+    /// entry names), ODP (`extractors::odp`, `draw:page` count in `content.xml`),
+    /// and multi-frame TIFF images built with the `ocr` feature
+    /// (`extractors::image`, frame count via the `tiff` crate). Not enforced for
+    /// any other format, including DOCX, ODT, XLSX, legacy PPT/DOC, Pages/Numbers,
+    /// and TIFF images when the `ocr` feature is disabled: those formats either
+    /// have no fixed "page" the crate can count without doing the expensive work
+    /// itself (DOCX/ODT page count is a layout outcome, not a stored value), or
+    /// have no per-page pipeline to gate at all. Setting `max_pages` on a
+    /// document of an unenforced format is silently a no-op, not a guarantee.
+    // GH#764: modelled as `Option<usize>` rather than a `usize::MAX` sentinel, which had no
+    // faithful representation in a generated binding -- alef reads `Default` impls into
+    // concrete values, and a path expression it cannot fold yields the target language's zero,
+    // which would have inverted "no page cap" into "reject every document" in all 15 bindings.
+    // `Option<usize>` maps cleanly to None/nil/null/undefined everywhere, so the field now
+    // generates instead of being skipped.
+    pub max_pages: Option<usize>,
 }
 
 impl Default for SecurityLimits {
@@ -63,6 +101,7 @@ impl Default for SecurityLimits {
             max_iterations: 10_000_000,
             max_xml_depth: 1024,
             max_table_cells: 100_000,
+            max_pages: None,
         }
     }
 }
@@ -145,6 +184,14 @@ pub enum SecurityError {
         max: usize,
     },
 
+    /// Document has too many pages
+    TooManyPages {
+        /// Number of pages found in the document.
+        count: usize,
+        /// Configured maximum page count.
+        max: usize,
+    },
+
     /// An archive entry could not be read, so its declared sizes could not be
     /// counted towards the archive limits. Reported rather than skipped: an
     /// unaccounted entry makes every aggregate total untrustworthy.
@@ -194,6 +241,14 @@ impl std::fmt::Display for SecurityError {
             SecurityError::TooManyCells { cells, max } => {
                 write!(f, "Too many table cells: {} (max: {})", cells, max)
             }
+            SecurityError::TooManyPages { count, max } => {
+                write!(
+                    f,
+                    "Document has too many pages: {} (max: {}). Raise `security_limits.max_pages` \
+                     if this document is legitimate, or split it before extraction.",
+                    count, max
+                )
+            }
             SecurityError::UnreadableEntry { index, reason } => {
                 write!(
                     f,
@@ -207,15 +262,58 @@ impl std::fmt::Display for SecurityError {
 
 impl std::error::Error for SecurityError {}
 
+/// Reject a document whose page count exceeds `max_pages`.
+///
+/// GH#1451. Every paginated format that can count cheaply before per-page work begins calls
+/// this: PDF pages, PPTX/ODP/Keynote slides, multi-frame TIFF. Counting is what differs
+/// between them; the comparison is not, and it had been copied verbatim into four modules.
+///
+/// `None` means unlimited, so an unset limit costs one branch and never rejects. The
+/// comparison is `>` rather than `>=` deliberately -- a document exactly at the ceiling is
+/// within it.
+// Callers are the five paginated-format extractors, each behind its own feature: odp.rs and
+// extraction/pptx/mod.rs (`office`), pdf/mod.rs (`pdf`), iwork/keynote.rs (`iwork`), and
+// image.rs (`ocr`, for multi-frame TIFF). A default build enables none of them, so this
+// is gated to exactly that union rather than carrying `#[allow(dead_code)]`. No `test` arm:
+// nothing tests it directly, and adding one would re-hide it.
+#[cfg(any(feature = "office", feature = "pdf", feature = "iwork", feature = "ocr"))]
+pub(crate) fn enforce_page_count(count: usize, max_pages: Option<usize>) -> Result<(), SecurityError> {
+    match max_pages {
+        Some(max) if count > max => Err(SecurityError::TooManyPages { count, max }),
+        _ => Ok(()),
+    }
+}
+
 /// Helper struct for validating ZIP archives for security issues.
-#[cfg(any(feature = "archives", feature = "hwpx", feature = "iwork"))]
+#[cfg(any(
+    feature = "archives",
+    feature = "hwpx",
+    feature = "iwork",
+    feature = "office",
+    feature = "excel"
+))]
 #[cfg_attr(alef, alef(skip))]
 pub struct ZipBombValidator {
     limits: SecurityLimits,
 }
 
-#[cfg(any(feature = "archives", feature = "hwpx", feature = "iwork"))]
+#[cfg(any(
+    feature = "archives",
+    feature = "hwpx",
+    feature = "iwork",
+    feature = "office",
+    feature = "excel"
+))]
 impl ZipBombValidator {
+    /// Smallest uncompressed member size the per-member ratio cap applies to.
+    ///
+    /// The ratio cap guards against one member that inflates to hundreds of
+    /// megabytes. A member measured in kilobytes cannot exhaust memory whatever
+    /// its ratio, and blank-page JPEGs, empty stylesheets and whitespace-padded
+    /// pages routinely deflate past 100:1 (GH#1496). The total-size cap and the
+    /// whole-archive ratio cap still bound the aggregate.
+    const MEMBER_RATIO_FLOOR: u64 = 1024 * 1024;
+
     /// Create a new ZIP bomb validator.
     pub(crate) fn new(limits: SecurityLimits) -> Self {
         Self { limits }
@@ -271,7 +369,7 @@ impl ZipBombValidator {
             total_uncompressed = total_uncompressed.saturating_add(uncompressed_size);
             total_compressed = total_compressed.saturating_add(compressed_size);
 
-            if uncompressed_size > 0 {
+            if uncompressed_size > 0 && (compressed_size == 0 || uncompressed_size >= Self::MEMBER_RATIO_FLOOR) {
                 // A zero compressed size paired with a non-zero uncompressed size cannot be
                 // produced by any compressor; treating it as an unbounded ratio stops the
                 // entry from slipping past this check on a division it never performs. ~keep
@@ -590,6 +688,12 @@ impl SecurityBudget {
         self.depth.pop();
     }
 
+    /// The element depth at which [`SecurityBudget::enter`] starts to fail.
+    #[cfg(feature = "office")]
+    pub(crate) fn depth_limit(&self) -> usize {
+        self.depth.max_depth
+    }
+
     /// Account for `len` bytes of emitted text. Returns `Err(ContentTooLarge)`
     /// once total output exceeds `max_content_size`.
     pub(crate) fn account_text(&mut self, len: usize) -> Result<(), SecurityError> {
@@ -614,32 +718,187 @@ impl SecurityBudget {
     }
 }
 
-/// Return `true` when `path_str` contains a path-traversal component (`..`).
+/// Error returned by [`resolve_container_entry`] when a container-relative entry name
+/// cannot be safely resolved.
 ///
-/// Uses [`std::path::Path::components`] rather than a string search so that
-/// normalised representations (e.g. `a/../b`) are caught while benign values
-/// like `"1..2"` in list-numbering prefixes are not falsely flagged.
+/// Deliberately narrow: this is about resolving a name against an archive-relative base
+/// directory, not filesystem confinement. See [`crate::core::path_resolver`] for the
+/// (unrelated) problem of confining a real filesystem read to a base directory.
+#[cfg(any(feature = "office", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PathTraversalError {
+    /// A `..` component popped past the container root: there was nothing left to remove.
+    EscapesRoot,
+    /// The target contains a NUL byte, which cannot appear in a legitimate archive entry name.
+    InvalidByte,
+    /// The target carries a Windows drive letter (`C:`) or UNC (`//server/share`) prefix.
+    /// This function resolves names *inside* an archive, never a host filesystem path, so
+    /// either form is rejected outright rather than treated as a literal path segment.
+    DriveOrUncPrefix,
+    /// Resolution produced no path segments at all (e.g. a bare `..` against a one-level
+    /// base, or an input made up only of `.`/empty components).
+    EmptyResult,
+}
+
+#[cfg(any(feature = "office", test))]
+impl std::fmt::Display for PathTraversalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Self::EscapesRoot => write!(f, "path escapes the container root"),
+            Self::InvalidByte => write!(f, "path contains a NUL byte"),
+            Self::DriveOrUncPrefix => write!(f, "path carries a drive letter or UNC prefix"),
+            Self::EmptyResult => write!(f, "path resolves to no entry"),
+        }
+    }
+}
+
+#[cfg(any(feature = "office", test))]
+impl std::error::Error for PathTraversalError {}
+
+/// Resolve a container-relative entry name against a base directory inside a ZIP-based
+/// container (an OOXML part, an EPUB package, ...).
 ///
-/// # Examples
+/// This is **boundary-relative**, not a `..`-blacklist: an in-bounds `..` that leaves and
+/// returns without crossing the container root is allowed, because that is the normal,
+/// spec-correct form of many OPC/EPUB relationships (`../media/image1.png` is exactly how a
+/// PPTX slide references an image one directory up, and how a DOCX `word/_rels/document.xml.rels`
+/// entry references an image at the package root's `media/`). Only a `..` that would pop
+/// past the root is rejected. This replaces the deleted `has_path_traversal`, which rejected
+/// every `..` unconditionally and would have broken every one of those legitimate references.
 ///
-/// Not run as a doctest: this predicate is `pub(crate)`, used by the archive and
-/// container extractors. The public entry point for archive safety is
-/// [`crate::SecurityLimits`].
+/// `base` is the container-relative directory the reference resolves against (e.g. `"word"`,
+/// `"ppt/slides"`, `"OEBPS/text"`; `""` or `"."` means the container root). A leading `/` in
+/// `target` means "relative to the container root" per the OPC/EPUB convention -- not the
+/// host filesystem -- and overrides `base` entirely.
 ///
-/// ```ignore
-/// # use xberg::extractors::security::has_path_traversal;
-/// assert!(has_path_traversal("word/../../etc/passwd"));
-/// assert!(!has_path_traversal("word/images/photo.png"));
-/// ```
-#[allow(dead_code)]
-pub(crate) fn has_path_traversal(path_str: &str) -> bool {
-    use std::path::{Component, Path};
-    Path::new(path_str).components().any(|c| c == Component::ParentDir)
+/// Backslashes in `target` are normalised to `/` explicitly rather than relying on
+/// [`std::path`], whose component parsing is target-OS-dependent: the same source can treat
+/// `a\..\..\x` as one opaque literal on Unix and as three components on Windows. A drive
+/// letter (`C:`) or UNC prefix (`//server/share`, from a normalised `\\server\share`) is
+/// rejected outright. `base` is not backslash-normalised: every real caller builds it from
+/// `/`-delimited container-relative names (a hardcoded literal, or a directory sliced out of
+/// an entry name that itself uses `/`), never from raw attacker input.
+///
+/// Percent-decoding is deliberately **not** performed here; it is format-specific (an EPUB
+/// href is a URL, an OOXML `Target` attribute is not). A caller that needs it must decode
+/// *before* calling this function -- decoding after would let a decoded `../` slip past a
+/// boundary check that already ran.
+// Every real caller (DOCX, EPUB, PPTX) lives behind `#[cfg(feature = "office")]`, so this
+// whole group compiles out with that feature off rather than carrying a blanket
+// `#[allow(dead_code)]`, which would also mask a genuinely-unused item appearing later.
+// `test` is OR'd in so the unit tests below still reach it under a non-office test build.
+#[cfg(any(feature = "office", test))]
+pub(crate) fn resolve_container_entry(base: &str, target: &str) -> Result<String, PathTraversalError> {
+    if target.contains('\0') {
+        return Err(PathTraversalError::InvalidByte);
+    }
+
+    let normalized_target = target.replace('\\', "/");
+    if is_drive_or_unc_prefixed(&normalized_target) {
+        return Err(PathTraversalError::DriveOrUncPrefix);
+    }
+
+    let mut stack: Vec<&str> = Vec::new();
+    let effective: &str = match normalized_target.strip_prefix('/') {
+        Some(root_relative) => root_relative,
+        None => {
+            for segment in base.split('/') {
+                push_segment(&mut stack, segment)?;
+            }
+            normalized_target.as_str()
+        }
+    };
+
+    for segment in effective.split('/') {
+        push_segment(&mut stack, segment)?;
+    }
+
+    if stack.is_empty() {
+        return Err(PathTraversalError::EmptyResult);
+    }
+
+    Ok(stack.join("/"))
+}
+
+/// Apply one `/`-delimited path segment to the working stack: push a normal component,
+/// ignore `.` and empty components, and pop on `..` -- erroring if there is nothing left to
+/// pop. Shared between the `base` and `target` halves of [`resolve_container_entry`] so the
+/// pop-underflow rule is exactly one rule, applied identically on both sides of the join.
+#[cfg(any(feature = "office", test))]
+fn push_segment<'a>(stack: &mut Vec<&'a str>, segment: &'a str) -> Result<(), PathTraversalError> {
+    match segment {
+        "" | "." => {}
+        ".." => {
+            if stack.pop().is_none() {
+                return Err(PathTraversalError::EscapesRoot);
+            }
+        }
+        _ => stack.push(segment),
+    }
+    Ok(())
+}
+
+/// `true` when `path` begins with a Windows drive letter (`C:`) or a UNC prefix (`//`, which
+/// is what `\\server\share` becomes after backslash normalisation).
+#[cfg(any(feature = "office", test))]
+fn is_drive_or_unc_prefixed(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    path.starts_with("//") || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "office")]
+    fn archive_with_compressible_entry(entry_size: usize) -> zip::ZipArchive<std::io::Cursor<Vec<u8>>> {
+        use std::io::{Cursor, Write};
+        use zip::write::SimpleFileOptions;
+
+        const STORED_BALLAST_SIZE: usize = 4 * 1024 * 1024;
+
+        let mut bytes = Vec::new();
+        {
+            let mut writer = zip::ZipWriter::new(Cursor::new(&mut bytes));
+            let stored = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            writer.start_file("ballast.bin", stored).expect("start stored entry");
+            writer
+                .write_all(&vec![0x5a; STORED_BALLAST_SIZE])
+                .expect("write stored ballast");
+
+            let deflated = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            writer
+                .start_file("compact.bin", deflated)
+                .expect("start deflated entry");
+            writer.write_all(&vec![0; entry_size]).expect("write compact entry");
+            writer.finish().expect("finish ZIP");
+        }
+        zip::ZipArchive::new(Cursor::new(bytes)).expect("open ZIP")
+    }
+
+    #[cfg(feature = "office")]
+    #[test]
+    fn zip_ratio_allows_small_highly_compressible_entry() {
+        let mut archive = archive_with_compressible_entry(337 * 1024);
+
+        assert!(
+            ZipBombValidator::new(SecurityLimits::default())
+                .validate(&mut archive)
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "office")]
+    #[test]
+    fn zip_ratio_rejects_large_highly_compressible_entry() {
+        let mut archive = archive_with_compressible_entry(4 * 1024 * 1024);
+
+        assert!(matches!(
+            ZipBombValidator::new(SecurityLimits::default()).validate(&mut archive),
+            Err(SecurityError::ZipBombDetected { uncompressed_size, .. })
+                if uncompressed_size == 4 * 1024 * 1024
+        ));
+    }
 
     #[test]
     fn test_default_limits() {
@@ -647,6 +906,34 @@ mod tests {
         assert_eq!(limits.max_archive_size, 500 * 1024 * 1024);
         assert_eq!(limits.max_nesting_depth, 1024);
         assert_eq!(limits.max_entity_length, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_default_max_pages_is_unlimited() {
+        // A default that rejects real documents would be worse than the risk it
+        // mitigates (issue #1451): the ceiling only applies once a caller opts in.
+        assert_eq!(SecurityLimits::default().max_pages, None);
+    }
+
+    #[test]
+    fn test_too_many_pages_display_names_the_limit() {
+        let error = SecurityError::TooManyPages {
+            count: 4_000,
+            max: 1_000,
+        };
+        let message = error.to_string();
+        assert!(
+            message.contains("4000"),
+            "message must name the observed count: {message}"
+        );
+        assert!(
+            message.contains("1000"),
+            "message must name the configured max: {message}"
+        );
+        assert!(
+            message.contains("max_pages"),
+            "message must name the limit that was hit: {message}"
+        );
     }
 
     #[test]
@@ -763,38 +1050,232 @@ mod tests {
         );
     }
 
+    // `resolve_container_entry` matrix. Each case below is named after the input class
+    // from the path-traversal unification brief so the test file doubles as the
+    // executable version of that comparison table.
+
     #[test]
-    fn test_path_traversal_detected_in_simple_dotdot() {
-        assert!(has_path_traversal("../etc/passwd"));
+    fn parent_relative_target_in_bounds_pops_into_the_root() {
+        // "../x" against a one-level base: the ".." exactly cancels "a", landing on "x"
+        // at the container root. This is the PPTX/DOCX "spec-correct ../media/x.png" shape.
+        assert_eq!(resolve_container_entry("a", "../x"), Ok("x".to_string()));
     }
 
     #[test]
-    fn test_path_traversal_detected_in_middle_of_path() {
-        assert!(has_path_traversal("word/images/../../etc/passwd"));
+    fn parent_relative_target_out_of_bounds_at_the_root_is_rejected() {
+        // Same "../x", but there is no base directory left to pop: this is a real escape.
+        assert_eq!(
+            resolve_container_entry("", "../x"),
+            Err(PathTraversalError::EscapesRoot)
+        );
     }
 
     #[test]
-    fn test_path_traversal_detected_at_end() {
-        assert!(has_path_traversal("word/images/.."));
+    fn double_parent_within_a_single_level_base_escapes() {
+        // "a/../../x": one push, then two pops. The base is empty, so after the local
+        // "a" is popped there is nothing left for the second "..".
+        assert_eq!(
+            resolve_container_entry("", "a/../../x"),
+            Err(PathTraversalError::EscapesRoot)
+        );
     }
 
     #[test]
-    fn test_normal_path_not_flagged() {
-        assert!(!has_path_traversal("word/images/photo.png"));
+    fn double_parent_within_a_two_level_base_is_in_bounds() {
+        // Same shape, but the base has enough depth ("root") to absorb both "a" and the
+        // outer "..": the whole path collapses to a container-root-relative "x".
+        assert_eq!(resolve_container_entry("root", "a/../../x"), Ok("x".to_string()));
     }
 
     #[test]
-    fn test_empty_path_not_flagged() {
-        assert!(!has_path_traversal(""));
+    fn absolute_target_is_root_relative_and_ignores_base() {
+        // A leading "/" means "relative to the container root" (the OPC/EPUB convention),
+        // not the host filesystem -- `base` is completely bypassed.
+        assert_eq!(resolve_container_entry("word", "/abs/x"), Ok("abs/x".to_string()));
     }
 
     #[test]
-    fn test_dotdot_in_filename_not_flagged() {
-        assert!(!has_path_traversal("images/1..2.png"));
+    fn windows_drive_letter_target_is_rejected() {
+        assert_eq!(
+            resolve_container_entry("word", "C:\\x"),
+            Err(PathTraversalError::DriveOrUncPrefix)
+        );
     }
 
     #[test]
-    fn test_absolute_path_without_traversal_not_flagged() {
-        assert!(!has_path_traversal("/usr/local/share/doc.pdf"));
+    fn unc_style_target_is_rejected() {
+        // "\\server\share\x" normalises to "//server/share/x", which is caught by the
+        // same UNC check as a literal "//..." input -- no separate UNC-specific parsing.
+        assert_eq!(
+            resolve_container_entry("word", "\\\\server\\share\\x"),
+            Err(PathTraversalError::DriveOrUncPrefix)
+        );
+    }
+
+    #[test]
+    fn backslash_traversal_is_normalised_the_same_as_forward_slash() {
+        // "a\..\..\x": backslashes are converted to "/" explicitly, so this behaves
+        // identically on every build platform instead of depending on `std::path`'s
+        // target-dependent component parsing (the drift `has_path_traversal` had).
+        assert_eq!(
+            resolve_container_entry("", "a\\..\\..\\x"),
+            Err(PathTraversalError::EscapesRoot)
+        );
+    }
+
+    #[test]
+    fn dot_segments_are_transparent_to_in_bounds_traversal() {
+        // "a/./../x": the "." is a no-op and the ".." cancels "a", leaving "x".
+        assert_eq!(resolve_container_entry("", "a/./../x"), Ok("x".to_string()));
+    }
+
+    #[test]
+    fn four_dots_is_a_literal_component_not_a_traversal_token() {
+        // "....//x": "...." is not the exact string "..", so it is pushed as an ordinary
+        // (if unusual) literal segment. The doubled slash contributes an empty component,
+        // which is dropped.
+        assert_eq!(resolve_container_entry("", "....//x"), Ok("..../x".to_string()));
+    }
+
+    #[test]
+    fn bare_dotdot_against_a_one_level_base_has_no_file_left_to_resolve() {
+        assert_eq!(resolve_container_entry("a", ".."), Err(PathTraversalError::EmptyResult));
+    }
+
+    #[test]
+    fn bare_dotdot_against_the_root_escapes() {
+        assert_eq!(resolve_container_entry("", ".."), Err(PathTraversalError::EscapesRoot));
+    }
+
+    #[test]
+    fn empty_components_are_skipped() {
+        assert_eq!(resolve_container_entry("", "a//b"), Ok("a/b".to_string()));
+    }
+
+    #[test]
+    fn trailing_dotdot_resolves_to_the_base_directory_itself() {
+        // "a/..": pushes "a" onto "root" then immediately pops it back off, landing
+        // exactly on the base -- allowed, even though the result names a directory
+        // rather than a file (the caller's `by_name` lookup will simply miss).
+        assert_eq!(resolve_container_entry("root", "a/.."), Ok("root".to_string()));
+    }
+
+    #[test]
+    fn nul_byte_is_rejected_outright() {
+        assert_eq!(
+            resolve_container_entry("word", "media/\0image1.png"),
+            Err(PathTraversalError::InvalidByte)
+        );
+    }
+
+    #[test]
+    fn percent_encoded_traversal_is_never_decoded_by_this_function() {
+        // "%2e%2e%2f" contains no literal '/' -- it is one opaque literal segment here.
+        // Decoding is the caller's job, and must happen *before* calling this function
+        // (EPUB's `resolve_path` does exactly that); decoding afterwards would let a
+        // decoded "../" slip past a boundary check that already ran.
+        assert_eq!(
+            resolve_container_entry("base", "%2e%2e%2f"),
+            Ok("base/%2e%2e%2f".to_string())
+        );
+    }
+
+    #[test]
+    fn multibyte_character_after_dotdot_is_a_literal_segment_not_a_slice_panic() {
+        // ".." followed by a 4-byte emoji is not the exact string "..", so the whole
+        // thing is pushed as a literal segment. Exact string comparison (rather than the
+        // old PPTX code's fixed-byte-offset slice) can never land mid-character.
+        assert_eq!(
+            resolve_container_entry("base", "..\u{1F600}/x"),
+            Ok("base/..\u{1F600}/x".to_string())
+        );
+    }
+
+    // DOCX-specific cases: `docx.rs` calls this with `base = "word"`. These pin the two
+    // behaviours called out in the unification plan as a deliberate change from the
+    // deleted `has_path_traversal`, which rejected every `..` unconditionally.
+
+    #[test]
+    fn docx_word_relative_target_climbs_to_the_package_root_media_directory() {
+        // The normal shape for a DOCX image whose relationship lives at the package
+        // root's "media/" directory, one level above "word/". `has_path_traversal` used
+        // to reject this outright; it is legitimate and must resolve.
+        assert_eq!(
+            resolve_container_entry("word", "../media/image1.png"),
+            Ok("media/image1.png".to_string())
+        );
+    }
+
+    #[test]
+    fn docx_word_relative_target_that_truly_escapes_the_package_still_errors() {
+        assert_eq!(
+            resolve_container_entry("word", "../../../etc/passwd"),
+            Err(PathTraversalError::EscapesRoot)
+        );
+    }
+
+    #[test]
+    fn docx_absolute_target_reroots_to_the_package_relative_name() {
+        // `has_path_traversal` allowed this (asserted deliberately at what was
+        // `security.rs:891`) and DOCX then re-rooted it by hand with `strip_prefix('/')`.
+        // The shared helper folds that re-rooting into the same call.
+        assert_eq!(
+            resolve_container_entry("word", "/media/image1.png"),
+            Ok("media/image1.png".to_string())
+        );
+    }
+
+    /// Bytes that deflate to about their own size, like a photograph.
+    #[cfg(feature = "office")]
+    fn incompressible(len: usize) -> Vec<u8> {
+        let mut state = 0x9E37_79B9u32;
+        (0..len)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (state >> 24) as u8
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "office")]
+    fn deflated_archive(members: &[(&str, Vec<u8>)]) -> zip::ZipArchive<std::io::Cursor<Vec<u8>>> {
+        use std::io::Write;
+        let mut cursor = std::io::Cursor::new(Vec::new());
+        {
+            let mut writer = zip::ZipWriter::new(&mut cursor);
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+            for (name, bytes) in members {
+                writer.start_file(*name, options).expect("start_file");
+                writer.write_all(bytes).expect("write");
+            }
+            writer.finish().expect("finish");
+        }
+        cursor.set_position(0);
+        zip::ZipArchive::new(cursor).expect("archive")
+    }
+
+    #[cfg(feature = "office")]
+    #[test]
+    fn zip_bomb_ratio_cap_ignores_small_members_and_keeps_large_ones() {
+        let validator = ZipBombValidator::new(SecurityLimits::default());
+
+        // A blank-page image that deflates past 100:1 next to a real photograph:
+        // the whole-archive ratio stays near 1:1, so only the per-member cap decides.
+        let mut small = deflated_archive(&[
+            ("blank.jpg", vec![b'A'; 200 * 1024]),
+            ("photo.jpg", incompressible(2 * 1024 * 1024)),
+        ]);
+        validator
+            .validate(&mut small)
+            .expect("a 200 KiB member past the ratio cap is not a bomb");
+
+        let mut large = deflated_archive(&[
+            ("bomb.bin", vec![b'A'; 8 * 1024 * 1024]),
+            ("photo.jpg", incompressible(2 * 1024 * 1024)),
+        ]);
+        let error = validator
+            .validate(&mut large)
+            .expect_err("an 8 MiB member past the ratio cap is rejected");
+        assert!(matches!(error, SecurityError::ZipBombDetected { .. }), "{error}");
     }
 }

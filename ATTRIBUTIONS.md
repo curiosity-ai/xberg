@@ -360,56 +360,107 @@ extraction via `nom-exif` is pure Rust and works on every target.
 
 ---
 
-## ttf-parser
+## pdfium-render
 
-A safe, zero-allocation TrueType / OpenType / AAT font parser. xberg consumes it
-as the published `xberg-ttf-parser` crate, a fork of upstream carrying fixes
-that have not yet been released upstream:
+High-level idiomatic Rust wrapper around Pdfium, forked and vendored for xberg:
 
-- **Source**: <https://github.com/harfbuzz/ttf-parser>
-- **License**: MIT OR Apache-2.0 upstream; the fork takes the MIT option and is
-  redistributed under MIT, retaining the upstream copyright notice.
-- **Author(s)**: Yevhenii Reizner, Khaled Hosny, Laurenz Stampfl, Caleb
-  Maclennan and contributors
-- **Version**: `xberg-ttf-parser` 1.1.0, which is upstream 0.25.1 plus nine
-  upstream pull requests carried on top: `#203` (`b422ac0`), `#207` (`52a9811`),
-  `#216` (`9b9e55f`), `#222` (`3a585f1`), `#223` (`32439d2`), `#224` (`dd2337b`),
-  `#225` (`99aa5e3`), `#226` (`86daf57`) and `#228` (`023f8163`).
-- **Location**: consumed from crates.io — <https://crates.io/crates/xberg-ttf-parser>.
-  Only `crates/ttf-parser-compat/` lives in this repo; see below.
-- **Purpose**: Parse embedded font programs when rendering PDF pages. No
-  first-party xberg code calls it. It reaches xberg transitively through
-  `pdf_oxide` and `fontdb`, the only two consumers in `Cargo.lock`.
+- **Source**: <https://github.com/ajrcarey/pdfium-render>
+- **License**: MIT OR Apache-2.0 upstream; the fork takes the MIT option and is redistributed
+  under MIT, retaining the upstream copyright notice below.
+- **Author**: Alastair Carey (<alastair@alastaircarey.com>), Copyright (c) 2022-2026
+- **Forked Version**: 0.8.x-era, with bindings generated against pdfium 7678 (`src/bindings/version.rs`,
+  `src/bindgen/pdfium_7678.rs`); the runtime binary pin used by `scripts/download_pdfium_runtime.sh`
+  and `.task/languages/rust.yml` is a newer, verified-compatible 7881
+- **Location**: `crates/xberg-pdfium-render/`
+- **Purpose**: PDF structure-tree and content-mark access, text extraction and rendering via
+  Google's Pdfium library
 
-### Why a fork is still in the dependency graph
+### Modifications
 
-Upstream v0.25.1 rejects any CFF charstring containing the deprecated
-`dotsection` operator, dropping the affected glyphs entirely (`i`, `j`, `!`,
-`.`), so PDF pages using Type 1 derived CFF fonts silently lose those
-characters. The fix (upstream `#228`) is merged upstream but **unreleased** —
-crates.io still shows 0.25.1 as the newest `ttf-parser`. Until upstream cuts a
-0.25.2, the fork is the only way to get the fix into `pdf_oxide` and `fontdb`,
-neither of which xberg can edit.
-
-### The compat shim
-
-`crates/ttf-parser-compat/` is an xberg addition, not upstream code: a package
-literally named `ttf-parser` whose entire body is `pub use xberg_ttf_parser::*`.
-Cargo matches `[patch.crates-io]` entries on package name alone and refuses to
-patch across a rename or onto another crates.io package, so this shim is the
-only mechanism that can redirect the transitive consumers onto the fixed parser.
-It is never published. `crates/ttf-parser-compat/tests/patch_engaged.rs` fails
-loudly if the redirect ever stops taking effect, which is otherwise silent.
-
-When upstream releases a 0.25.2 carrying the nine fixes, the shim and the
-`[patch.crates-io]` entry can both be deleted and this section removed. A 0.26
-would not satisfy the `^0.25` requirement either consumer declares, so the
-release number matters.
+- Updated to Rust 2024 edition and workspace conventions
+- Added musl static linking support in `build.rs`
+- Removed examples and test data (kept in the upstream repo)
+- **Added** struct-tree and content-mark wrappers (~1,036 lines across `struct_element.rs`,
+  `struct_tree.rs`, `content_mark.rs`, `content_marks.rs`) that upstream does not provide —
+  upstream's `PdfPageStructureTree` exposes no public constructor and has no `PdfStructElement`
+  type at all
 
 ### License Compatibility
 
-MIT and Apache-2.0 are both permissive and already on the `deny.toml` allow
-list. The published crate carries upstream's license text verbatim.
+The upstream MIT OR Apache-2.0 dual license permits redistribution under MIT alone. The upstream
+author and copyright are recorded in this file, which is distributed with the source.
+
+---
+
+## PDFOxide
+
+Pure-Rust PDF parsing, extraction and rendering — xberg's default PDF engine, forked and vendored:
+
+- **Source**: <https://github.com/yfedoseev/pdf_oxide>
+- **License**: MIT OR Apache-2.0 upstream; this fork elects the MIT arm and is redistributed
+  under MIT, retaining the upstream copyright notice below.
+- **Author**: Yury Fedoseev, Copyright (c) 2025-present
+- **Forked Version**: forked pre-1.0, published independently as `xberg-pdf-oxide` 1.0.1 on
+  crates.io, then vendored here from that repository's `development` branch at commit
+  `196ec71a1cfd6e818e1498053584ff93c794bde1`. No git history was carried across, so that SHA
+  is the provenance link; the source repository has since been retired.
+- **Location**: `crates/xberg-native-pdf/` (crate `xberg-native-pdf`, lib `xberg_native_pdf`)
+- **Purpose**: text extraction, reading order, tables, forms, annotations, XFA, encryption and
+  page rendering — everything behind `PdfBackend::Native`
+
+### Modifications
+
+- Renamed to `xberg-native-pdf` on vendoring. Upstream's trademark policy permits describing
+  this crate as a fork of PDFOxide but not using upstream's names as the name of a
+  distribution, so the rename is a compliance improvement as well as a naming one. This file,
+  `crates/xberg-native-pdf/ATTRIBUTIONS.md`, and `crates/xberg-native-pdf/CHANGELOG.md` are the
+  places that document the upstream project by design. Beyond those, the identifier
+  `pdf_oxide` (or a variant spelling) survives, deliberately, in a small number of live,
+  commented, load-bearing spots — confirm with `grep -rlniE 'pdf[_-]?oxide' crates/`:
+  - `crates/xberg/src/core/config/pdf.rs` (`PdfBackend`'s rejection test): the old spelling
+    must appear verbatim so the test can assert it is rejected, not silently aliased.
+  - `crates/xberg-native-pdf/src/document.rs` (a `/Producer` allowlist entry): matches PDFs
+    already written by the `pdf_oxide`/`xberg-pdf-oxide` lineages, which are still arriving in
+    the wild, so recognizing them as trusted authoring tools is intentional.
+  - `crates/xberg-native-pdf/src/decoders/flate.rs` (an environment-variable
+    back-compatibility chain): `PDF_OXIDE_MAX_DECOMPRESS_MB` and
+    `XBERG_PDF_OXIDE_MAX_DECOMPRESS_MB` keep older deployments' env vars working.
+  - `crates/xberg-native-pdf/tests/test_signed_pdf_opens_and_renders.rs`: a verbatim quotation
+    of a third-party signing tool's own error message (`PdfOxide.Exceptions.SignatureException`),
+    not a reference to this codebase.
+
+  The same grep also turns up `crates/xberg-php/` and `crates/xberg-node/` (alef-generated
+  binding sources) and every `docs-site/src/content/docs/reference/api-*.md` /
+  `cli.md`/`configuration.md`/`types.md` page: these are mechanically generated from the Rust
+  doc comments above and were stale (pre-dating the `xberg-native-pdf` rename in the comments
+  they mirror) at the time of writing; they carry no independent attribution and refresh on the
+  next `alef generate`, not by hand-editing. Historical entries in the root `CHANGELOG.md` (and
+  its `docs-site/src/content/docs/changelog.md` mirror) also name `pdf_oxide`/`xberg-pdf-oxide`;
+  those describe releases from when the crate really was named that, and changelogs are an
+  append-only historical record, so they are left as written rather than retroactively edited.
+- Stripped upstream's language bindings, CLI, MCP server, and its OCR, ML, digital-signature,
+  WASM, barcode, HTML/CSS-to-PDF and PDF/A subsystems
+- Replaced `ttf-parser` with the fontations/`skrifa` stack
+- Migrated diagnostics from the `log` facade to `tracing`; the target root is exported as
+  `xberg_native_pdf::LOG_TARGET_ROOT` so consumers filter on a value rather than a literal
+- Rust 2024 edition and workspace conventions
+- Per-release detail in `crates/xberg-native-pdf/CHANGELOG.md`
+
+### Vendored and bundled third-party code
+
+`crates/xberg-native-pdf/ATTRIBUTIONS.md` is the authoritative record and ships with the crate.
+It covers `src/vendor/fontdb/` (derived from fontdb 0.24.0, Yevhenii Reizner, MIT) and the fonts
+embedded via `include_bytes!` under `src/fonts/assets/`: DejaVuSans and DejaVuSans-Bold
+(Bitstream Vera / DejaVu licence), DroidSansFallbackFull.ttf (Apache-2.0) and
+NotoEmoji-Regular.ttf (SIL OFL 1.1), the latter two behind the `cjk-form-fonts` feature. The
+DejaVu licence requires renaming modified fonts; these are unmodified and must stay so.
+
+### License Compatibility
+
+Electing the MIT arm of an MIT-OR-Apache-2.0 dual offer is permitted by both licences. The
+upstream copyright notice is preserved verbatim at `crates/xberg-native-pdf/LICENSE`, which is
+distributed with the source. No endorsement by or affiliation with the upstream project is
+implied.
 
 ---
 

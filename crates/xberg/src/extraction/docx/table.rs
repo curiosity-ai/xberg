@@ -210,38 +210,38 @@ pub(crate) fn parse_table_properties(
                 budget.enter()?;
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"tblStyle" => {
-                        props.style_id = get_attribute(&e, b"val");
+                    "tblStyle" => {
+                        props.style_id = get_attribute(&e, "val");
                     }
-                    b"tblW" => {
+                    "tblW" => {
                         props.width = parse_width_element(&e);
                     }
-                    b"jc" => {
-                        props.alignment = get_attribute(&e, b"val");
+                    "jc" => {
+                        props.alignment = get_attribute(&e, "val");
                     }
-                    b"tblLayout" => {
-                        props.layout = get_attribute(&e, b"type");
+                    "tblLayout" => {
+                        props.layout = get_attribute(&e, "type");
                     }
-                    b"tblLook" => {
+                    "tblLook" => {
                         props.look = Some(parse_table_look(&e));
                     }
-                    b"tblBorders" => {
+                    "tblBorders" => {
                         props.borders = Some(parse_table_borders(reader));
                         // `parse_table_borders` reads through its own `</w:tblBorders>`
                         // without touching `budget`; refund the enter above or every
                         // `tblBorders` child leaks one depth level.
                         budget.leave();
                     }
-                    b"tblCellMar" => {
+                    "tblCellMar" => {
                         props.cell_margins = Some(parse_cell_margins_element(reader));
                         // Same as `tblBorders`: consumes its own end tag.
                         budget.leave();
                     }
-                    b"tblInd" => {
+                    "tblInd" => {
                         props.indent = parse_width_element(&e);
                     }
-                    b"tblCaption" => {
-                        props.caption = get_attribute(&e, b"val");
+                    "tblCaption" => {
+                        props.caption = get_attribute(&e, "val");
                     }
                     _ => {}
                 }
@@ -250,31 +250,31 @@ pub(crate) fn parse_table_properties(
             Ok(Event::Empty(e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"tblStyle" => {
-                        props.style_id = get_attribute(&e, b"val");
+                    "tblStyle" => {
+                        props.style_id = get_attribute(&e, "val");
                     }
-                    b"tblW" => {
+                    "tblW" => {
                         props.width = parse_width_element(&e);
                     }
-                    b"jc" => {
-                        props.alignment = get_attribute(&e, b"val");
+                    "jc" => {
+                        props.alignment = get_attribute(&e, "val");
                     }
-                    b"tblLayout" => {
-                        props.layout = get_attribute(&e, b"type");
+                    "tblLayout" => {
+                        props.layout = get_attribute(&e, "type");
                     }
-                    b"tblLook" => {
+                    "tblLook" => {
                         props.look = Some(parse_table_look(&e));
                     }
-                    b"tblInd" => {
+                    "tblInd" => {
                         props.indent = parse_width_element(&e);
                     }
-                    b"tblCaption" => {
-                        props.caption = get_attribute(&e, b"val");
+                    "tblCaption" => {
+                        props.caption = get_attribute(&e, "val");
                     }
-                    b"tblBorders" => {
+                    "tblBorders" => {
                         props.borders = Some(TableBorders::default());
                     }
-                    b"tblCellMar" => {
+                    "tblCellMar" => {
                         props.cell_margins = Some(CellMargins::default());
                     }
                     _ => {}
@@ -283,7 +283,7 @@ pub(crate) fn parse_table_properties(
             }
             Ok(Event::End(e)) => {
                 budget.leave();
-                if e.local_name().as_ref() as &[u8] == b"tblPr" {
+                if e.local_name().as_ref() == "tblPr" {
                     break;
                 }
                 buf.clear();
@@ -318,14 +318,14 @@ pub(crate) fn parse_row_properties(
                 budget.enter()?;
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"trHeight" => {
-                        props.height = get_attribute_int(&e, b"val");
-                        props.height_rule = get_attribute(&e, b"hRule");
+                    "trHeight" => {
+                        props.height = get_attribute_int(&e, "val");
+                        props.height_rule = get_attribute(&e, "hRule");
                     }
-                    b"tblHeader" => {
+                    "tblHeader" => {
                         props.is_header = is_toggle_on(&e);
                     }
-                    b"cantSplit" => {
+                    "cantSplit" => {
                         props.cant_split = is_toggle_on(&e);
                     }
                     _ => {}
@@ -335,14 +335,14 @@ pub(crate) fn parse_row_properties(
             Ok(Event::Empty(e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"trHeight" => {
-                        props.height = get_attribute_int(&e, b"val");
-                        props.height_rule = get_attribute(&e, b"hRule");
+                    "trHeight" => {
+                        props.height = get_attribute_int(&e, "val");
+                        props.height_rule = get_attribute(&e, "hRule");
                     }
-                    b"tblHeader" => {
+                    "tblHeader" => {
                         props.is_header = is_toggle_on(&e);
                     }
-                    b"cantSplit" => {
+                    "cantSplit" => {
                         props.cant_split = is_toggle_on(&e);
                     }
                     _ => {}
@@ -351,7 +351,7 @@ pub(crate) fn parse_row_properties(
             }
             Ok(Event::End(e)) => {
                 budget.leave();
-                if e.local_name().as_ref() as &[u8] == b"trPr" {
+                if e.local_name().as_ref() == "trPr" {
                     break;
                 }
                 buf.clear();
@@ -364,6 +364,28 @@ pub(crate) fn parse_row_properties(
     }
 
     Ok(props)
+}
+
+/// Maximum plausible `w:gridSpan` value for a single table cell.
+///
+/// Word's UI caps a table at 63 columns; this ceiling is set well above that (1,024) so
+/// wide, tooling-generated tables (spreadsheet exports and similar) still round-trip,
+/// while a value that could not correspond to any real document is rejected. Every unit
+/// of `gridSpan` becomes one cloned copy of the cell's text at each of the four
+/// consumption sites (`extractors/docx.rs` x2, `extraction/docx/parser.rs` x2), so an
+/// unclamped `w:val="4294967295"` would attempt roughly 4 billion `String` clones.
+const MAX_CELL_GRID_SPAN: u32 = 1024;
+
+/// Reject a `w:gridSpan` value outside the plausible `1..=MAX_CELL_GRID_SPAN` range.
+///
+/// Rather than silently truncating a corrupt value down into range (which would
+/// fabricate a plausible-looking but wrong column count), an out-of-range span is
+/// dropped back to `None`, so the cell falls back to its unspanned default of 1 column
+/// (`unwrap_or(1)` at every consumption site). This mirrors `parse_width_element`'s
+/// existing convention for this module: an unparseable/invalid property value degrades
+/// to "not specified" rather than erroring the whole document.
+fn validate_grid_span(span: Option<u32>) -> Option<u32> {
+    span.filter(|&value| (1..=MAX_CELL_GRID_SPAN).contains(&value))
 }
 
 /// Parse cell-level properties from streaming XML reader.
@@ -387,37 +409,37 @@ pub(crate) fn parse_cell_properties(
                 budget.enter()?;
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"tcW" => {
+                    "tcW" => {
                         props.width = parse_width_element(&e);
                     }
-                    b"gridSpan" => {
-                        props.grid_span = get_attribute_u32(&e, b"val");
+                    "gridSpan" => {
+                        props.grid_span = validate_grid_span(get_attribute_u32(&e, "val"));
                     }
-                    b"vMerge" => {
+                    "vMerge" => {
                         props.v_merge = Some(parse_vmerge(&e));
                     }
-                    b"tcBorders" => {
+                    "tcBorders" => {
                         props.borders = Some(parse_cell_borders(reader));
                         // `parse_cell_borders` reads through its own `</w:tcBorders>`
                         // without touching `budget`; refund the enter above.
                         budget.leave();
                     }
-                    b"shd" => {
+                    "shd" => {
                         props.shading = Some(parse_cell_shading(&e));
                     }
-                    b"tcMar" => {
+                    "tcMar" => {
                         props.margins = Some(parse_cell_margins_element(reader));
                         // `parse_cell_margins_element` reads through its own
                         // `</w:tcMar>` without touching `budget`; refund the enter above.
                         budget.leave();
                     }
-                    b"vAlign" => {
-                        props.vertical_align = get_attribute(&e, b"val");
+                    "vAlign" => {
+                        props.vertical_align = get_attribute(&e, "val");
                     }
-                    b"textDirection" => {
-                        props.text_direction = get_attribute(&e, b"val");
+                    "textDirection" => {
+                        props.text_direction = get_attribute(&e, "val");
                     }
-                    b"noWrap" => {
+                    "noWrap" => {
                         props.no_wrap = is_toggle_on(&e);
                     }
                     _ => {}
@@ -427,31 +449,31 @@ pub(crate) fn parse_cell_properties(
             Ok(Event::Empty(e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"tcW" => {
+                    "tcW" => {
                         props.width = parse_width_element(&e);
                     }
-                    b"gridSpan" => {
-                        props.grid_span = get_attribute_u32(&e, b"val");
+                    "gridSpan" => {
+                        props.grid_span = validate_grid_span(get_attribute_u32(&e, "val"));
                     }
-                    b"vMerge" => {
+                    "vMerge" => {
                         props.v_merge = Some(parse_vmerge(&e));
                     }
-                    b"shd" => {
+                    "shd" => {
                         props.shading = Some(parse_cell_shading(&e));
                     }
-                    b"vAlign" => {
-                        props.vertical_align = get_attribute(&e, b"val");
+                    "vAlign" => {
+                        props.vertical_align = get_attribute(&e, "val");
                     }
-                    b"textDirection" => {
-                        props.text_direction = get_attribute(&e, b"val");
+                    "textDirection" => {
+                        props.text_direction = get_attribute(&e, "val");
                     }
-                    b"noWrap" => {
+                    "noWrap" => {
                         props.no_wrap = is_toggle_on(&e);
                     }
-                    b"tcBorders" => {
+                    "tcBorders" => {
                         props.borders = Some(CellBorders::default());
                     }
-                    b"tcMar" => {
+                    "tcMar" => {
                         props.margins = Some(CellMargins::default());
                     }
                     _ => {}
@@ -460,7 +482,7 @@ pub(crate) fn parse_cell_properties(
             }
             Ok(Event::End(e)) => {
                 budget.leave();
-                if e.local_name().as_ref() as &[u8] == b"tcPr" {
+                if e.local_name().as_ref() == "tcPr" {
                     break;
                 }
                 buf.clear();
@@ -493,16 +515,16 @@ pub(crate) fn parse_table_grid(
         match reader.read_event_into(&mut buf) {
             Ok(Event::Start(e)) => {
                 budget.enter()?;
-                if e.local_name().as_ref() as &[u8] == b"gridCol"
-                    && let Some(width) = get_attribute_int(&e, b"w")
+                if e.local_name().as_ref() == "gridCol"
+                    && let Some(width) = get_attribute_int(&e, "w")
                 {
                     grid.columns.push(width);
                 }
                 buf.clear();
             }
             Ok(Event::Empty(e)) => {
-                if e.local_name().as_ref() as &[u8] == b"gridCol"
-                    && let Some(width) = get_attribute_int(&e, b"w")
+                if e.local_name().as_ref() == "gridCol"
+                    && let Some(width) = get_attribute_int(&e, "w")
                 {
                     grid.columns.push(width);
                 }
@@ -510,7 +532,7 @@ pub(crate) fn parse_table_grid(
             }
             Ok(Event::End(e)) => {
                 budget.leave();
-                if e.local_name().as_ref() as &[u8] == b"tblGrid" {
+                if e.local_name().as_ref() == "tblGrid" {
                     break;
                 }
                 buf.clear();
@@ -530,7 +552,7 @@ pub(crate) fn parse_table_grid(
 /// `<w:foo w:val="true"/>` (on), `<w:foo w:val="false"/>` (off).
 fn is_toggle_on(e: &BytesStart) -> bool {
     !matches!(
-        get_attribute(e, b"val").as_deref(),
+        get_attribute(e, "val").as_deref(),
         Some("0") | Some("false") | Some("off")
     )
 }
@@ -538,18 +560,18 @@ fn is_toggle_on(e: &BytesStart) -> bool {
 /// Helper: Parse border element from attributes.
 fn parse_border_element(e: &BytesStart) -> BorderStyle {
     BorderStyle {
-        style: get_attribute(e, b"val").unwrap_or_default(),
-        size: get_attribute_int(e, b"sz"),
-        color: get_attribute(e, b"color"),
-        space: get_attribute_int(e, b"space"),
+        style: get_attribute(e, "val").unwrap_or_default(),
+        size: get_attribute_int(e, "sz"),
+        color: get_attribute(e, "color"),
+        space: get_attribute_int(e, "space"),
     }
 }
 
 /// Helper: Parse width element from attributes.
 fn parse_width_element(e: &BytesStart) -> Option<TableWidth> {
-    get_attribute_int(e, b"w").map(|value| TableWidth {
+    get_attribute_int(e, "w").map(|value| TableWidth {
         value,
-        width_type: get_attribute(e, b"type").unwrap_or_default(),
+        width_type: get_attribute(e, "type").unwrap_or_default(),
     })
 }
 
@@ -558,21 +580,21 @@ fn parse_width_element(e: &BytesStart) -> Option<TableWidth> {
 fn parse_table_look(e: &BytesStart) -> TableLook {
     let mut look = TableLook::default();
 
-    let has_individual = get_attribute(e, b"firstRow").is_some()
-        || get_attribute(e, b"lastRow").is_some()
-        || get_attribute(e, b"firstColumn").is_some()
-        || get_attribute(e, b"lastColumn").is_some()
-        || get_attribute(e, b"noHBand").is_some()
-        || get_attribute(e, b"noVBand").is_some();
+    let has_individual = get_attribute(e, "firstRow").is_some()
+        || get_attribute(e, "lastRow").is_some()
+        || get_attribute(e, "firstColumn").is_some()
+        || get_attribute(e, "lastColumn").is_some()
+        || get_attribute(e, "noHBand").is_some()
+        || get_attribute(e, "noVBand").is_some();
 
     if has_individual {
-        look.first_row = get_attribute(e, b"firstRow").as_deref() == Some("1");
-        look.last_row = get_attribute(e, b"lastRow").as_deref() == Some("1");
-        look.first_column = get_attribute(e, b"firstColumn").as_deref() == Some("1");
-        look.last_column = get_attribute(e, b"lastColumn").as_deref() == Some("1");
-        look.no_h_band = get_attribute(e, b"noHBand").as_deref() == Some("1");
-        look.no_v_band = get_attribute(e, b"noVBand").as_deref() == Some("1");
-    } else if let Some(val_str) = get_attribute(e, b"val")
+        look.first_row = get_attribute(e, "firstRow").as_deref() == Some("1");
+        look.last_row = get_attribute(e, "lastRow").as_deref() == Some("1");
+        look.first_column = get_attribute(e, "firstColumn").as_deref() == Some("1");
+        look.last_column = get_attribute(e, "lastColumn").as_deref() == Some("1");
+        look.no_h_band = get_attribute(e, "noHBand").as_deref() == Some("1");
+        look.no_v_band = get_attribute(e, "noVBand").as_deref() == Some("1");
+    } else if let Some(val_str) = get_attribute(e, "val")
         && let Ok(mask) = i32::from_str_radix(&val_str, 16)
     {
         look.first_row = (mask & 0x0020) != 0;
@@ -588,7 +610,7 @@ fn parse_table_look(e: &BytesStart) -> TableLook {
 
 /// Helper: Parse vertical merge state.
 fn parse_vmerge(e: &BytesStart) -> VerticalMerge {
-    match get_attribute(e, b"val") {
+    match get_attribute(e, "val") {
         Some(val) if val == "restart" => VerticalMerge::Restart,
         _ => VerticalMerge::Continue,
     }
@@ -597,9 +619,9 @@ fn parse_vmerge(e: &BytesStart) -> VerticalMerge {
 /// Helper: Parse cell shading from attributes.
 fn parse_cell_shading(e: &BytesStart) -> CellShading {
     CellShading {
-        fill: get_attribute(e, b"fill"),
-        color: get_attribute(e, b"color"),
-        val: get_attribute(e, b"val"),
+        fill: get_attribute(e, "fill"),
+        color: get_attribute(e, "color"),
+        val: get_attribute(e, "val"),
     }
 }
 
@@ -613,22 +635,22 @@ fn parse_table_borders(reader: &mut Reader<&[u8]>) -> TableBorders {
             Ok(Event::Start(e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"top" => {
+                    "top" => {
                         borders.top = Some(parse_border_element(&e));
                     }
-                    b"bottom" => {
+                    "bottom" => {
                         borders.bottom = Some(parse_border_element(&e));
                     }
-                    b"left" | b"start" => {
+                    "left" | "start" => {
                         borders.left = Some(parse_border_element(&e));
                     }
-                    b"right" | b"end" => {
+                    "right" | "end" => {
                         borders.right = Some(parse_border_element(&e));
                     }
-                    b"insideH" => {
+                    "insideH" => {
                         borders.inside_h = Some(parse_border_element(&e));
                     }
-                    b"insideV" => {
+                    "insideV" => {
                         borders.inside_v = Some(parse_border_element(&e));
                     }
                     _ => {}
@@ -638,22 +660,22 @@ fn parse_table_borders(reader: &mut Reader<&[u8]>) -> TableBorders {
             Ok(Event::Empty(e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"top" => {
+                    "top" => {
                         borders.top = Some(parse_border_element(&e));
                     }
-                    b"bottom" => {
+                    "bottom" => {
                         borders.bottom = Some(parse_border_element(&e));
                     }
-                    b"left" | b"start" => {
+                    "left" | "start" => {
                         borders.left = Some(parse_border_element(&e));
                     }
-                    b"right" | b"end" => {
+                    "right" | "end" => {
                         borders.right = Some(parse_border_element(&e));
                     }
-                    b"insideH" => {
+                    "insideH" => {
                         borders.inside_h = Some(parse_border_element(&e));
                     }
-                    b"insideV" => {
+                    "insideV" => {
                         borders.inside_v = Some(parse_border_element(&e));
                     }
                     _ => {}
@@ -661,7 +683,7 @@ fn parse_table_borders(reader: &mut Reader<&[u8]>) -> TableBorders {
                 buf.clear();
             }
             Ok(Event::End(e)) => {
-                if e.local_name().as_ref() as &[u8] == b"tblBorders" {
+                if e.local_name().as_ref() == "tblBorders" {
                     break;
                 }
                 buf.clear();
@@ -686,16 +708,16 @@ fn parse_cell_borders(reader: &mut Reader<&[u8]>) -> CellBorders {
             Ok(Event::Start(e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"top" => {
+                    "top" => {
                         borders.top = Some(parse_border_element(&e));
                     }
-                    b"bottom" => {
+                    "bottom" => {
                         borders.bottom = Some(parse_border_element(&e));
                     }
-                    b"left" | b"start" => {
+                    "left" | "start" => {
                         borders.left = Some(parse_border_element(&e));
                     }
-                    b"right" | b"end" => {
+                    "right" | "end" => {
                         borders.right = Some(parse_border_element(&e));
                     }
                     _ => {}
@@ -705,16 +727,16 @@ fn parse_cell_borders(reader: &mut Reader<&[u8]>) -> CellBorders {
             Ok(Event::Empty(e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"top" => {
+                    "top" => {
                         borders.top = Some(parse_border_element(&e));
                     }
-                    b"bottom" => {
+                    "bottom" => {
                         borders.bottom = Some(parse_border_element(&e));
                     }
-                    b"left" | b"start" => {
+                    "left" | "start" => {
                         borders.left = Some(parse_border_element(&e));
                     }
-                    b"right" | b"end" => {
+                    "right" | "end" => {
                         borders.right = Some(parse_border_element(&e));
                     }
                     _ => {}
@@ -722,7 +744,7 @@ fn parse_cell_borders(reader: &mut Reader<&[u8]>) -> CellBorders {
                 buf.clear();
             }
             Ok(Event::End(e)) => {
-                if e.local_name().as_ref() as &[u8] == b"tcBorders" {
+                if e.local_name().as_ref() == "tcBorders" {
                     break;
                 }
                 buf.clear();
@@ -747,17 +769,17 @@ fn parse_cell_margins_element(reader: &mut Reader<&[u8]>) -> CellMargins {
             Ok(Event::Start(e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"top" => {
-                        margins.top = get_attribute_int(&e, b"w");
+                    "top" => {
+                        margins.top = get_attribute_int(&e, "w");
                     }
-                    b"bottom" => {
-                        margins.bottom = get_attribute_int(&e, b"w");
+                    "bottom" => {
+                        margins.bottom = get_attribute_int(&e, "w");
                     }
-                    b"left" | b"start" => {
-                        margins.left = get_attribute_int(&e, b"w");
+                    "left" | "start" => {
+                        margins.left = get_attribute_int(&e, "w");
                     }
-                    b"right" | b"end" => {
-                        margins.right = get_attribute_int(&e, b"w");
+                    "right" | "end" => {
+                        margins.right = get_attribute_int(&e, "w");
                     }
                     _ => {}
                 }
@@ -766,24 +788,24 @@ fn parse_cell_margins_element(reader: &mut Reader<&[u8]>) -> CellMargins {
             Ok(Event::Empty(e)) => {
                 let local_name = e.local_name();
                 match local_name.as_ref() {
-                    b"top" => {
-                        margins.top = get_attribute_int(&e, b"w");
+                    "top" => {
+                        margins.top = get_attribute_int(&e, "w");
                     }
-                    b"bottom" => {
-                        margins.bottom = get_attribute_int(&e, b"w");
+                    "bottom" => {
+                        margins.bottom = get_attribute_int(&e, "w");
                     }
-                    b"left" | b"start" => {
-                        margins.left = get_attribute_int(&e, b"w");
+                    "left" | "start" => {
+                        margins.left = get_attribute_int(&e, "w");
                     }
-                    b"right" | b"end" => {
-                        margins.right = get_attribute_int(&e, b"w");
+                    "right" | "end" => {
+                        margins.right = get_attribute_int(&e, "w");
                     }
                     _ => {}
                 }
                 buf.clear();
             }
             Ok(Event::End(e)) => {
-                if e.local_name().as_ref() as &[u8] == b"tblCellMar" || e.local_name().as_ref() as &[u8] == b"tcMar" {
+                if e.local_name().as_ref() == "tblCellMar" || e.local_name().as_ref() == "tcMar" {
                     break;
                 }
                 buf.clear();
@@ -800,23 +822,23 @@ fn parse_cell_margins_element(reader: &mut Reader<&[u8]>) -> CellMargins {
 
 /// Helper: Extract string attribute value.
 /// Uses local_name() to handle namespace-prefixed attributes (e.g., `w:val` matches `val`).
-fn get_attribute(e: &BytesStart, key: &[u8]) -> Option<String> {
+fn get_attribute(e: &BytesStart, key: &str) -> Option<String> {
     e.attributes()
         .flatten()
-        .find(|attr| attr.key.local_name().as_ref() as &[u8] == key)
+        .find(|attr| attr.key.local_name().as_ref() == key)
         .and_then(|attr| {
-            let raw = std::str::from_utf8(&attr.value).ok()?;
+            let raw = attr.value.as_ref();
             quick_xml::escape::unescape(raw).ok().map(|s| s.into_owned())
         })
 }
 
 /// Helper: Extract and parse integer attribute value.
-fn get_attribute_int(e: &BytesStart, key: &[u8]) -> Option<i32> {
+fn get_attribute_int(e: &BytesStart, key: &str) -> Option<i32> {
     get_attribute(e, key).and_then(|s| s.parse().ok())
 }
 
 /// Helper: Extract and parse unsigned integer attribute value.
-fn get_attribute_u32(e: &BytesStart, key: &[u8]) -> Option<u32> {
+fn get_attribute_u32(e: &BytesStart, key: &str) -> Option<u32> {
     get_attribute(e, key).and_then(|s| s.parse().ok())
 }
 

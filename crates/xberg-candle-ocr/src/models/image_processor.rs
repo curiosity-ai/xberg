@@ -32,6 +32,21 @@ impl Default for ImageProcessor {
     }
 }
 
+/// Decode `image_bytes` and return its `(width, height)` in pixels.
+///
+/// Callers that expect a specific input granularity (e.g. TrOCR expects a single
+/// cropped text line, not a full page) can use this to inspect the raw raster shape
+/// *before* it gets force-resized to a fixed square by [`ImageProcessor::process`],
+/// which silently discards the original aspect ratio and would otherwise hide a
+/// granularity mismatch behind a successful-looking (but fabricated) decode.
+pub fn dimensions(image_bytes: &[u8]) -> Result<(u32, u32)> {
+    if image_bytes.is_empty() {
+        return Err(CandleOcrError::UnsupportedConfig("empty image data".to_string()));
+    }
+    let img = image::load_from_memory(image_bytes)?;
+    Ok((img.width(), img.height()))
+}
+
 impl ImageProcessor {
     /// Decode `image_bytes`, resize, normalize, return `[1, 3, H, W]` float32 on `device`.
     pub fn process(&self, image_bytes: &[u8], device: &Device) -> Result<Tensor> {

@@ -52,12 +52,32 @@ pub(crate) fn render_djot(doc: &InternalDocument) -> String {
                 let list_depth = state.list_depth();
                 let indent = "  ".repeat(list_depth.saturating_sub(1));
                 let text = render_djot_annotated(&elem.text, &elem.annotations);
+                let source_label = elem.list_item_source_label().filter(|label| !label.is_empty());
                 let mut block = String::with_capacity(indent.len() + text.len() + 8);
                 block.push_str(&indent);
+                // A literal source marker (e.g. "B.", "(a)") cannot be expressed by Djot's
+                // auto-incrementing decimal marker syntax either, so it falls back to a
+                // bullet with the label written out as visible text, same trade-off as the
+                // markdown renderer (comrak_bridge) makes. `next_list_number` is still
+                // called (and its result discarded) so a sibling item without a label keeps
+                // counting from the position it would have held either way.
                 if ordered {
                     let n = state.next_list_number();
-                    block.push_str(&n.to_string());
-                    block.push_str(". ");
+                    match source_label {
+                        Some(label) => {
+                            block.push_str("- ");
+                            block.push_str(label);
+                            block.push(' ');
+                        }
+                        None => {
+                            block.push_str(&n.to_string());
+                            block.push_str(". ");
+                        }
+                    }
+                } else if let Some(label) = source_label {
+                    block.push_str("- ");
+                    block.push_str(label);
+                    block.push(' ');
                 } else {
                     block.push_str("- ");
                 };
@@ -340,11 +360,14 @@ fn render_djot_annotated(text: &str, annotations: &[crate::types::document_struc
                     }
                 }
                 AnnotationKind::Color { .. } | AnnotationKind::FontSize { .. } | AnnotationKind::Custom { .. } => {
-                    normalized
+                    normalized.into_owned()
                 }
             }
         },
-        normalize_inline_text,
+        // `render_annotated_text_with_plain` wants an owned `String` for the plain
+        // rendering, so the borrow `normalize_inline_text` can now return has to be
+        // materialised here rather than at every call site inside the closure above.
+        |text| normalize_inline_text(text).into_owned(),
     )
 }
 
@@ -413,6 +436,36 @@ mod tests {
         let out = render_djot(&doc);
         assert!(out.contains("1. First\n"), "got: {}", out);
         assert!(out.contains("2. Second\n"), "got: {}", out);
+    }
+
+    /// #### FAILS against unfixed code
+    /// `InternalElement::set_list_item_source_label` does not exist on unfixed
+    /// code, so this does not compile without the fix. Once compiled, it proves
+    /// two things: a captured literal source label (here "B.") is written out
+    /// verbatim instead of the synthesized "1.", and a *sibling* item with no
+    /// label of its own still gets the ordinal it would have held either way
+    /// (2, not 1) -- `next_list_number` is called for every ordered item,
+    /// labeled or not, precisely so this doesn't happen.
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn test_render_djot_ordered_list_with_a_literal_source_label() {
+        use crate::types::internal::{ElementKind, InternalElement};
+
+        let mut doc = InternalDocument::new("pdf");
+        doc.push_element(InternalElement::text(ElementKind::ListStart { ordered: true }, "", 0));
+        let mut labeled = InternalElement::text(ElementKind::ListItem { ordered: true }, "General Provisions.", 1);
+        labeled.set_list_item_source_label("B.");
+        doc.push_element(labeled);
+        doc.push_element(InternalElement::text(
+            ElementKind::ListItem { ordered: true },
+            "Second item",
+            1,
+        ));
+        doc.push_element(InternalElement::text(ElementKind::ListEnd, "", 0));
+
+        let out = render_djot(&doc);
+        assert!(out.contains("- B. General Provisions.\n"), "got: {out}");
+        assert!(out.contains("2. Second item\n"), "got: {out}");
     }
 
     #[test]

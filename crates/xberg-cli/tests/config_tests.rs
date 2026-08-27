@@ -10,17 +10,6 @@
 #![allow(clippy::bool_assert_comparison)]
 #![allow(clippy::field_reassign_with_default)]
 
-use std::path::PathBuf;
-use tempfile::TempDir;
-
-/// Helper to create a temporary config file
-#[allow(dead_code)]
-fn create_test_config(dir: &TempDir, name: &str, content: &str) -> PathBuf {
-    let config_path = dir.path().join(name);
-    std::fs::write(&config_path, content).expect("Failed to write config file");
-    config_path
-}
-
 #[test]
 fn test_output_format_flag_plain() {
     let config = xberg::core::config::ExtractionConfig::default();

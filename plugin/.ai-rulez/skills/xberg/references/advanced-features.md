@@ -21,7 +21,7 @@ Post-processors enrich extraction results after document parsing. They run non-d
             return "metadata_enricher"
 
         def version(self) -> str:
-            return "1.0.0"
+            return "1.1.0"
 
         def process(self, result: ExtractedDocument, config: ExtractionConfig) -> ExtractedDocument:
             result.metadata.additional["processed_by"] = "metadata_enricher"
@@ -79,7 +79,7 @@ Validators perform quality checks. Unlike post-processors, a validator that rais
             return "min_content_validator"
 
         def version(self) -> str:
-            return "1.0.0"
+            return "1.1.0"
 
         def validate(self, result: ExtractedDocument, config: ExtractionConfig) -> None:
             if len(result.content) < 100:
@@ -126,37 +126,27 @@ Register a custom OCR engine to integrate proprietary or specialized OCR.
 === "Python"
 
     ```python
-    from xberg import register_ocr_backend, ExtractInput, extract, ExtractionConfig, OcrConfig, OcrBackendType
+    from xberg import ExtractedDocument, OcrBackendType, OcrConfig, register_ocr_backend
 
     class CustomOcrBackend:
         def name(self) -> str:
             return "custom_ocr"
 
-        def version(self) -> str:
-            return "1.0.0"
-
-        def supported_languages(self) -> list[str]:
-            return ["eng", "deu", "fra", "spa"]
-
         def supports_language(self, language: str) -> bool:
-            return language in self.supported_languages()
+            return language in {"eng", "deu", "fra", "spa"}
 
         def backend_type(self) -> OcrBackendType:
             return OcrBackendType.CUSTOM
 
         # The second argument is the resolved OcrConfig, not a language string.
-        def process_image(self, image_bytes: bytes, config: OcrConfig) -> dict:
+        def process_image(self, image_bytes: bytes, config: OcrConfig) -> ExtractedDocument:
             language = config.language[0] if config.language else "eng"
             # text = my_ocr_engine.recognize(image_bytes, language)
-            return {
-                "content": "Extracted text from image",
-                "tables": [],
-            }
+            return ExtractedDocument(content="Extracted text from image", mime_type="text/plain")
 
     register_ocr_backend(CustomOcrBackend())
 
-    config = ExtractionConfig(ocr=OcrConfig(backend="custom_ocr", language="eng"))
-    # result = await extract(ExtractInput(uri="scanned.pdf"), config)
+    config = OcrConfig(backend="custom_ocr", language=["eng"])
     ```
 
 === "TypeScript"
@@ -193,7 +183,7 @@ Register a custom OCR engine to integrate proprietary or specialized OCR.
 
     registerOcrBackend(backend);
 
-    const config = { ocr: { backend: "custom_ocr", language: "eng" } };
+    const config = { ocr: { backend: "custom_ocr", language: ["eng"] } };
     const output = await extract({ kind: "uri", uri: "scanned.pdf" }, config);
     ```
 
@@ -214,7 +204,7 @@ Override extraction settings for individual inputs by setting `config` on each `
             uri="scan.tiff",
             config=FileExtractionConfig(
                 force_ocr=True,
-                ocr=OcrConfig(backend="tesseract", language="deu"),
+                ocr=OcrConfig(backend="tesseract", language=["deu"]),
             ),
         )
 
@@ -236,7 +226,7 @@ Override extraction settings for individual inputs by setting `config` on each `
         {
           kind: "uri",
           uri: "scan.tiff",
-          config: { forceOcr: true, ocr: { backend: "tesseract", language: "deu" } },
+          config: { forceOcr: true, ocr: { backend: "tesseract", language: ["deu"] } },
         },
       ],
       { outputFormat: "markdown" },

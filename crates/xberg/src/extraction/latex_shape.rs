@@ -20,10 +20,7 @@ mod tests {
 
     #[test]
     fn test_alignment_gets_an_environment() {
-        assert_eq!(
-            wrap_aligned_math("a &= b"),
-            "\\begin{aligned}a &= b\\end{aligned}"
-        );
+        assert_eq!(wrap_aligned_math("a &= b"), "\\begin{aligned}a &= b\\end{aligned}");
     }
 
     #[test]

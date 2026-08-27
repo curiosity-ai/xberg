@@ -24,6 +24,8 @@ packages=(
   # rather than downloaded inside the timed extraction. ~keep
   tesseract-ocr-kor
   tesseract-ocr-jpn-vert
+  libtesseract-dev
+  libleptonica-dev
   fonts-liberation
   fonts-dejavu-core
   fonts-noto-core
@@ -64,7 +66,7 @@ else
     echo "::error::Package installation timed out after 15 minutes"
   else
     echo "::warning::Some packages failed to install, attempting individual installs..."
-    for pkg in tesseract-ocr libssl-dev pkg-config cmake; do
+    for pkg in tesseract-ocr libtesseract-dev libleptonica-dev libssl-dev pkg-config cmake; do
       echo "Installing $pkg..."
       if retry_with_backoff_timeout 300 sudo apt-get install -y "$pkg" 2>&1; then
         echo "  ✓ $pkg installed"

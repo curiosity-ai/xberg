@@ -157,7 +157,7 @@ async fn extract_batch_collects_unsupported_scheme_error() {
     assert_eq!(output.summary.results, 1);
     assert_eq!(output.summary.errors, 1);
     assert_eq!(output.errors[0].index, 1);
-    assert_eq!(output.errors[0].code, 1003);
+    assert_eq!(output.errors[0].code, 1010);
     assert_eq!(output.errors[0].error_type, "unsupported_format");
 }
 
@@ -170,50 +170,58 @@ async fn extract_batch_applies_item_timeout() {
     .await;
 
     let error = item.result.unwrap_err();
-    assert_eq!(error_code(&error), 1004);
+    assert_eq!(error_code(&error), 1014);
     assert_eq!(error_type(&error), "timeout");
 }
 
 #[test]
-fn should_map_named_variants_to_their_dedicated_code_and_type() {
-    let cases: [(XbergError, u32, &str); 6] = [
-        (XbergError::Io(std::io::Error::other("t")), 1001, "io"),
-        (XbergError::validation("t"), 1002, "validation"),
-        (XbergError::UnsupportedFormat("t/mime".to_string()), 1003, "unsupported_format"),
-        (XbergError::Timeout { elapsed_ms: 1, limit_ms: 2 }, 1004, "timeout"),
-        (XbergError::Cancelled, 1005, "cancelled"),
-        (XbergError::security("t"), 1006, "security"),
+fn should_map_every_variant_to_its_canonical_code_and_type() {
+    let cases: [(XbergError, u32, &str); 18] = [
+        (XbergError::Io(std::io::Error::other("t")), 1000, "io"),
+        (XbergError::parsing("t"), 1001, "parsing"),
+        (XbergError::ocr("t"), 1002, "ocr"),
+        (XbergError::validation("t"), 1003, "validation"),
+        (XbergError::cache("t"), 1004, "cache"),
+        (XbergError::image_processing("t"), 1005, "image_processing"),
+        (XbergError::serialization("t"), 1006, "serialization"),
+        (
+            XbergError::MissingDependency("t".to_string()),
+            1007,
+            "missing_dependency",
+        ),
+        (
+            XbergError::Plugin {
+                message: "t".to_string(),
+                plugin_name: "p".to_string(),
+            },
+            1008,
+            "plugin",
+        ),
+        (XbergError::LockPoisoned("t".to_string()), 1009, "lock_poisoned"),
+        (
+            XbergError::UnsupportedFormat("t/mime".to_string()),
+            1010,
+            "unsupported_format",
+        ),
+        (XbergError::embedding("t"), 1011, "embedding"),
+        (XbergError::reranking("t"), 1012, "reranking"),
+        (XbergError::transcription("t"), 1013, "transcription"),
+        (
+            XbergError::Timeout {
+                elapsed_ms: 1,
+                limit_ms: 2,
+            },
+            1014,
+            "timeout",
+        ),
+        (XbergError::Cancelled, 1015, "cancelled"),
+        (XbergError::security("t"), 1016, "security"),
+        (XbergError::Other("t".to_string()), 1017, "other"),
     ];
 
     for (error, expected_code, expected_type) in cases {
         assert_eq!(error_code(&error), expected_code);
         assert_eq!(error_type(&error), expected_type);
-    }
-}
-
-#[test]
-fn should_default_unlisted_variants_to_1099_and_other() {
-    let cases: [XbergError; 12] = [
-        XbergError::parsing("t"),
-        XbergError::ocr("t"),
-        XbergError::cache("t"),
-        XbergError::image_processing("t"),
-        XbergError::serialization("t"),
-        XbergError::MissingDependency("t".to_string()),
-        XbergError::Plugin {
-            message: "t".to_string(),
-            plugin_name: "p".to_string(),
-        },
-        XbergError::LockPoisoned("t".to_string()),
-        XbergError::embedding("t"),
-        XbergError::Other("t".to_string()),
-        XbergError::transcription("t"),
-        XbergError::reranking("t"),
-    ];
-
-    for error in cases {
-        assert_eq!(error_code(&error), 1099);
-        assert_eq!(error_type(&error), "other");
     }
 }
 
@@ -460,6 +468,94 @@ fn engine_batch_base_config_applies_plan_budget_once() {
 
     let reused = resolve_batch_base_config(&adjusted, 2);
     assert!(Arc::ptr_eq(&adjusted, &reused));
+}
+
+/// Regression test for task #709: `resolve_input_config` is the single choke point
+/// both `extract_one` (the single-input `extract`/`extract_batch_sequential` path) and
+/// the shared-URL-group construction in `extract_batch_concurrent` go through.
+/// Installing the internal cancellation token here — before either `run_batch_item`'s
+/// or `finalize_shared_item`'s own timeout wrapper races the extraction — guarantees
+/// `token.cancel()` at those call sites has the SAME token this config's extractor
+/// checkpoints observe, not a disconnected one.
+#[test]
+fn resolve_input_config_installs_a_cancel_token_when_a_timeout_is_configured() {
+    let base = ExtractionConfig {
+        extraction_timeout_secs: Some(30),
+        cancel_token: None,
+        ..Default::default()
+    };
+    let input = ExtractInput::from_bytes(b"hello".to_vec(), "text/plain", None);
+
+    let resolved = resolve_input_config(&input, &base);
+
+    assert!(
+        resolved.cancel_token.is_some(),
+        "resolve_input_config must install an internal token when a timeout is configured"
+    );
+}
+
+/// A caller-supplied token (the REST cancel path, `DELETE /jobs/{id}`) must survive
+/// `resolve_input_config` unchanged, so it keeps working exactly as before.
+#[test]
+fn resolve_input_config_preserves_a_caller_supplied_cancel_token() {
+    let supplied = crate::cancellation::CancellationToken::new();
+    let base = ExtractionConfig {
+        extraction_timeout_secs: Some(30),
+        cancel_token: Some(supplied.clone()),
+        ..Default::default()
+    };
+    let input = ExtractInput::from_bytes(b"hello".to_vec(), "text/plain", None);
+
+    let resolved = resolve_input_config(&input, &base);
+
+    supplied.cancel();
+    assert!(
+        resolved.cancel_token.expect("token must survive").is_cancelled(),
+        "resolve_input_config must keep the caller's own token (a clone of the same Arc), \
+         not swap in an unrelated one that never observes the caller's cancel() call"
+    );
+}
+
+/// Companion to `resolve_input_config`'s tests above, for the concurrent-batch path:
+/// `resolve_batch_input_config` feeds both `run_batch_item`'s cancel_token argument and
+/// the `resolved_config` passed to `extract_one_resolved`, so it must install the same
+/// guarantee without breaking the existing Arc-reuse fast path when nothing changed.
+#[test]
+fn resolve_batch_input_config_shares_the_arc_when_nothing_needs_installing() {
+    let base = Arc::new(ExtractionConfig {
+        extraction_timeout_secs: None,
+        cancel_token: None,
+        ..Default::default()
+    });
+    let input = ExtractInput::from_bytes(b"hello".to_vec(), "text/plain", None);
+    let thread_budget = crate::core::config::concurrency::resolve_thread_budget(base.concurrency.as_ref());
+
+    let resolved = resolve_batch_input_config(&input, &base, thread_budget);
+
+    assert!(
+        Arc::ptr_eq(&resolved, &base),
+        "no timeout, no cancel_token need, and no thread-budget change must reuse the \
+         SAME Arc, not clone the config"
+    );
+}
+
+#[test]
+fn resolve_batch_input_config_installs_a_cancel_token_when_a_timeout_is_configured() {
+    let base = Arc::new(ExtractionConfig {
+        extraction_timeout_secs: Some(30),
+        cancel_token: None,
+        ..Default::default()
+    });
+    let input = ExtractInput::from_bytes(b"hello".to_vec(), "text/plain", None);
+    let thread_budget = crate::core::config::concurrency::resolve_thread_budget(base.concurrency.as_ref());
+
+    let resolved = resolve_batch_input_config(&input, &base, thread_budget);
+
+    assert!(
+        resolved.cancel_token.is_some(),
+        "resolve_batch_input_config must install an internal token when a timeout is \
+         configured, even though nothing else forced a clone"
+    );
 }
 
 #[test]

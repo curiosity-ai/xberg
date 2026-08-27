@@ -25,8 +25,6 @@ use std::io::Cursor;
 
 /// Maximum uncompressed size per file in a DOCX archive (100 MB).
 pub const MAX_UNCOMPRESSED_FILE_SIZE: u64 = 100 * 1024 * 1024;
-/// Maximum number of entries in a DOCX ZIP archive.
-pub const MAX_ZIP_ENTRIES: usize = 10_000;
 /// Maximum total uncompressed size of all files in a DOCX archive (500 MB).
 pub const MAX_TOTAL_UNCOMPRESSED_SIZE: u64 = 500 * 1024 * 1024;
 /// Maximum image file size for extraction (100 MB).

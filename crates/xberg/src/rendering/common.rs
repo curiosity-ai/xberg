@@ -124,9 +124,17 @@ pub(crate) fn render_annotated_text_with_plain(
     let mut out = String::with_capacity(text.len() + 64);
 
     for ann in &sorted {
-        let start = ann.start.min(len);
-        let end = ann.end.min(len);
-        if start < pos {
+        // `TextAnnotation::start`/`end` are byte offsets that may originate from any
+        // extractor, not just the ones in this crate that are provably char-boundary-safe
+        // (e.g. `pdf::structure::assembly::extract_text_and_annotations`, which derives
+        // them from `text.len()` on the exact same buffer). Nothing here guarantees that
+        // in general, so — matching `comrak_bridge::build_comrak_ast`'s identical guard on
+        // the same annotation type — clamp to the nearest char boundary before slicing
+        // `text`, rather than trusting the offset outright and panicking on a mid-codepoint
+        // cut.
+        let start = text.ceil_char_boundary(ann.start.min(len) as usize) as u32;
+        let end = text.floor_char_boundary(ann.end.min(len) as usize) as u32;
+        if start < pos || start >= end {
             continue;
         }
         if start > pos {
@@ -379,7 +387,13 @@ pub(crate) fn render_table_djot(cells: &[Vec<String>]) -> String {
 /// - Collapses multiple consecutive whitespace (spaces, tabs) into a single space
 /// - Replaces newlines with spaces (mid-paragraph line breaks from PDF extraction)
 /// - Strips control characters (< 0x20) except tab
-pub(crate) fn normalize_inline_text(text: &str) -> String {
+pub(crate) fn normalize_inline_text(text: &str) -> Cow<'_, str> {
+    let needs_normalization = text.as_bytes().windows(2).any(|w| w[0] == b' ' && w[1] == b' ')
+        || text.bytes().any(|b| b < 0x20 && b != b'\t');
+    if !needs_normalization {
+        return Cow::Borrowed(text);
+    }
+
     let mut result = String::with_capacity(text.len());
     let mut prev_space = false;
     for ch in text.chars() {
@@ -394,7 +408,7 @@ pub(crate) fn normalize_inline_text(text: &str) -> String {
             result.push(ch);
         }
     }
-    result
+    Cow::Owned(result)
 }
 
 /// Ensure the output has a trailing newline (but not doubled).
@@ -714,6 +728,52 @@ mod tests {
         assert_eq!(result, "[B:Hello world]");
     }
 
+    /// `TextAnnotation::start`/`end` are byte offsets that can be produced by any
+    /// extractor, not just the char-boundary-safe path in `pdf::structure::assembly`.
+    /// An annotation landing mid-codepoint made `&text[start..end]` panic with
+    /// "byte index 1 is not a char boundary".
+    ///
+    /// The span here is deliberately NON-EMPTY after clamping. An empty one
+    /// (`start: 1, end: 1`) proves nothing: the accompanying `start >= end` skip
+    /// discards it before any slicing happens, so that case still passes with the
+    /// boundary clamp removed. `é` occupies bytes `0..2`, so `start: 1` cuts inside
+    /// it while `end: 3` is a real boundary -- reaching the slice and panicking
+    /// unless `start` is rounded up to 2.
+    #[test]
+    fn render_annotated_text_clamps_mid_codepoint_offset_instead_of_panicking() {
+        let text = "éab";
+        let ann = vec![TextAnnotation {
+            start: 1,
+            end: 3,
+            kind: AnnotationKind::Bold,
+        }];
+        let result = render_annotated_text(text, &ann, |span, kind| match kind {
+            AnnotationKind::Bold => format!("[B:{}]", span),
+            _ => span.to_string(),
+        });
+        assert_eq!(
+            result, "é[B:a]b",
+            "start must round up to the char boundary at 2, bolding only the complete chars"
+        );
+    }
+
+    /// The empty-after-clamping case, kept separately so each guard has its own test:
+    /// `start: 1, end: 1` inside `é` collapses to nothing and must be dropped.
+    #[test]
+    fn render_annotated_text_drops_an_annotation_that_clamps_to_empty() {
+        let text = "é world";
+        let ann = vec![TextAnnotation {
+            start: 1,
+            end: 1,
+            kind: AnnotationKind::Bold,
+        }];
+        let result = render_annotated_text(text, &ann, |span, kind| match kind {
+            AnnotationKind::Bold => format!("[B:{}]", span),
+            _ => span.to_string(),
+        });
+        assert_eq!(result, text, "an annotation with no content must be dropped, not panic");
+    }
+
     #[test]
     fn test_render_state_blockquote_depth() {
         let mut state = RenderState::default();
@@ -976,7 +1036,19 @@ mod tests {
 
     #[test]
     fn test_normalize_inline_text_no_change() {
-        assert_eq!(normalize_inline_text("Hello world"), "Hello world");
+        let result = normalize_inline_text("Hello world");
+        assert!(matches!(result, Cow::Borrowed(_)), "should not allocate when unchanged");
+        assert_eq!(result, "Hello world");
+    }
+
+    #[test]
+    fn test_normalize_inline_text_collapses_spaces_allocates() {
+        let result = normalize_inline_text("Hello   world");
+        assert!(
+            matches!(result, Cow::Owned(_)),
+            "should allocate when spaces are collapsed"
+        );
+        assert_eq!(result, "Hello world");
     }
 
     #[test]

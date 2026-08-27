@@ -7,7 +7,7 @@
 //!   tracing spans (requires `otel` feature).
 //! - **Metrics instruments** (`metrics`) — counters, histograms, and gauges
 //!   for monitoring extraction operations (requires `otel` feature).
-//! - **Prometheus support** ([`init_prometheus`]) — installs a Prometheus-backed
+//! - **Prometheus support** (`init_prometheus`) — installs a Prometheus-backed
 //!   `SdkMeterProvider` as the global OTel meter provider (requires `prometheus` feature).
 //!
 //! The `conventions` module is always available (it's just string constants).

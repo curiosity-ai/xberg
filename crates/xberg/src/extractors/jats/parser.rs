@@ -2,7 +2,6 @@
 
 use crate::Result;
 use crate::extractors::security::SecurityBudget;
-use crate::text::utf8_validation;
 use quick_xml::events::Event;
 
 use crate::utils::xml_utils::EntityReader;
@@ -44,7 +43,7 @@ pub(super) fn extract_text_content(reader: &mut EntityReader<'_>, budget: &mut S
                 }
             }
             Ok(Event::Text(t)) => {
-                let decoded = String::from_utf8_lossy(t.as_ref()).to_string();
+                let decoded = t.as_ref().to_string();
                 if !decoded.trim().is_empty() {
                     budget.check_entity(&decoded)?;
                     budget.account_text(decoded.len())?;
@@ -53,7 +52,7 @@ pub(super) fn extract_text_content(reader: &mut EntityReader<'_>, budget: &mut S
                 }
             }
             Ok(Event::CData(t)) => {
-                let decoded = utf8_validation::from_utf8(t.as_ref()).unwrap_or("").to_string();
+                let decoded = t.as_ref().to_string();
                 if !decoded.trim().is_empty() {
                     budget.check_entity(&decoded)?;
                     budget.account_text(decoded.len())?;
@@ -109,7 +108,7 @@ pub(super) fn extract_citation_text(reader: &mut EntityReader<'_>, budget: &mut 
             Ok(Event::Start(e)) => {
                 budget.enter()?;
                 depth += 1;
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
 
                 match tag.as_str() {
                     "element-citation" => {
@@ -135,8 +134,8 @@ pub(super) fn extract_citation_text(reader: &mut EntityReader<'_>, budget: &mut 
                     "pub-id" | "article-id" if in_element_citation => {
                         let mut id_type = String::new();
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                             if key == "pub-id-type" {
                                 id_type = val.to_string();
@@ -154,7 +153,7 @@ pub(super) fn extract_citation_text(reader: &mut EntityReader<'_>, budget: &mut 
                 if depth == 0 {
                     break;
                 }
-                let tag = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let tag = e.name().as_ref().to_string();
 
                 match tag.as_str() {
                     "name" if in_name => {
@@ -189,7 +188,7 @@ pub(super) fn extract_citation_text(reader: &mut EntityReader<'_>, budget: &mut 
                 depth -= 1;
             }
             Ok(Event::Text(t)) => {
-                let decoded = String::from_utf8_lossy(t.as_ref()).to_string();
+                let decoded = t.as_ref().to_string();
                 let trimmed = decoded.trim();
 
                 if !trimmed.is_empty() {
@@ -333,8 +332,8 @@ pub(super) fn extract_fig_content(
                     "label" | "title" | "p" => current_tag = tag.clone(),
                     "graphic" => {
                         for attr in e.attributes().flatten() {
-                            let key = String::from_utf8_lossy(attr.key.as_ref());
-                            let val = String::from_utf8_lossy(attr.value.as_ref());
+                            let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                            let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                             budget.check_attr(&key, &val)?;
                             if key == "xlink:href" || key.ends_with(":href") || key == "href" {
                                 href = Some(val.to_string());
@@ -354,8 +353,8 @@ pub(super) fn extract_fig_content(
                 let tag = crate::utils::xml_tag_name(name.as_ref());
                 if tag.as_ref() == "graphic" {
                     for attr in e.attributes().flatten() {
-                        let key = String::from_utf8_lossy(attr.key.as_ref());
-                        let val = String::from_utf8_lossy(attr.value.as_ref());
+                        let key = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                        let val = std::borrow::Cow::Borrowed(attr.value.as_ref());
                         budget.check_attr(&key, &val)?;
                         if key == "xlink:href" || key.ends_with(":href") || key == "href" {
                             href = Some(val.to_string());
@@ -377,7 +376,7 @@ pub(super) fn extract_fig_content(
                 depth -= 1;
             }
             Ok(Event::Text(t)) => {
-                let decoded = String::from_utf8_lossy(t.as_ref()).to_string();
+                let decoded = t.as_ref().to_string();
                 let trimmed = decoded.trim();
 
                 if !trimmed.is_empty() {

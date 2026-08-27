@@ -4,20 +4,11 @@ import io.xberg.ExtractInputKind
 import io.xberg.ExtractionConfig
 import io.xberg.Xberg
 
-val output = Xberg.extractBatch(
-    listOf(
-        ExtractInput(kind = ExtractInputKind.URI, uri = "document.pdf"),
-        ExtractInput(
-            kind = ExtractInputKind.BYTES,
-            bytes = "Hello from memory".toByteArray(),
-            mimeType = "text/plain",
-            filename = "note.txt",
-        ),
-    ),
-    ExtractionConfig(),
+val inputs = listOf(
+    ExtractInput(kind = ExtractInputKind.URI, uri = "report.pdf"),
+    ExtractInput(kind = ExtractInputKind.URI, uri = "notes.txt"),
 )
 
-output.results.forEach { result ->
-    println(result.content)
-}
+val output = Xberg.extractBatch(inputs, ExtractionConfig())
+output.results.forEach { println(it.content) }
 ```

@@ -1566,13 +1566,13 @@ fn extend_table_bottom_rows(
         return hint_img_bottom;
     }
 
-    let mut left_bins: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
-    let mut right_bins: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut left_bins: ahash::AHashMap<u32, u32> = ahash::AHashMap::new();
+    let mut right_bins: ahash::AHashMap<u32, u32> = ahash::AHashMap::new();
     for w in &in_hint {
         *left_bins.entry(w.left / X_BIN_PTS).or_insert(0) += 1;
         *right_bins.entry((w.left + w.width) / X_BIN_PTS).or_insert(0) += 1;
     }
-    let bin_hit = |bins: &std::collections::HashMap<u32, u32>, bin: u32| {
+    let bin_hit = |bins: &ahash::AHashMap<u32, u32>, bin: u32| {
         (bin.saturating_sub(1)..=bin + 1).any(|b| bins.get(&b).copied().unwrap_or(0) >= MIN_BIN_COUNT)
     };
     let word_aligns = |w: &crate::pdf::table_reconstruct::HocrWord| {

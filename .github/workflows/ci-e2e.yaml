@@ -2,7 +2,7 @@ name: CI E2E
 
 on:
   push:
-    branches: [main]
+    branches: [main, chore/alef-fixes]
     paths:
       - "crates/**"
       - "packages/**"
@@ -16,6 +16,7 @@ on:
       - "scripts/ci/wasm/**"
       - ".github/workflows/ci-e2e.yaml"
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     branches: [main]
     paths:
       - "crates/**"
@@ -53,7 +54,7 @@ permissions:
 jobs:
   build-ffi:
     name: Build FFI (${{ matrix.target }})
-    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
     strategy:
@@ -65,7 +66,7 @@ jobs:
           - os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -90,7 +91,7 @@ jobs:
 
       - name: Restore FFI artifacts from cache
         id: ffi-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             target/release/libxberg_ffi.*
@@ -144,7 +145,7 @@ jobs:
 
   e2e-tests:
     name: E2E (${{ matrix.lang }})
-    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]'
+    if: github.repository == 'xberg-io/xberg' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft != true
     needs: [build-ffi]
     runs-on: ${{ matrix.runs-on }}
     timeout-minutes: 180
@@ -209,7 +210,7 @@ jobs:
             runs-on: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -343,7 +344,7 @@ jobs:
 
       - name: Setup Go
         if: matrix.go-version
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
           go-version: ${{ matrix.go-version }}
 
@@ -371,7 +372,7 @@ jobs:
 
       - name: Setup Android SDK
         if: matrix.lang == 'kotlin-android'
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
         with:
           packages: "platforms;android-35 build-tools;35.0.0"
           accept-android-sdk-licenses: true
@@ -384,7 +385,7 @@ jobs:
 
       - name: Setup .NET
         if: matrix.dotnet-version
-        uses: actions/setup-dotnet@v5
+        uses: actions/setup-dotnet@v6
         with:
           dotnet-version: ${{ matrix.dotnet-version }}
 
@@ -438,6 +439,10 @@ jobs:
 
       - name: Install Task
         uses: xberg-io/actions/install-task@v1
+
+      - name: Install wasm-pack
+        if: matrix.lang == 'wasm'
+        run: task demo:dev:setup:wasm-pack
 
       - name: Install alef CLI
         uses: xberg-io/actions/install-alef@v1

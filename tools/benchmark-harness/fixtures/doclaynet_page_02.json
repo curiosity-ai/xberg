@@ -1,6 +1,6 @@
 {
   "document": "../../../test_documents/images/doclaynet_page_02.jpg",
-  "file_type": "jpeg",
+  "file_type": "jpg",
   "file_size": 219650,
   "expected_frameworks": [
     "xberg"

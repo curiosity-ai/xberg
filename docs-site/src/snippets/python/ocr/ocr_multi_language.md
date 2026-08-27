@@ -4,7 +4,7 @@ from xberg import ExtractInput, extract, ExtractionConfig, OcrConfig
 
 async def main() -> None:
     config: ExtractionConfig = ExtractionConfig(
-        ocr=OcrConfig(backend="tesseract", language="eng+deu+fra")
+        ocr=OcrConfig(backend="tesseract", language=["eng", "deu", "fra"])
     )
 
     result = await extract(ExtractInput(uri="multilingual.pdf"), config)

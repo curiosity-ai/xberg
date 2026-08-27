@@ -117,7 +117,7 @@ flowchart LR
 | **core/**       | Main entry points (`extract`, `extract_batch`), MIME detection, config loading, pipeline orchestration                                                                                                             |
 | **plugins/**    | Plugin trait definitions (`DocumentExtractor`, `OcrBackend`, `PostProcessor`, `Validator`, `Renderer`) and the registry system (ExtractorRegistry, OcrRegistry, ValidatorRegistry, ProcessorRegistry, RendererRegistry) |
 | **extractors/** | Maps MIME types to the correct extractor implementation and registers them with the plugin system                                                                                                                       |
-| **extraction/** | Format-specific extraction logic - PDF via pdf_oxide, Excel via calamine, email parsing, and so on.                                                                                                                     |
+| **extraction/** | Format-specific extraction logic - PDF via xberg-native-pdf, Excel via calamine, email parsing, and so on.                                                                                                                     |
 | **ocr/**        | OCR orchestration - Tesseract bindings, HOCR parsing, table detection                                                                                                                                                   |
 | **text/**       | Text processing utilities - token reduction, quality scoring, string manipulation                                                                                                                                       |
 | **types/**      | Shared data structures: `ExtractionResult`, `ExtractedDocument`, `Metadata`, `Chunk`, and friends                                                                                                                                            |
@@ -172,7 +172,7 @@ runtime registration and selection. See [Reranking Concepts](/guides/reranking/)
 ## Why Rust?
 
 **Speed.** Rust compiles to native machine code with LLVM optimizations. PDF parsing uses
-pdf_oxide — a pure-Rust library with no system-library overhead. Text processing uses SIMD
+xberg-native-pdf — a pure-Rust library with no system-library overhead. Text processing uses SIMD
 instructions to handle multiple characters per CPU cycle. Batch extraction runs on all CPU
 cores through Tokio's async runtime.
 

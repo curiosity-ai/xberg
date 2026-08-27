@@ -118,6 +118,8 @@ impl Plugin for TesseractWasmBackend {
     }
 }
 
+/// Inherits the `RequiresUpright` default for `page_orientation_handling` — unmeasured, not validated (#657).
+/// The native `TesseractBackend` declares `SelfCorrecting`, but that was measured on the native build, not this one.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl OcrBackend for TesseractWasmBackend {
@@ -222,6 +224,15 @@ impl OcrBackend for TesseractWasmBackend {
     fn backend_type(&self) -> OcrBackendType {
         OcrBackendType::Tesseract
     }
+
+    /// The WASM Tesseract backend reports no page-level confidence.
+    fn confidence_semantics(&self) -> crate::plugins::ConfidenceSemantics {
+        crate::plugins::ConfidenceSemantics::None
+    }
+
+    // Rotation handling has not been measured for this backend; it stays on the trait's
+    // `RequiresUpright` default rather than inheriting the native Tesseract backend's measured
+    // `SelfCorrecting` value.
 }
 
 /// Returns the compile-time-bundled English tessdata when the

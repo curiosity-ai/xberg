@@ -14,6 +14,10 @@
 //!   `Layout` suffix adds layout detection on top.
 //! - **Paddle***: explicitly pinned PaddleOCR model version and tier, with
 //!   optional layout detection; the label-to-model mapping is benchmark identity. ~keep
+//! - **Sceptre***: Sceptre OCR pinned to the ONNX Runtime inference engine
+//!   (`force_ocr`), with `Layout`/`AutoRotate` variants mirroring the Tesseract/Paddle
+//!   pattern. The tract engine is deliberately not exposed here — it is reserved for the
+//!   bounded diagnostic matrix reachable only from the separate `XbergPipeline` enum. ~keep
 //! - **Docling / PaddleOcrPython / RapidOcr**: vendored pipelines whose
 //!   outputs are pre-computed and read from disk (no live extraction).
 //! - **LayoutSlanet***: layout detection with explicit SLANeXT table model
@@ -56,6 +60,10 @@ const EXTRACTION_TIMEOUT_PER_PAGE_MS: u64 = 400;
 
 const PP_OCR_V5: &str = "pp-ocrv5";
 const PP_OCR_V6: &str = "pp-ocrv6";
+/// Sceptre's ONNX Runtime inference engine selector, passed via `OcrConfig::backend_options` as
+/// `{"model":{"backend":"ort"}}` — mirrors `SCEPTRE_ORT_OPTIONS_JSON` in `adapters/xberg.rs`,
+/// which drives the same selection for the separate `XbergPipeline` (CLI-subprocess) enum. ~keep
+const SCEPTRE_MODEL_BACKEND_ORT: &str = "ort";
 const PADDLE_DET_SIDE_1024: u32 = 1024;
 const PADDLE_DET_SIDE_1536: u32 = 1536;
 const PADDLE_DET_SIDE_2048: u32 = 2048;
@@ -146,6 +154,19 @@ pub enum Pipeline {
     PaddleAutoRotate,
     /// PaddleOCR without auto_rotate (for comparison)
     PaddleNoRotate,
+    /// Sceptre OCR pinned to the ONNX Runtime inference engine (force_ocr)
+    #[serde(rename = "sceptre-ort", alias = "sceptre")]
+    Sceptre,
+    /// Sceptre OCR (ONNX Runtime) + layout detection
+    #[serde(
+        rename = "sceptre-ort+layout",
+        alias = "sceptre-ort-layout",
+        alias = "sceptre-layout"
+    )]
+    SceptreLayout,
+    /// Sceptre OCR (ONNX Runtime) with auto_rotate enabled
+    #[serde(rename = "sceptre-ort-autorotate", alias = "sceptre-autorotate")]
+    SceptreAutoRotate,
     /// Docling vendored extraction (read from file)
     Docling,
     /// PaddleOCR Python vendored extraction (read from file)
@@ -160,12 +181,12 @@ pub enum Pipeline {
     LayoutSlanetPlus,
     /// Native PDF + layout detection + classifier-routed SLANeXT (wired/wireless auto)
     LayoutSlanetAuto,
-    /// pdf_oxide backend text extraction (no OCR, no layout)
-    PdfOxide,
-    /// pdf_oxide backend + layout detection
-    PdfOxideLayout,
-    /// pdf_oxide backend + layout detection + reading-order reordering
-    PdfOxideReadingOrder,
+    /// xberg-native-pdf backend text extraction (no OCR, no layout)
+    Native,
+    /// xberg-native-pdf backend + layout detection
+    NativeLayout,
+    /// xberg-native-pdf backend + layout detection + reading-order reordering
+    NativeReadingOrder,
     /// Candle-based TrOCR (force_ocr, plain text)
     CandleTrocr,
     /// Candle-based PaddleOCR-VL (force_ocr, end-to-end markdown)
@@ -210,6 +231,9 @@ impl Pipeline {
             Pipeline::TesseractAutoRotate => "tesseract-autorotate",
             Pipeline::PaddleAutoRotate => "paddle-autorotate",
             Pipeline::PaddleNoRotate => "paddle-norotate",
+            Pipeline::Sceptre => "sceptre-ort",
+            Pipeline::SceptreLayout => "sceptre-ort+layout",
+            Pipeline::SceptreAutoRotate => "sceptre-ort-autorotate",
             Pipeline::Docling => "docling",
             Pipeline::PaddleOcrPython => "paddleocr-python",
             Pipeline::RapidOcr => "rapidocr",
@@ -217,9 +241,9 @@ impl Pipeline {
             Pipeline::LayoutSlanetWireless => "layout+slanet-wireless",
             Pipeline::LayoutSlanetPlus => "layout+slanet-plus",
             Pipeline::LayoutSlanetAuto => "layout+slanet-auto",
-            Pipeline::PdfOxide => "pdf-oxide",
-            Pipeline::PdfOxideLayout => "pdf-oxide+layout",
-            Pipeline::PdfOxideReadingOrder => "pdf-oxide+layout+reading-order",
+            Pipeline::Native => "native",
+            Pipeline::NativeLayout => "native+layout",
+            Pipeline::NativeReadingOrder => "native+layout+reading-order",
             Pipeline::CandleTrocr => "candle-trocr",
             Pipeline::CandlePaddleocrVl => "candle-paddleocr-vl",
             Pipeline::CandleGlmOcr => "candle-glm-ocr",
@@ -266,6 +290,12 @@ impl Pipeline {
             "tesseract-autorotate" => Some(Pipeline::TesseractAutoRotate),
             "paddle-autorotate" => Some(Pipeline::PaddleAutoRotate),
             "paddle-norotate" => Some(Pipeline::PaddleNoRotate),
+            "sceptre" | "sceptre-ort" | "sceptre_ort" => Some(Pipeline::Sceptre),
+            "sceptre-ort+layout" | "sceptre-ort-layout" | "sceptre-layout" | "sceptre+layout"
+            | "sceptre_ort_layout" => Some(Pipeline::SceptreLayout),
+            "sceptre-ort-autorotate" | "sceptre-autorotate" | "sceptre_ort_autorotate" | "sceptre_autorotate" => {
+                Some(Pipeline::SceptreAutoRotate)
+            }
             "docling" => Some(Pipeline::Docling),
             "paddleocr-python" => Some(Pipeline::PaddleOcrPython),
             "rapidocr" => Some(Pipeline::RapidOcr),
@@ -275,12 +305,9 @@ impl Pipeline {
             "layout+slanet-auto" | "layout-slanet-auto" | "layout+slanet" | "layout-slanet" => {
                 Some(Pipeline::LayoutSlanetAuto)
             }
-            "pdf-oxide" | "pdf_oxide" | "oxide" => Some(Pipeline::PdfOxide),
-            "pdf-oxide+layout" | "pdf-oxide-layout" | "oxide+layout" | "oxide-layout" => Some(Pipeline::PdfOxideLayout),
-            "pdf-oxide+layout+reading-order"
-            | "pdf-oxide-layout-reading-order"
-            | "oxide+layout+reading-order"
-            | "oxide-layout-reading-order" => Some(Pipeline::PdfOxideReadingOrder),
+            "native" => Some(Pipeline::Native),
+            "native+layout" | "native-layout" => Some(Pipeline::NativeLayout),
+            "native+layout+reading-order" | "native-layout-reading-order" => Some(Pipeline::NativeReadingOrder),
             "candle-trocr" | "candle_trocr" | "trocr" => Some(Pipeline::CandleTrocr),
             "candle-paddleocr-vl" | "candle_paddleocr_vl" | "paddleocr-vl" => Some(Pipeline::CandlePaddleocrVl),
             "candle-glm-ocr" | "candle_glm_ocr" | "glm-ocr" => Some(Pipeline::CandleGlmOcr),
@@ -322,8 +349,8 @@ impl Pipeline {
             Pipeline::PaddleV6SmallLayout,
             Pipeline::PaddleV6Tiny,
             Pipeline::PaddleV6TinyLayout,
-            Pipeline::PdfOxide,
-            Pipeline::PdfOxideLayout,
+            Pipeline::Native,
+            Pipeline::NativeLayout,
             Pipeline::CandleGlmOcr,
         ]
     }
@@ -524,6 +551,31 @@ fn build_paddle_v6_small_layout_quality_config(profile: PaddleQualityProfile) ->
     )
 }
 
+/// Build a Sceptre extraction config pinned to the ONNX Runtime inference engine.
+///
+/// Mirrors `push_sceptre_args`/`SCEPTRE_ORT_OPTIONS_JSON` in `adapters/xberg.rs`: that CLI-subprocess
+/// adapter selects the ONNX Runtime engine by passing `--ocr-backend-options
+/// {"model":{"backend":"ort"}}`; this in-process config forces the same selection through
+/// `OcrConfig::backend_options`, which `crate::extract_xberg_file` reads unchanged. ~keep
+fn build_sceptre_extraction_config(
+    layout: Option<xberg::core::config::layout::LayoutDetectionConfig>,
+) -> xberg::ExtractionConfig {
+    xberg::ExtractionConfig {
+        output_format: xberg::core::config::OutputFormat::Markdown,
+        force_ocr: true,
+        ocr: Some(xberg::core::config::OcrConfig {
+            backend: "sceptre".to_string(),
+            language: vec!["eng".to_string()],
+            backend_options: Some(serde_json::json!({
+                "model": { "backend": SCEPTRE_MODEL_BACKEND_ORT }
+            })),
+            ..Default::default()
+        }),
+        layout,
+        ..Default::default()
+    }
+}
+
 fn build_tesseract_extraction_config(psm: i32) -> xberg::ExtractionConfig {
     xberg::ExtractionConfig {
         output_format: xberg::core::config::OutputFormat::Markdown,
@@ -574,7 +626,7 @@ fn flip_existing_tesseract_result_caches(config: &mut xberg::ExtractionConfig) {
 }
 
 /// Materializes xberg's own OCR fallback default (`OcrConfig::default()`, backend `"tesseract"`)
-/// when a pipeline left `config.ocr` entirely `None` (e.g. `Pipeline::Baseline`/`PdfOxide`'s
+/// when a pipeline left `config.ocr` entirely `None` (e.g. `Pipeline::Baseline`/`Native`'s
 /// native-with-OCR-fallback pipelines). Gives a fixture's OCR language somewhere to attach via
 /// `apply_fixture_ocr_language`, without forcing `force_ocr`. Must run *before* that call. ~keep
 fn materialize_implicit_ocr_config(config: &mut xberg::ExtractionConfig) {
@@ -735,6 +787,17 @@ pub fn build_extraction_config(pipeline: Pipeline) -> xberg::ExtractionConfig {
             config
         }
         Pipeline::PaddleNoRotate => build_paddle_extraction_config(PP_OCR_V6, "medium", None),
+        Pipeline::Sceptre => build_sceptre_extraction_config(None),
+        Pipeline::SceptreLayout => build_sceptre_extraction_config(Some(LayoutDetectionConfig::default())),
+        Pipeline::SceptreAutoRotate => {
+            let mut config = build_sceptre_extraction_config(None);
+            config
+                .ocr
+                .as_mut()
+                .expect("Sceptre benchmark config must include OCR")
+                .auto_rotate = true;
+            config
+        }
         Pipeline::LayoutSlanetAuto => xberg::ExtractionConfig {
             layout: Some(LayoutDetectionConfig {
                 table_model: xberg::core::config::layout::TableModel::SlanetAuto,
@@ -747,11 +810,11 @@ pub fn build_extraction_config(pipeline: Pipeline) -> xberg::ExtractionConfig {
             }),
             ..base
         },
-        Pipeline::PdfOxide => xberg::ExtractionConfig {
+        Pipeline::Native => xberg::ExtractionConfig {
             pdf_options: Some(xberg::PdfConfig { ..Default::default() }),
             ..base
         },
-        Pipeline::PdfOxideLayout => xberg::ExtractionConfig {
+        Pipeline::NativeLayout => xberg::ExtractionConfig {
             pdf_options: Some(xberg::PdfConfig { ..Default::default() }),
             layout: Some(LayoutDetectionConfig::default()),
             use_layout_for_markdown: true,
@@ -762,7 +825,7 @@ pub fn build_extraction_config(pipeline: Pipeline) -> xberg::ExtractionConfig {
             }),
             ..base
         },
-        Pipeline::PdfOxideReadingOrder => xberg::ExtractionConfig {
+        Pipeline::NativeReadingOrder => xberg::ExtractionConfig {
             pdf_options: Some(xberg::PdfConfig {
                 reading_order: true,
                 ..Default::default()
@@ -1559,7 +1622,7 @@ pub struct GuardrailContract {
 }
 
 const READING_ORDER_GUARDRAIL_DOC: &str = "681693";
-const READING_ORDER_GUARDRAIL_PIPELINE: &str = "pdf-oxide+layout+reading-order";
+const READING_ORDER_GUARDRAIL_PIPELINE: &str = "native+layout+reading-order";
 const READING_ORDER_GUARDRAIL_ANCHORS: &[&str] = &[
     "maintainers wanted",
     "See #182",
@@ -2344,6 +2407,80 @@ mod tests {
     }
 
     #[test]
+    fn sceptre_pipeline_aliases_parse_to_expected_variant() {
+        let aliases = [
+            ("sceptre", Pipeline::Sceptre),
+            ("sceptre-ort", Pipeline::Sceptre),
+            ("sceptre_ort", Pipeline::Sceptre),
+            ("sceptre-ort+layout", Pipeline::SceptreLayout),
+            ("sceptre-ort-layout", Pipeline::SceptreLayout),
+            ("sceptre-layout", Pipeline::SceptreLayout),
+            ("sceptre+layout", Pipeline::SceptreLayout),
+            ("sceptre-ort-autorotate", Pipeline::SceptreAutoRotate),
+            ("sceptre-autorotate", Pipeline::SceptreAutoRotate),
+        ];
+
+        for (alias, expected) in aliases {
+            assert_eq!(
+                Pipeline::parse(alias),
+                Some(expected),
+                "failed to parse sceptre alias '{alias}'"
+            );
+        }
+        assert_eq!(Pipeline::Sceptre.name(), "sceptre-ort");
+        assert_eq!(Pipeline::SceptreLayout.name(), "sceptre-ort+layout");
+        assert_eq!(Pipeline::SceptreAutoRotate.name(), "sceptre-ort-autorotate");
+    }
+
+    #[test]
+    fn unknown_pipeline_name_reports_the_requested_name() {
+        // Regression guard: adding the sceptre variants must not turn an unrelated typo into a
+        // match (e.g. via an overly broad alias), and the caller-supplied name must still surface
+        // verbatim so `main::parse_pipeline_names` can build its "unknown pipeline '<name>'" error.
+        assert_eq!(Pipeline::parse("sceptre-typo"), None);
+        assert_eq!(Pipeline::parse("sceptr"), None);
+    }
+
+    #[test]
+    fn sceptre_presets_pin_the_ort_inference_engine_and_backend() {
+        let cases = [
+            (Pipeline::Sceptre, false, false),
+            (Pipeline::SceptreLayout, true, false),
+            (Pipeline::SceptreAutoRotate, false, true),
+        ];
+
+        for (pipeline, expected_layout, expected_auto_rotate) in cases {
+            let config = build_extraction_config(pipeline);
+            let ocr = config.ocr.as_ref().expect("Sceptre preset must configure OCR");
+            let backend_options = ocr
+                .backend_options
+                .as_ref()
+                .expect("Sceptre preset must pin the inference engine");
+
+            assert!(config.force_ocr, "Sceptre preset {} must force OCR", pipeline.name());
+            assert_eq!(ocr.backend, "sceptre", "unexpected backend for {}", pipeline.name());
+            assert_eq!(
+                backend_options["model"]["backend"],
+                SCEPTRE_MODEL_BACKEND_ORT,
+                "unexpected inference engine for {}",
+                pipeline.name()
+            );
+            assert_eq!(
+                config.layout.is_some(),
+                expected_layout,
+                "unexpected layout for {}",
+                pipeline.name()
+            );
+            assert_eq!(
+                ocr.auto_rotate,
+                expected_auto_rotate,
+                "unexpected auto_rotate for {}",
+                pipeline.name()
+            );
+        }
+    }
+
+    #[test]
     fn paddle_quality_sweep_presets_are_opt_in() {
         let defaults = Pipeline::all_xberg();
         for pipeline in [
@@ -2396,7 +2533,7 @@ mod tests {
             fixture_path: std::path::PathBuf::new(),
         };
 
-        for pipeline in [Pipeline::Baseline, Pipeline::PdfOxide] {
+        for pipeline in [Pipeline::Baseline, Pipeline::Native] {
             let mut config = build_extraction_config(pipeline);
             materialize_implicit_ocr_config(&mut config);
             apply_fixture_ocr_language(&mut config, &doc);
@@ -2789,7 +2926,7 @@ mod tests {
             contracts: vec![GuardrailContract {
                 doc: "681693".to_string(),
                 file_type: Some("pdf".to_string()),
-                pipeline: "pdf-oxide+layout+reading-order".to_string(),
+                pipeline: "native+layout+reading-order".to_string(),
                 min_sf1: Some(0.8),
                 min_tf1: None,
                 relative_order: reading_order_anchors(READING_ORDER_GUARDRAIL_DOC, READING_ORDER_GUARDRAIL_PIPELINE),
@@ -2800,7 +2937,7 @@ mod tests {
                 name: "681693".to_string(),
                 file_type: "pdf".to_string(),
                 results: vec![PipelineResult {
-                    pipeline: Pipeline::PdfOxideReadingOrder,
+                    pipeline: Pipeline::NativeReadingOrder,
                     sf1: 0.9,
                     tf1: 0.9,
                     char_similarity: 0.9,
@@ -2825,7 +2962,7 @@ mod tests {
         let failures = check_guardrails(&make_results(out_of_order), &config);
 
         assert_eq!(failures.len(), 1);
-        assert!(failures[0].starts_with("relative-order regression: 681693 [pdf] pdf-oxide+layout+reading-order"));
+        assert!(failures[0].starts_with("relative-order regression: 681693 [pdf] native+layout+reading-order"));
     }
 
     #[test]
@@ -3111,8 +3248,11 @@ mod tests {
             "layout+slanet-wireless",
             "layout+slanet-plus",
             "layout+slanet-auto",
-            "pdf-oxide",
-            "pdf-oxide+layout",
+            "native",
+            "native+layout",
+            "sceptre-ort",
+            "sceptre-ort+layout",
+            "sceptre-ort-autorotate",
             "candle-trocr",
             "candle-paddleocr-vl",
             "candle-glm-ocr",

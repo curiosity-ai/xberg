@@ -63,7 +63,11 @@ Official Docker images built on the Rust core with Debian 13 (Trixie). Each imag
 
 **Core** is optimized for production deployments where image size matters. Both images support all major formats — choose based on deployment constraints.
 
-All images include: Tesseract OCR (eng, spa, fra, deu, ita, por, chi-sim, chi-tra, jpn, ara, rus, hin), PDF (pdf_oxide), images, HTML, email, and archives.
+All images include: Tesseract OCR (eng, spa, fra, deu, ita, por, chi-sim, chi-tra, jpn, ara, rus, hin), PDF (xberg-native-pdf), images, HTML, email, and archives.
+
+:::note[CPU only]
+All published Docker images (Core, Full, and CLI) run ONNX Runtime on CPU. There is no published GPU/CUDA image. GPU acceleration is available, but requires building from source with the `cuda` feature against a CUDA-enabled ONNX Runtime — the prebuilt ORT binaries these images ship with do not include CUDA support. See [GPU Acceleration](/getting-started/installation/#gpu-acceleration).
+:::
 
 ## Execution Modes
 

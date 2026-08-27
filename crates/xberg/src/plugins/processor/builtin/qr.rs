@@ -154,11 +154,7 @@ fn append_payload_section(result: &mut ExtractedDocument, config: &ExtractionCon
     append_section(&mut result.content, &markdown_section(payloads));
 
     let renders_as_text = match config.output_format {
-        OutputFormat::Plain
-        | OutputFormat::Markdown
-        | OutputFormat::Djot
-        | OutputFormat::Html
-        | OutputFormat::Structured => true,
+        OutputFormat::Plain | OutputFormat::Markdown | OutputFormat::Djot | OutputFormat::Html => true,
         // DocTags joins Json/Custom rather than the text formats above: its output is a tag
         // stream with no free-text position, so appending an untagged payload section would
         // emit content outside any element and stop the document round-tripping.

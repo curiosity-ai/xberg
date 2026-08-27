@@ -4,6 +4,7 @@
 FROM alpine:3.21 AS builder
 
 ARG RUST_TOOLCHAIN=nightly-2026-03-10
+ARG PDFIUM_VERSION=7881
 
 WORKDIR /build
 
@@ -30,9 +31,24 @@ ENV RUSTFLAGS="-C target-feature=-crt-static"
 ENV ORT_LIB_LOCATION=/usr/lib
 ENV ORT_PREFER_DYNAMIC_LINK=1
 
+# Download pdfium (musl build). bblanchon/pdfium-binaries is the only source for a
+# musl-linked libpdfium.so -- chromium-browser-snapshots (the mirror used below for
+# the glibc images) does not publish musl artifacts, so this is single-source with
+# retries rather than a fallback mirror. The library is loaded at RUNTIME via
+# PDFIUM_DYNAMIC_LIB_PATH (crates/xberg/src/extractors/pdf/pdfium_engine.rs), not
+# linked at build time, so nothing else here needs to reference it.
+RUN mkdir -p /build/pdfium && \
+    ARCH=$(uname -m) && \
+    if [ "$ARCH" = "aarch64" ]; then PDFIUM_ARCH="arm64"; else PDFIUM_ARCH="x64"; fi && \
+    curl -fL --retry 5 --retry-delay 2 --retry-max-time 180 --retry-all-errors \
+        "https://github.com/bblanchon/pdfium-binaries/releases/download/chromium/${PDFIUM_VERSION}/pdfium-linux-musl-${PDFIUM_ARCH}.tgz" \
+        -o /build/pdfium.tgz && \
+    tar -xzf /build/pdfium.tgz -C /build/pdfium && \
+    rm /build/pdfium.tgz && \
+    strip --strip-unneeded /build/pdfium/lib/libpdfium.so
+
 COPY Cargo.toml Cargo.lock ./
 COPY crates/xberg/ crates/xberg/
-COPY crates/ttf-parser-compat/ crates/ttf-parser-compat/
 COPY crates/xberg-gliner/ crates/xberg-gliner/
 COPY crates/xberg-cli/ crates/xberg-cli/
 COPY crates/xberg-libheif/ crates/xberg-libheif/
@@ -40,8 +56,10 @@ COPY crates/xberg-libwpd/ crates/xberg-libwpd/
 COPY crates/xberg-tesseract/ crates/xberg-tesseract/
 COPY crates/xberg-paddle-ocr/ crates/xberg-paddle-ocr/
 COPY crates/xberg-candle-ocr/ crates/xberg-candle-ocr/
+COPY crates/xberg-pdfium-render/ crates/xberg-pdfium-render/
+COPY crates/xberg-native-pdf/ crates/xberg-native-pdf/
 
-RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-ffi/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /\"crates\/xberg-wasm\"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /snippet-runner/d; /e2e\/rust/d' Cargo.toml
+RUN sed -i '/xberg-py/d; /xberg_rb/d; /xberg-node/d; /xberg-ffi/d; /xberg-jni/d; /xberg-php/d; /xberg-rag/d; /xberg_rustler/d; /xberg_nif/d; /packages\/dart\/rust/d; /packages\/swift\/rust/d; /\"crates\/xberg-wasm\"/d; /^\[profile\.release\.package\.xberg-wasm\]$/,$d; /benchmark-harness/d; /e2e-generator/d; /e2e\/rust/d' Cargo.toml
 
 RUN cargo build --release --package xberg-cli --features all && \
     cp target/release/xberg /build/xberg && \
@@ -53,18 +71,34 @@ RUN file /build/xberg && \
 
 FROM alpine:3.21
 
+# Alpine's `onnxruntime` ships a 16.7 MB `onnx_test_runner` test harness, and pulls
+# `protoc` in transitively for its codegen executables. None of them are reachable at
+# runtime -- the CLI links `libonnxruntime.so` and `libprotoc.so`, not these binaries --
+# so they are deleted in the same layer as the install (a later `rm` would leave the
+# bytes in the lower layer and shrink nothing). Worth ~23 MB on amd64, measured. Do NOT
+# extend this to the libheif codecs: `libheif-x265`/`libheif-aom` back HEIC *encoding*,
+# which is a supported image output format (core/image_encode.rs). ~keep
 RUN apk add --no-cache libgcc && \
     apk add --no-cache \
         libstdc++ \
         onnxruntime \
         libheif libheif-libde265 libheif-aom libheif-dav1d libheif-x265 \
     --repository=https://dl-cdn.alpinelinux.org/alpine/edge/community \
-    --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main
+    --repository=https://dl-cdn.alpinelinux.org/alpine/edge/main && \
+    rm -f /usr/bin/onnx_test_runner /usr/bin/protoc /usr/bin/protoc-[0-9]* \
+          /usr/bin/protoc-gen-upb-* /usr/bin/protoc-gen-upbdefs-*
 
 COPY --from=builder /build/xberg /usr/local/bin/xberg
+COPY --from=builder /build/pdfium/lib/libpdfium.so /usr/local/lib/
 
 LABEL org.opencontainers.image.source="https://github.com/xberg-io/xberg"
 LABEL org.opencontainers.image.description="Xberg document intelligence - CLI variant"
 LABEL org.opencontainers.image.licenses="MIT"
+
+# Read at runtime by extract_core_pdfium's bind_once() -- see
+# crates/xberg/src/extractors/pdf/pdfium_engine.rs. Set explicitly rather than
+# relying on musl's default dlopen search path, which is not guaranteed to
+# include /usr/local/lib.
+ENV PDFIUM_DYNAMIC_LIB_PATH=/usr/local/lib
 
 ENTRYPOINT ["xberg"]

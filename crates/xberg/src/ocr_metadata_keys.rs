@@ -25,3 +25,10 @@ pub(crate) const OCR_ORIENTATION_DEGREES_METADATA_KEY: &str = "orientation_degre
 pub(crate) const OCR_ORIENTATION_CONFIDENCE_METADATA_KEY: &str = "orientation_confidence";
 /// Set when the pipeline actually rotated the image before running OCR.
 pub(crate) const OCR_AUTO_ROTATED_METADATA_KEY: &str = "auto_rotated";
+/// Fraction of a page's dictionary-checkable words that Tesseract's own DAWG dictionary
+/// (`TesseractAPI::is_valid_word`) rejects as not-a-word. Tesseract-only: other backends
+/// never write this key, so consumers must treat its absence as "no evidence" rather than
+/// as `0.0` ("every word is valid"). See `dictionary_invalid_word_ratio` in
+/// `ocr::processor::execution` and `is_dictionary_invalid_noise` in `extractors::pdf::ocr`.
+pub(crate) const OCR_TESSERACT_DICT_INVALID_WORD_RATIO_METADATA_KEY: &str = "tesseract_dict_invalid_word_ratio";
+pub(crate) const OCR_IMAGE_PREPROCESSING_METADATA_KEY: &str = "image_preprocessing";

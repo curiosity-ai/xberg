@@ -7,10 +7,8 @@ async fn main() -> xberg::Result<()> {
         pdf_options: Some(PdfConfig {
             hierarchy: Some(HierarchyConfig {
                 enabled: true,
-                detection_threshold: Some(0.75),
-                ocr_coverage_threshold: Some(0.8),
-                min_level: Some(1),
-                max_level: Some(5),
+                k_clusters: 3,
+                include_bbox: true,
             }),
             ..Default::default()
         }),
@@ -18,7 +16,11 @@ async fn main() -> xberg::Result<()> {
     };
 
     let output = extract(ExtractInput::from_uri("document.pdf"), &config).await?;
-    println!("Hierarchy levels: {}", output.results[0].hierarchy.len());
+    for page in output.results[0].pages.iter().flatten() {
+        if let Some(hierarchy) = &page.hierarchy {
+            println!("Page {}: {} hierarchy blocks", page.page_number, hierarchy.block_count);
+        }
+    }
     Ok(())
 }
 ```

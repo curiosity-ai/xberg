@@ -1,9 +1,14 @@
-//! LLM client factory — converts xberg's LlmConfig to a liter-llm DefaultClient.
+//! LLM client factory — converts xberg's LlmConfig to a liter-llm ManagedClient.
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Arc;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::LazyLock;
 
-use liter_llm::client::{ClientConfig, DefaultClient};
+use ahash::AHashMap;
+use liter_llm::client::ClientConfig;
+use liter_llm::{LlmInFlightLimitConfig, ManagedClient};
+use parking_lot::RwLock;
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::core::config::CredentialProviderConfig;
@@ -385,6 +390,14 @@ fn validate_cache_backend(cache: &LlmCacheConfig) -> crate::Result<()> {
 ///   `"https://api.openai.com/v1/"` would join with a request path into a doubled
 ///   `//`.
 ///
+/// [`LlmConfig::max_concurrency`] is the one field that is not a straight copy: it maps
+/// onto liter-llm's [`LlmInFlightLimitConfig`] (`Some(max)` becomes
+/// `Some(LlmInFlightLimitConfig { max_in_flight: Some(max) })`, `None` stays `None`).
+/// liter-llm only installs the corresponding Tower in-flight-limit layer when the client
+/// is built as a [`ManagedClient`] — a plain `DefaultClient` has no Tower stack at all, so
+/// this field is silently inert unless the client is built through [`ManagedClient`] (see
+/// [`create_client`]).
+///
 /// `providers` is copied below purely for a lossless DTO-to-DTO conversion (see the
 /// dedicated test); liter-llm's own `into_client_builder` never reads it back off the
 /// value returned here — [`build_client_config`] instead registers each entry directly
@@ -411,6 +424,9 @@ fn to_liter_llm_config(config: &LlmConfig) -> liter_llm::client::LlmConfig {
         cache: config.cache.as_deref().map(to_liter_llm_cache),
         budget: config.budget.as_deref().map(to_liter_llm_budget),
         rate_limit: config.rate_limit.as_deref().map(to_liter_llm_rate_limit),
+        in_flight_limit: config.max_concurrency.map(|max| LlmInFlightLimitConfig {
+            max_in_flight: Some(max),
+        }),
         cost_tracking: config.cost_tracking,
         tracing: config.tracing,
         cooldown_secs: config.cooldown_secs,
@@ -485,7 +501,124 @@ fn apply_credential_provider(
     Ok(builder.credential_provider(provider))
 }
 
-/// Create a liter-llm [`DefaultClient`] from xberg's [`LlmConfig`].
+/// Build a fresh liter-llm [`ManagedClient`] from an already-resolved [`ClientConfig`].
+///
+/// Shared by [`cached_managed_client`] (the cache-miss path behind [`create_client`]) and
+/// [`create_client_with_credential_provider`] (which is never cached — see that function's
+/// docs). Building through [`ManagedClient`] rather than the plain `DefaultClient` is what
+/// makes [`LlmConfig::max_concurrency`] (mapped to `in_flight_limit` in
+/// [`to_liter_llm_config`]) actually take effect: `DefaultClient` has no Tower stack at
+/// all, so the same config field would be silently inert built the other way — see
+/// GH#1465.
+fn build_managed_client(config: &LlmConfig, client_config: ClientConfig) -> crate::Result<ManagedClient> {
+    ManagedClient::new(client_config, Some(&config.model)).map_err(|e| {
+        let msg = format!("Failed to build LLM client for model '{}': {e}", config.model);
+        crate::XbergError::Validation {
+            message: msg,
+            source: Some(Box::new(e)),
+        }
+    })
+}
+
+/// Process-wide cache of shared [`ManagedClient`]s, keyed by a digest of the [`LlmConfig`]
+/// that built them.
+///
+/// # Why a shared client (GH#1465)
+///
+/// [`LlmConfig::max_concurrency`] is meant to bound *provider* concurrency — e.g. "never
+/// have more than N requests in flight against this OpenAI account at once". A limiter
+/// attached to a client that is rebuilt on every call is not that: it is a per-call
+/// allowance, so N concurrent extractions each mint their own instance and their own
+/// semaphore, and aggregate provider concurrency stays unbounded — the opposite of what a
+/// provider limit is for (see the GH#1465 issue and #1453, which this replaces). Caching
+/// by configuration identity means every caller that resolves to the same [`LlmConfig`]
+/// shares one [`ManagedClient`], and therefore one in-flight-request semaphore, making the
+/// bound global instead of per-extraction.
+///
+/// # The key is a digest, never the config
+///
+/// [`LlmConfig::api_key`] (and, via [`LlmConfig::credential_provider`], secrets nested in
+/// [`CredentialProviderConfig`]) must never become a map key, a log field, or anything
+/// `Debug`-printed (see this crate's secrets-handling conventions). [`config_digest`]
+/// stores only a 32-byte BLAKE3 digest of the JSON-serialized config here — a fixed-size,
+/// non-reversible fingerprint. Two configs that serialize identically collide onto the
+/// same cached client (the desired cache-hit behavior); nothing about the original secret
+/// is recoverable from the stored digest.
+///
+/// # Growth
+///
+/// A cache keyed on arbitrary caller-supplied config content has unbounded key
+/// cardinality in principle — e.g. a long-running server accepting a distinct per-request
+/// [`LlmConfig`] from untrusted callers. [`MAX_CACHED_LLM_CLIENTS`] caps the number of
+/// distinct clients held at once. Once full, a config that would need a new entry still
+/// gets a correctly-built, fully-functional client from [`cached_managed_client`] — it is
+/// simply not pooled, so that one call loses the cross-call sharing benefit instead of the
+/// process growing without bound. There is no eviction (no LRU) of existing entries: the
+/// cap is a ceiling on distinct configurations, not a size-managed cache, on the
+/// expectation that in-process usage exercises a small, mostly-static set of
+/// configurations (one per configured pipeline stage/feature), not one per request.
+///
+/// Shape matches the engine pools already established in this crate for other expensive,
+/// process-wide resources — see `candle_ocr::trocr_backend::ENGINE_POOL`.
+#[cfg(not(target_arch = "wasm32"))]
+static LLM_CLIENT_POOL: LazyLock<RwLock<AHashMap<[u8; 32], Arc<ManagedClient>>>> =
+    LazyLock::new(|| RwLock::new(AHashMap::new()));
+
+/// Ceiling on distinct cached LLM client configurations — see [`LLM_CLIENT_POOL`].
+#[cfg(not(target_arch = "wasm32"))]
+const MAX_CACHED_LLM_CLIENTS: usize = 256;
+
+/// Compute the [`LLM_CLIENT_POOL`] cache key for `config`: a BLAKE3 digest of its
+/// JSON serialization. Never log or otherwise expose this value's input — see
+/// [`LLM_CLIENT_POOL`]'s docs on why only the digest is stored.
+#[cfg(not(target_arch = "wasm32"))]
+fn config_digest(config: &LlmConfig) -> crate::Result<[u8; 32]> {
+    let serialized = serde_json::to_vec(config).map_err(|e| crate::XbergError::Validation {
+        message: format!("Failed to serialize LLM config for client-cache lookup: {e}"),
+        source: Some(Box::new(e)),
+    })?;
+    Ok(*blake3::hash(&serialized).as_bytes())
+}
+
+/// Return a cached [`ManagedClient`] for `config`, building and pooling one on first use.
+///
+/// Uses a read -> miss -> build -> write -> double-check pattern (matching
+/// `candle_ocr::trocr_backend::get_or_init_engine`) so that two racing callers with the
+/// same config do not both pay the client-construction cost, and so that only one of the
+/// two ends up in the pool. See [`LLM_CLIENT_POOL`] for the key derivation, sharing
+/// rationale, and growth bound.
+#[cfg(not(target_arch = "wasm32"))]
+fn cached_managed_client(config: &LlmConfig) -> crate::Result<Arc<ManagedClient>> {
+    let digest = config_digest(config)?;
+
+    {
+        let pool = LLM_CLIENT_POOL.read();
+        if let Some(client) = pool.get(&digest) {
+            return Ok(Arc::clone(client));
+        }
+    }
+
+    let client_config = build_client_config(config)?;
+    let client = Arc::new(build_managed_client(config, client_config)?);
+
+    let mut pool = LLM_CLIENT_POOL.write();
+    if let Some(existing) = pool.get(&digest) {
+        return Ok(Arc::clone(existing));
+    }
+    if pool.len() < MAX_CACHED_LLM_CLIENTS {
+        pool.insert(digest, Arc::clone(&client));
+    } else {
+        tracing::debug!(
+            cached = pool.len(),
+            limit = MAX_CACHED_LLM_CLIENTS,
+            "LLM client cache at capacity; built an unpooled client for this call"
+        );
+    }
+    Ok(client)
+}
+
+/// Create a shared, process-wide-cached liter-llm [`ManagedClient`] from xberg's
+/// [`LlmConfig`].
 ///
 /// The `model` field from the config is passed as a model hint so that
 /// liter-llm can resolve the correct provider automatically.
@@ -501,19 +634,17 @@ fn apply_credential_provider(
 /// is wrapped with the model that failed to build, so the resulting error names
 /// the operation (building the LLM client), the input (the model string), and
 /// (via the wrapped source) a concrete suggestion.
-pub(crate) fn create_client(config: &LlmConfig) -> crate::Result<DefaultClient> {
-    let client_config = build_client_config(config)?;
-
-    DefaultClient::new(client_config, Some(&config.model)).map_err(|e| {
-        let msg = format!("Failed to build LLM client for model '{}': {e}", config.model);
-        crate::XbergError::Validation {
-            message: msg,
-            source: Some(Box::new(e)),
-        }
-    })
+///
+/// Returns an `Arc` shared with every other caller that resolves to an identical
+/// [`LlmConfig`] (see [`cached_managed_client`]/[`LLM_CLIENT_POOL`]) — this, plus building
+/// through [`ManagedClient`] rather than `DefaultClient`, is what makes
+/// [`LlmConfig::max_concurrency`] a real, global provider-request bound instead of a
+/// per-call allowance (GH#1465).
+pub(crate) fn create_client(config: &LlmConfig) -> crate::Result<Arc<ManagedClient>> {
+    cached_managed_client(config)
 }
 
-/// Create a liter-llm [`DefaultClient`] from xberg's [`LlmConfig`], overriding any
+/// Create a liter-llm [`ManagedClient`] from xberg's [`LlmConfig`], overriding any
 /// [`LlmConfig::credential_provider`] with an explicit, caller-supplied provider.
 ///
 /// This is the escape hatch for authentication modes [`CredentialProviderConfig`] cannot
@@ -522,33 +653,33 @@ pub(crate) fn create_client(config: &LlmConfig) -> crate::Result<DefaultClient> 
 /// [`liter_llm::auth::CredentialProvider`] implementation. Building `provider` requires the
 /// caller to depend on `liter-llm` directly; xberg does not re-export its auth types.
 ///
+/// Deliberately **not** cached through [`LLM_CLIENT_POOL`]: the cache key is a digest of
+/// the serializable [`LlmConfig`], and `provider` (an `Arc<dyn CredentialProvider>`) is not
+/// part of that — nor of any other serializable identity this function has access to. Two
+/// callers passing the same `config` with two different `provider`s must never be handed
+/// the same client, so every call here builds a fresh, unpooled [`ManagedClient`] instead.
+/// It is still built through [`ManagedClient`] (via [`build_managed_client`]), so
+/// [`LlmConfig::max_concurrency`] still takes effect per client built this way — it simply
+/// is not shared across calls the way [`create_client`]'s cached client is.
+///
 /// Not available on wasm32: this function lives in `crate::llm::client`, which — like the rest
 /// of `crate::llm` — is compiled out on that target (see the crate-root `pub mod llm;` gate in
 /// `lib.rs`), because there is no native-http-backed `CredentialProvider` implementation to
 /// construct `provider` from there in the first place. [`LlmConfig::credential_provider`]
 /// itself still exists as a field on wasm32 (see that field's docs) — it is simply never read.
 ///
-/// `#[cfg_attr(alef, alef(skip))]`: `Arc<dyn liter_llm::auth::CredentialProvider>` is a trait
-/// object with no FFI-representable equivalent — alef's own `lossy_sanitized_surface` check
-/// rejects it outright rather than silently degrading the parameter to a `String`, matching
-/// every other binding-unreachable LLM entry point in this crate (e.g.
-/// `llm::text_completion::complete_text`, `llm::structured::complete_with_json_schema`).
+/// This Rust-only function accepts a liter-llm trait object and is not exposed
+/// through language bindings.
 #[cfg(not(target_arch = "wasm32"))]
 #[cfg_attr(alef, alef(skip))]
 pub fn create_client_with_credential_provider(
     config: &LlmConfig,
     provider: Arc<dyn liter_llm::auth::CredentialProvider>,
-) -> crate::Result<DefaultClient> {
+) -> crate::Result<ManagedClient> {
     let mut client_config = build_client_config(config)?;
     client_config.credential_provider = Some(provider);
 
-    DefaultClient::new(client_config, Some(&config.model)).map_err(|e| {
-        let msg = format!("Failed to build LLM client for model '{}': {e}", config.model);
-        crate::XbergError::Validation {
-            message: msg,
-            source: Some(Box::new(e)),
-        }
-    })
+    build_managed_client(config, client_config)
 }
 
 #[cfg(test)]
@@ -674,6 +805,57 @@ mod tests {
             Err(other) => panic!("expected a Validation error, got: {other}"),
             Ok(_) => panic!("expected create_client to reject the invalid header"),
         }
+    }
+
+    /// Regression test for GH#1465.
+    ///
+    /// A per-client in-flight-request limit is only a real *provider* concurrency bound if
+    /// every caller resolving to the same [`LlmConfig`] shares one client (and therefore
+    /// one semaphore). Before this fix, `create_client` built a fresh `DefaultClient` (no
+    /// Tower stack at all) on every call, so two calls with an identical config produced
+    /// two independent instances — this asserts they now produce the *same* instance.
+    #[test]
+    fn test_create_client_shares_one_instance_for_identical_config() {
+        let config = LlmConfig {
+            model: "openai/gpt-4o".to_string(),
+            api_key: Some("test-key-for-sharing-test".to_string()),
+            ..LlmConfig::default()
+        };
+
+        let first = create_client(&config).expect("build first client");
+        let second = create_client(&config).expect("build second client");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two create_client calls with an identical LlmConfig must return the same client \
+             instance so an in-flight-request limit is enforced globally, not per call"
+        );
+    }
+
+    /// Companion to [`test_create_client_shares_one_instance_for_identical_config`]: two
+    /// distinct configurations must never collide onto the same cached client — that would
+    /// leak one caller's client (and its credentials-derived provider auth) to a caller
+    /// with unrelated configuration.
+    #[test]
+    fn test_create_client_does_not_share_instance_across_different_configs() {
+        let config_a = LlmConfig {
+            model: "openai/gpt-4o".to_string(),
+            api_key: Some("test-key-a-for-sharing-test".to_string()),
+            ..LlmConfig::default()
+        };
+        let config_b = LlmConfig {
+            model: "openai/gpt-4o".to_string(),
+            api_key: Some("test-key-b-for-sharing-test".to_string()),
+            ..LlmConfig::default()
+        };
+
+        let client_a = create_client(&config_a).expect("build client for config a");
+        let client_b = create_client(&config_b).expect("build client for config b");
+
+        assert!(
+            !Arc::ptr_eq(&client_a, &client_b),
+            "create_client must not share a client instance across different LlmConfigs"
+        );
     }
 
     fn bedrock_model_config(bedrock: BedrockConfig) -> LlmConfig {
@@ -875,8 +1057,9 @@ mod tests {
         });
         config.headers = Some(headers);
 
-        // Not `expect_err`: that needs `T: Debug` and liter-llm's `DefaultClient` does not
-        // implement it, so the success arm has to be discarded by hand.
+        // Not `expect_err`: that needs `T: Debug` and liter-llm's `ManagedClient` (returned
+        // wrapped in `Arc` by `create_client`) does not implement it, so the success arm has
+        // to be discarded by hand.
         let Err(err) = create_client(&config) else {
             panic!("invalid header must reject the request");
         };
@@ -1141,6 +1324,32 @@ mod tests {
             Err(other) => panic!("expected a Validation error, got: {other}"),
             Ok(_) => panic!("expected build_client_config to reject the invalid header"),
         }
+    }
+
+    /// Regression test for GH#1465.
+    ///
+    /// `LlmConfig::max_concurrency` must map onto liter-llm's `in_flight_limit` — the field
+    /// `into_client_builder` wires onto a Tower in-flight-request-limit layer when the
+    /// client is built through `ManagedClient` (see `build_managed_client`'s docs). `None`
+    /// must stay `None` (unlimited), never default to an artificial limit.
+    #[test]
+    fn test_to_liter_llm_config_maps_max_concurrency_to_in_flight_limit() {
+        let with_limit = LlmConfig {
+            model: "openai/gpt-4o".to_string(),
+            max_concurrency: Some(4),
+            ..LlmConfig::default()
+        };
+        assert_eq!(
+            to_liter_llm_config(&with_limit).in_flight_limit,
+            Some(LlmInFlightLimitConfig { max_in_flight: Some(4) })
+        );
+
+        let without_limit = LlmConfig {
+            model: "openai/gpt-4o".to_string(),
+            max_concurrency: None,
+            ..LlmConfig::default()
+        };
+        assert_eq!(to_liter_llm_config(&without_limit).in_flight_limit, None);
     }
 
     /// `providers` has no equivalent field on liter-llm's `ClientConfig` at all —

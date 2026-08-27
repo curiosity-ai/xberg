@@ -1,17 +1,18 @@
 ```typescript title="TypeScript"
-import { extract } from '@xberg-io/xberg';
+import { ExtractInputKind, NerBackendKind, extract } from '@xberg-io/xberg';
 
 const output = await extract({
-    kind: "uri",
+    kind: ExtractInputKind.Uri,
     uri: "contract.pdf",
 }, {
     ner: {
-        backend: "llm",
+        backend: NerBackendKind.Llm,
         llm: { model: "openai/gpt-4o-mini" },
     },
 });
 
-for (const entity of output.results[0].entities ?? []) {
+const [first] = output.results ?? [];
+for (const entity of first?.entities ?? []) {
     console.log(`${entity.category}: ${entity.text}`);
 }
 ```

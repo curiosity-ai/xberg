@@ -98,7 +98,7 @@ fn make_pdf_with_default_off_layer() -> Vec<u8> {
 /// in extracted content — it is invisible in every PDF viewer that honors
 /// `/OCProperties/D/OFF`, and surfacing it produces phantom/duplicate text
 /// for the common "redline layer" / "print vs. screen variant" authoring
-/// pattern the pdf_oxide `optional_content` module docs call out.
+/// pattern the xberg_native_pdf `optional_content` module docs call out.
 #[test]
 fn test_default_off_ocg_layer_excluded_from_extracted_text() {
     let pdf = make_pdf_with_default_off_layer();

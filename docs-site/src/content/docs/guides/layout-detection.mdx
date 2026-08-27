@@ -40,7 +40,7 @@ no default build profile, so it needs a build with `--features formula-recogniti
 | Baseline | 33.9%        | 87.4%   | 447 ms       |
 | Layout   | 41.1%        | 90.1%   | 1500 ms      |
 
-_171-document PDF corpus, CPU only. GPU acceleration significantly reduces the time penalty._
+*171-document PDF corpus, CPU only. GPU acceleration significantly reduces the time penalty.*
 
 :::note[Layout Detection Model]
 Xberg uses only the RT-DETR v2 model for layout detection. The `preset` field is not available in `LayoutDetectionConfig`. Configure table structure recognition separately via `table_model` — see "Table Structure Models" below.
@@ -142,6 +142,16 @@ See [LayoutDetectionConfig](/reference/configuration/#layoutdetectionconfig) for
 `use_layout_for_markdown` feeds detected regions into the non-OCR PDF markdown pipeline to drive heading, table, list, and figure detection that would otherwise rely on font-clustering heuristics alone. It is a top-level `ExtractionConfig` field — set it alongside `layout`, not inside `LayoutDetectionConfig`.
 
 Enabling it improves structural F1 at the cost of inference latency (~150-300 ms/page CPU, ~20-50 ms/page GPU). Default: `false`. Requires the `layout-detection` feature and a set `layout` config; it is skipped when `force_ocr` is enabled. On the CLI, pass `--use-layout-for-markdown`.
+
+### Layout Detection and Output Format
+
+Layout detection is a *structure signal*, not an output format: it feeds the same heading, table,
+list, and figure classification that the font-clustering heuristic produces, and both are discarded
+when `output_format` is `Plain` (the default), because `Plain` emits raw text with no structural
+markup to carry the result. Pair layout detection with a structured `output_format` — `Markdown`,
+`Djot`, `Html`, or `DocTags` — or the inference cost of running the model is spent for no visible
+effect on `content`. `output_format` and `layout` are independent config fields; enabling one does
+not change the other's default.
 
 ## Page Selection Strategy
 

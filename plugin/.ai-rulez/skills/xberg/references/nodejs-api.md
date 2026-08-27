@@ -122,7 +122,7 @@ interface ExtractionConfig {
 
   // Output control
   maxConcurrentExtractions?: number;
-  outputFormat?: "plain" | "markdown" | "djot" | "html"; // default: 'plain'
+  outputFormat?: "plain" | "markdown" | "djot" | "html" | "json" | "doctags" | string; // default: 'plain'
   resultFormat?: "unified" | "element_based"; // default: 'unified'
   securityLimits?: SecurityLimits;
 }
@@ -150,7 +150,6 @@ interface ChunkingConfig {
   maxCharacters?: number; // max characters per chunk
   overlap?: number; // overlap between chunks
   chunkerType?: "text" | "markdown" | "semantic";
-  prependHeadingContext?: boolean; // markdown chunker: prefix heading breadcrumb
   embedding?: { model?: { type: "preset"; name: string } } | Record<string, unknown>; // embedding config
   preset?: string; // named preset
 }
@@ -466,4 +465,4 @@ console.log(listSupportedFormats());
 
 ## Supported Document Formats
 
-Xberg supports 96 file formats: PDF, Office (DOCX, PPTX, XLSX, …), eBooks, images (with OCR), HTML/XML/SVG, email (EML, MSG), archives, data (JSON/YAML/TOML/CSV), academic, and source code (371 languages). See [supported-formats.md](supported-formats.md) for the complete list.
+Xberg supports 100 formats across 120 file extensions: PDF, Office, eBooks, images, HTML/XML/SVG, email, archives, structured data, academic formats, and source code. See [supported-formats.md](supported-formats.md) for the complete list.

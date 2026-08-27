@@ -277,7 +277,7 @@ impl LayoutDetection {
     }
 
     /// Deprecated: use the `class_name` field directly.
-    #[deprecated(since = "4.10.0", note = "Use `class_name` field instead")]
+    #[deprecated(since = "1.1.0", note = "Use `class_name` field instead")]
     pub fn class(&self) -> LayoutClass {
         self.class_name
     }
@@ -349,12 +349,18 @@ mod clamp_tests {
 
     #[test]
     fn interior_box_rounds_to_pixels() {
-        assert_eq!(bbox(10.2, 5.7, 20.1, 15.3).clamp_to_image(100, 50), Some((10, 5, 11, 11)));
+        assert_eq!(
+            bbox(10.2, 5.7, 20.1, 15.3).clamp_to_image(100, 50),
+            Some((10, 5, 11, 11))
+        );
     }
 
     #[test]
     fn negative_and_oversized_coordinates_clamp() {
-        assert_eq!(bbox(-8.0, -3.0, 400.0, 400.0).clamp_to_image(100, 50), Some((0, 0, 100, 50)));
+        assert_eq!(
+            bbox(-8.0, -3.0, 400.0, 400.0).clamp_to_image(100, 50),
+            Some((0, 0, 100, 50))
+        );
     }
 
     #[test]

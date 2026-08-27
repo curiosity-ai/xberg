@@ -204,7 +204,7 @@ fn parse_j2k_siz(bytes: &[u8]) -> Result<ExtractedImageMetadata> {
 /// Pure Rust, memory-safe decoder. No temp files needed.
 #[cfg(feature = "ocr")]
 pub(crate) fn decode_jp2_to_rgb(bytes: &[u8]) -> Result<image::RgbImage> {
-    use hayro_jpeg2000::{DecodeSettings, Image as Jp2Image};
+    use hayro_jpeg2000::{DecodeSettings, DecoderContext, Image as Jp2Image};
 
     let jp2 = Jp2Image::new(bytes, &DecodeSettings::default())
         .map_err(|e| XbergError::parsing(format!("JP2 decode failed: {}", e)))?;
@@ -212,9 +212,15 @@ pub(crate) fn decode_jp2_to_rgb(bytes: &[u8]) -> Result<image::RgbImage> {
     let height = jp2.height();
     let has_alpha = jp2.has_alpha();
     let num_channels = jp2.color_space().num_channels();
+    // hayro-jpeg2000 0.4 threads a caller-owned `DecoderContext` through `decode` so the
+    // sample buffers can be reused across images, and returns a borrowing `DecodedImage`
+    // rather than the interleaved `Vec<u8>` 0.3 handed back. `data_u8` is that same
+    // interleaved unsigned-8-bit view, so everything below is unchanged.
+    let mut decoder_context = DecoderContext::default();
     let pixels = jp2
-        .decode()
-        .map_err(|e| XbergError::parsing(format!("JP2 pixel decode failed: {}", e)))?;
+        .decode(&mut decoder_context)
+        .map_err(|e| XbergError::parsing(format!("JP2 pixel decode failed: {}", e)))?
+        .data_u8();
 
     let rgb_bytes = match (num_channels, has_alpha) {
         (1, false) => {
@@ -428,7 +434,7 @@ pub struct ImageOcrResult {
 /// # Returns
 /// Frame count if valid TIFF, error otherwise.
 #[cfg(feature = "ocr")]
-fn detect_tiff_frame_count(bytes: &[u8]) -> Result<usize> {
+pub(crate) fn detect_tiff_frame_count(bytes: &[u8]) -> Result<usize> {
     use tiff::decoder::Decoder;
     let mut decoder =
         Decoder::new(Cursor::new(bytes)).map_err(|e| XbergError::parsing(format!("TIFF decode: {}", e)))?;
@@ -513,6 +519,7 @@ pub(crate) fn extract_text_from_image_with_ocr(
             content: frame_text.to_string(),
             tables: vec![],
             image_indices: vec![],
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: Some(crate::extraction::blank_detection::is_page_text_blank(frame_text)),
             layout_regions: None,

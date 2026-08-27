@@ -502,6 +502,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn test_registry_construction_does_not_eagerly_allocate_tesseract() {
         use crate::ocr::tesseract_backend::TesseractBackend;

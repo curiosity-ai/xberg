@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-#   ./scripts/install-system-pdfium-macos.sh                    # uses defaults: version=7529, prefix=/usr/local
-#   PDFIUM_VERSION=7530 ./scripts/install-system-pdfium-macos.sh
+#   ./scripts/install-system-pdfium-macos.sh                    # uses defaults: version=7881, prefix=/usr/local
+#   PDFIUM_VERSION=7763 ./scripts/install-system-pdfium-macos.sh
 
 set -euo pipefail
 
-readonly PDFIUM_VERSION="${PDFIUM_VERSION:-7578}"
+readonly PDFIUM_VERSION="${PDFIUM_VERSION:-7881}"
 readonly PREFIX="${PREFIX:-/usr/local}"
 
 readonly RED='\033[0;31m'

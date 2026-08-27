@@ -2,9 +2,7 @@
 //!
 //! The in-core default is [`DefaultModelProvider`], which delegates to
 //! [`LayoutModelManager`](crate::layout::LayoutModelManager) — the on-demand
-//! download/cache path xberg uses today. Alternative providers (a pre-warmed
-//! mirror, an air-gapped bundle) implement this trait and are injected via
-//! [`EngineBuilder::with_model_provider`](super::super::EngineBuilder::with_model_provider).
+//! download/cache path xberg uses today.
 //!
 //! Gated behind `layout-detection`: that is the feature under which the model
 //! manager (and the ORT/HF download stack it drives) exists.

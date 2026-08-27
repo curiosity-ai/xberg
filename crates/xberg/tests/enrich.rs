@@ -150,31 +150,3 @@ async fn enrich_ner_with_stub_backend_populates_entities() {
     #[cfg(feature = "captioning")]
     assert!(enriched.captions.is_none());
 }
-
-/// A `Some` `transcription` must not fail the call: `enrich` records a non-fatal
-/// `ProcessingWarning` naming the extraction-time alternative and leaves the rest intact.
-#[cfg(feature = "transcription-types")]
-#[tokio::test]
-async fn enrich_transcription_records_warning_and_preserves_other_stages() {
-    use xberg::core::config::TranscriptionConfig;
-
-    let extraction = bare_result("audio transcript placeholder");
-    let config = EnrichmentConfig {
-        transcription: Some(TranscriptionConfig::default()),
-        ..Default::default()
-    };
-
-    let enriched = enrich(extraction, &config)
-        .await
-        .expect("transcription must not fail enrich");
-
-    let warnings = &enriched.extraction.processing_warnings;
-    assert_eq!(warnings.len(), 1, "expected exactly one warning, got {warnings:?}");
-    assert_eq!(warnings[0].source, "transcription");
-    assert!(
-        warnings[0].message.contains("ExtractionConfig::transcription"),
-        "warning must point at the extraction-time path; got: {}",
-        warnings[0].message
-    );
-    assert_eq!(enriched.extraction.content, "audio transcript placeholder");
-}

@@ -1,21 +1,21 @@
+---
+language: typescript
+target: wasm
+---
+
 ```typescript title="Wasm"
-import { extract, getWasmCapabilities, initWasm } from "@xberg-io/xberg-wasm";
+import init, { extract } from "@xberg-io/xberg-wasm";
 
 async function extractDocuments(files: Uint8Array[], mimeTypes: string[]) {
-  const caps = getWasmCapabilities();
-  if (!caps.hasWasm) {
-    throw new Error("WebAssembly not supported");
-  }
-
-  await initWasm();
+  await init();
 
   const results = await Promise.all(
-    files.map((bytes, index) => extract({ kind: "bytes", bytes, mimeType: mimeTypes[index] })),
+    files.map((bytes, index) => extract({ kind: "bytes", bytes, mimeType: mimeTypes[index] }, undefined)),
   );
 
   return results.map((r) => ({
-    content: r.content,
-    pageCount: r.metadata?.pageCount,
+    content: r.results[0].content,
+    metadata: r.results[0].metadata,
   }));
 }
 

@@ -50,27 +50,58 @@ pub(crate) fn resolve_image_path(base_dir: &Path, image_ref: &str) -> Option<Pat
         return None;
     }
 
-    let joined = base_dir.join(path_str);
-    let normalized = normalize_path(&joined);
-
+    // Normalise `base_dir` first, then apply `path_str`'s components on top of it,
+    // refusing to pop past the boundary between the two. Joining the two into one string,
+    // normalising the result, and then prefix-checking against the normalised base (the
+    // previous approach) cannot tell "popped back to exactly the base" apart from "popped
+    // straight through the base and out the other side": when `base_dir` is empty (its
+    // normalised form has zero components -- the case for a bare filename with no
+    // directory, whose `Path::parent()` is `""`), an empty path is a prefix of every path,
+    // so `Path::starts_with` passed vacuously and a pure-".." reference like `"../x"`
+    // silently resolved to `"x"` instead of being rejected.
     let norm_base = normalize_path(base_dir);
-    if !normalized.starts_with(&norm_base) {
-        return None;
+    let mut components: Vec<std::path::Component<'_>> = norm_base.components().collect();
+    let base_len = components.len();
+
+    for component in Path::new(path_str).components() {
+        match component {
+            std::path::Component::ParentDir => {
+                if components.len() <= base_len {
+                    return None;
+                }
+                components.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => components.push(other),
+        }
     }
 
-    Some(normalized)
+    Some(components.iter().collect())
 }
 
 /// Read an image file and produce an `ExtractedImage`.
 ///
-/// Returns `None` if the file does not exist, is not a regular file,
-/// exceeds the size limit, or has an unrecognised extension.
-pub(crate) fn read_image_file(path: &Path, image_index: u32) -> Option<ExtractedImage> {
+/// Returns `None` if the file does not exist, is not a regular file, exceeds the size
+/// limit, has an unrecognised extension, or -- once the file is known to exist -- turns
+/// out to be a symlink that resolves outside `base_dir`.
+pub(crate) fn read_image_file(path: &Path, base_dir: &Path, image_index: u32) -> Option<ExtractedImage> {
     let meta = std::fs::metadata(path).ok()?;
     if !meta.is_file() {
         return None;
     }
     if meta.len() > MAX_IMAGE_SIZE {
+        return None;
+    }
+
+    // `resolve_image_path` validates only the *structural* safety of the path -- it never
+    // touches the filesystem, so it cannot see a symlink. Now that the file is confirmed to
+    // exist, canonicalise both the resolved path and the base directory and re-check
+    // containment: a symlink inside `base_dir` that points outside it (e.g. a `.png`-named
+    // link to `/etc/shadow`) would otherwise be followed by `fs::read` below, since
+    // `fs::metadata`/`fs::read` both follow symlinks by default.
+    let canonical_path = std::fs::canonicalize(path).ok()?;
+    let canonical_base = std::fs::canonicalize(base_dir).ok()?;
+    if !canonical_path.starts_with(&canonical_base) {
         return None;
     }
 
@@ -91,7 +122,7 @@ pub(crate) fn read_image_file(path: &Path, image_index: u32) -> Option<Extracted
         _ => return None,
     };
 
-    let data = std::fs::read(path).ok()?;
+    let data = std::fs::read(&canonical_path).ok()?;
     let source_path = path.to_string_lossy().into_owned();
 
     Some(ExtractedImage {
@@ -139,7 +170,7 @@ pub(crate) fn resolve_image_uris(doc: &mut InternalDocument, base_dir: &Path, co
 
     for idx in image_uri_indices {
         if let Some(resolved) = resolve_image_path(base_dir, &doc.uris[idx].url)
-            && let Some(img) = read_image_file(&resolved, image_index)
+            && let Some(img) = read_image_file(&resolved, base_dir, image_index)
         {
             doc.images.push(img);
             image_index += 1;
@@ -270,5 +301,93 @@ mod tests {
     fn test_reject_windows_absolute() {
         let base = Path::new("/home/user/docs");
         assert_eq!(resolve_image_path(base, "C:\\Windows\\img.png"), None);
+    }
+
+    // Hardening: `base_dir` can legitimately be empty. `Path::parent()` on a bare filename
+    // with no directory component (e.g. extracting from `"file.md"` in the current
+    // directory) returns `Some("")`. The previous algorithm normalised the fully joined
+    // path and prefix-checked it against the normalised (empty) base; an empty path is a
+    // prefix of every path, so the check passed vacuously and `"../x"` silently resolved to
+    // `"x"` instead of being rejected. These pin the fix; the first test fails against the
+    // unfixed code (it returns `Some("etc/passwd")` there instead of `None`).
+
+    #[test]
+    fn test_empty_base_dir_rejects_pure_parent_traversal() {
+        let base = Path::new("");
+        assert_eq!(resolve_image_path(base, "../etc/passwd"), None);
+    }
+
+    #[test]
+    fn test_empty_base_dir_still_resolves_a_benign_relative_path() {
+        let base = Path::new("");
+        assert_eq!(
+            resolve_image_path(base, "images/photo.png"),
+            Some(PathBuf::from("images/photo.png"))
+        );
+    }
+
+    #[test]
+    fn test_trailing_parent_resolves_back_to_the_base_directory() {
+        let base = Path::new("/home/user/docs");
+        assert_eq!(
+            resolve_image_path(base, "sub/.."),
+            Some(PathBuf::from("/home/user/docs"))
+        );
+    }
+
+    // Hardening: `resolve_image_path` only validates path *structure*, never touching the
+    // filesystem, so it cannot see a symlink. `read_image_file` now re-checks containment
+    // via `canonicalize` once the file is confirmed to exist. Unix-only: creating a symlink
+    // on Windows needs elevated privileges the CI runner may not have, and the bug being
+    // fixed is not platform-specific in a way that requires a Windows-side regression here.
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_escaping_base_dir_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = std::env::temp_dir().join(format!("xberg_path_resolver_symlink_escape_{}", std::process::id()));
+        let base_dir = tmp.join("docs");
+        std::fs::create_dir_all(&base_dir).unwrap();
+
+        let outside_target = tmp.join("secret.png");
+        std::fs::write(&outside_target, b"outside").unwrap();
+
+        let link_path = base_dir.join("photo.png");
+        symlink(&outside_target, &link_path).unwrap();
+
+        let resolved = resolve_image_path(&base_dir, "photo.png").expect("structurally in-bounds");
+        assert_eq!(resolved, link_path);
+
+        let image = read_image_file(&resolved, &base_dir, 0);
+        assert!(
+            image.is_none(),
+            "a symlink resolving outside base_dir must be rejected once the file is known to exist"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_within_base_dir_still_resolves() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = std::env::temp_dir().join(format!("xberg_path_resolver_symlink_ok_{}", std::process::id()));
+        let base_dir = tmp.join("docs");
+        let sub_dir = base_dir.join("assets");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let real_target = sub_dir.join("real.png");
+        std::fs::write(&real_target, b"inside").unwrap();
+
+        let link_path = base_dir.join("photo.png");
+        symlink(&real_target, &link_path).unwrap();
+
+        let resolved = resolve_image_path(&base_dir, "photo.png").expect("structurally in-bounds");
+        let image = read_image_file(&resolved, &base_dir, 0).expect("a symlink resolving within base_dir must succeed");
+        assert_eq!(image.data.as_ref(), b"inside".as_slice());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

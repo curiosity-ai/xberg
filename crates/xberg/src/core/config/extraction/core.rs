@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use super::super::acceleration::AccelerationConfig;
 use super::super::content_filter::ContentFilterConfig;
 use super::super::formats::{JupyterCellRendering, OutputFormat};
+use super::super::llm::LlmConfig;
 use super::super::ocr::{OcrConfig, OcrStrategy};
 use super::super::page::PageConfig;
 use super::super::processing::{ChunkingConfig, PostProcessorConfig};
@@ -352,7 +353,6 @@ pub struct ExtractionConfig {
     /// combined document/inner-task budget for batch extraction. See
     /// [`crate::core::config::ConcurrencyConfig`] for details.
     #[serde(default)]
-    #[cfg_attr(alef, alef(skip))]
     pub concurrency: Option<super::super::concurrency::ConcurrencyConfig>,
 
     /// URL ingestion and crawl configuration.
@@ -431,15 +431,17 @@ pub struct ExtractionConfig {
     #[cfg_attr(feature = "alef-meta", alef(since = "1.0.0"))]
     pub qr_codes: Option<bool>,
 
-    /// Cancellation token for this extraction (None = no external cancellation).
+    /// Cooperative cancellation handle (`None` = no caller-initiated cancellation).
     ///
-    /// Pass a [`crate::cancellation::CancellationToken`] clone here and call its `cancel()`
-    /// from another thread / task to abort the extraction in progress. The extractor
-    /// checks the token at safe checkpoints (before lock acquisition, between pages,
-    /// between batch items) and returns [`crate::error::XbergError::Cancelled`] when set.
+    /// Rust callers may supply a [`crate::cancellation::CancellationToken`], retain a
+    /// clone, and call [`crate::cancellation::CancellationToken::cancel`] to request
+    /// that extraction stop at its next cancellation checkpoint. Cancellation is
+    /// cooperative rather than immediate, so latency depends on the extractor and
+    /// operation currently in progress.
     ///
-    /// The field is excluded from serialization because `CancellationToken` is a
-    /// runtime handle, not a configuration value.
+    /// Xberg also installs and uses cancellation tokens internally for extraction
+    /// timeouts and REST async jobs. This field remains excluded from serialization
+    /// and Alef-generated language bindings.
     #[serde(skip)]
     #[cfg_attr(alef, alef(skip))]
     pub cancel_token: Option<crate::cancellation::CancellationToken>,
@@ -589,6 +591,33 @@ impl ExtractionConfig {
         let mut resolved = layout.clone();
         resolved.acceleration = acceleration.cloned();
         Some(std::borrow::Cow::Owned(resolved))
+    }
+
+    /// Install an internal cancellation token when a timeout is configured but no
+    /// caller supplied one.
+    ///
+    /// `extraction_timeout_secs` fires `token.cancel()` at every timeout call site
+    /// (`core/extractor/{file,bytes,batch}.rs`, `engine/extract_impl.rs`). Binding-
+    /// driven and CLI-driven calls generally leave `cancel_token` as `None` unless
+    /// a Rust caller explicitly supplies one. Without this fallback, `token.cancel()`
+    /// has nothing to signal: the timeout stops *waiting* and returns
+    /// `XbergError::Timeout`, but spawned extraction work can continue running to
+    /// completion and consume a worker thread.
+    ///
+    /// A caller-supplied token is always left untouched, so Rust callers and the
+    /// REST cancellation path continue observing the same shared token.
+    ///
+    /// No-op when `extraction_timeout_secs` is `None`: without an internal timeout
+    /// path there is no need to allocate a fallback token. Callers may still supply
+    /// their own token for explicit cancellation.
+    ///
+    /// Unconditional on target/feature: the token and its atomic operations are
+    /// available on every target, including wasm32. Timeout call sites remain gated
+    /// independently where runtime support requires it.
+    pub(crate) fn ensure_cancel_token(&mut self) {
+        if self.extraction_timeout_secs.is_some() && self.cancel_token.is_none() {
+            self.cancel_token = Some(crate::cancellation::CancellationToken::default());
+        }
     }
 
     /// Create a new `ExtractionConfig` by applying per-file overrides from a
@@ -800,23 +829,96 @@ impl ExtractionConfig {
         std::borrow::Cow::Borrowed(self)
     }
 
+    fn validate_nested_llm_configs(&self, validate: fn(&LlmConfig) -> crate::Result<()>) -> crate::Result<()> {
+        self.validate_ocr_llm_configs(validate)?;
+        self.validate_chunking_llm_config(validate)?;
+        self.validate_direct_llm_configs(validate)
+    }
+
+    fn validate_ocr_llm_configs(&self, validate: fn(&LlmConfig) -> crate::Result<()>) -> crate::Result<()> {
+        let Some(ocr) = self.ocr.as_ref() else {
+            return Ok(());
+        };
+        if let Some(llm) = ocr.vlm_config.as_ref() {
+            validate_nested_llm("ocr.vlm_config", llm, validate)?;
+        }
+        if let Some(pipeline) = ocr.pipeline.as_ref() {
+            for stage in &pipeline.stages {
+                if let Some(llm) = stage.vlm_config.as_ref() {
+                    validate_nested_llm("ocr.pipeline[].vlm_config", llm, validate)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_chunking_llm_config(&self, validate: fn(&LlmConfig) -> crate::Result<()>) -> crate::Result<()> {
+        let llm = self
+            .chunking
+            .as_ref()
+            .and_then(|chunking| chunking.embedding.as_ref())
+            .and_then(|embedding| match &embedding.model {
+                super::super::processing::EmbeddingModelType::Llm { llm } => Some(llm.as_ref()),
+                _ => None,
+            });
+        if let Some(llm) = llm {
+            validate_nested_llm("chunking.embedding.model.llm", llm, validate)?;
+        }
+        Ok(())
+    }
+
+    fn validate_direct_llm_configs(&self, validate: fn(&LlmConfig) -> crate::Result<()>) -> crate::Result<()> {
+        let configs = [
+            (
+                "structured_extraction.llm",
+                self.structured_extraction.as_ref().map(|config| &config.llm),
+            ),
+            ("ner.llm", self.ner.as_ref().and_then(|config| config.llm.as_ref())),
+            (
+                "summarization.llm",
+                self.summarization.as_ref().and_then(|config| config.llm.as_ref()),
+            ),
+            ("translation.llm", self.translation.as_ref().map(|config| &config.llm)),
+            (
+                "page_classification.llm",
+                self.page_classification.as_ref().map(|config| &config.llm),
+            ),
+            (
+                "chunk_classification.llm",
+                self.chunk_classification.as_ref().map(|config| &config.llm),
+            ),
+            ("captioning.llm", self.captioning.as_ref().map(|config| &config.llm)),
+        ];
+        for (path, llm) in configs {
+            if let Some(llm) = llm {
+                validate_nested_llm(path, llm, validate)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Validate the configuration, returning an error if any settings are invalid.
     ///
     /// Checks:
     /// - `ocr`: backend name, VLM backend/model requirements, language codes, and the
-    ///   `vlm_fallback` quality threshold (see [`OcrConfig::validate`]).
+    ///   `vlm_fallback` quality threshold.
     /// - `chunking`: `max_characters` is non-zero and `overlap` is smaller than it.
+    ///   `topic_threshold`, when set, is a finite `[0.0, 1.0]` value.
     /// - `token_reduction`: `mode` is one of the recognized reduction levels.
     /// - `images`: `target_dpi`, `min_dpi`, and `max_dpi` are all positive and within the
     ///   supported range.
     /// - `language_detection`: `min_confidence` is a `[0.0, 1.0]` value.
     /// - `csv`: `delimiter`, when set, is exactly one ASCII character.
+    /// - `keywords`: the n-gram range contains positive, ordered bounds and `min_score` is a
+    ///   finite `[0.0, 1.0]` value.
+    /// - `layout`: `confidence_threshold`, when set, is a finite `[0.0, 1.0]` value.
+    /// - `redaction`: custom terms are non-empty and custom patterns compile.
+    /// - `pdf_options`: hierarchy cluster counts and margin fractions are in their supported ranges.
+    /// - every nested LLM config: sampling ranges and target-specific authentication support.
     ///
-    /// Called automatically when a config is loaded from a file
-    /// ([`ExtractionConfig::from_file`] and friends) or built from a JSON override
-    /// (`crate::core::config::merge::merge_config_json`). A config assembled directly through
-    /// the typed Rust API or an FFI builder is **not** automatically validated — call this
-    /// method explicitly before use in that case.
+    /// Called automatically when a config is loaded from a file, built from a JSON override,
+    /// or passed to the public `extract` and `extract_batch` entry points. Call this method
+    /// explicitly before passing a typed config to lower-level processing APIs.
     ///
     /// # Errors
     ///
@@ -830,8 +932,25 @@ impl ExtractionConfig {
         if let Some(ref ocr) = self.ocr {
             ocr.validate()?;
         }
+        self.ocr_strategy.validate()?;
+
+        #[cfg(feature = "pdf")]
+        if let Some(ref pdf_options) = self.pdf_options {
+            pdf_options.validate()?;
+        }
+
+        self.validate_nested_llm_configs(LlmConfig::validate)?;
+
+        #[cfg(any(feature = "keywords-yake", feature = "keywords-rake"))]
+        if let Some(ref keywords) = self.keywords {
+            keywords.validate()?;
+        }
 
         if let Some(ref chunking) = self.chunking {
+            if let Some(topic_threshold) = chunking.topic_threshold {
+                validate_unit_interval("chunking.topic_threshold", topic_threshold)?;
+            }
+
             // Only meaningful when the raw fields are the ones that will be used. A `preset`
             // replaces both `max_characters` and `overlap` in `ChunkingConfig::resolve_preset`,
             // and both fields carry serde defaults, so validating them alongside a preset would
@@ -853,6 +972,17 @@ impl ExtractionConfig {
 
         if let Some(ref language_detection) = self.language_detection {
             validate_confidence(language_detection.min_confidence)?;
+        }
+
+        #[cfg(feature = "layout-types")]
+        if let Some(ref layout) = self.layout
+            && let Some(confidence_threshold) = layout.confidence_threshold
+        {
+            validate_unit_interval("layout.confidence_threshold", confidence_threshold)?;
+        }
+
+        if let Some(ref redaction) = self.redaction {
+            redaction.validate()?;
         }
 
         if let Some(ref csv) = self.csv
@@ -915,11 +1045,33 @@ impl ExtractionConfig {
     }
 }
 
+fn validate_unit_interval(field: &str, value: f32) -> crate::Result<()> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        return Ok(());
+    }
+
+    Err(crate::XbergError::validation(format!(
+        "{field} must be a finite value between 0.0 and 1.0, got {value}"
+    )))
+}
+
+fn validate_nested_llm(
+    path: &str,
+    llm: &LlmConfig,
+    validate: fn(&LlmConfig) -> crate::Result<()>,
+) -> crate::Result<()> {
+    validate(llm).map_err(|error| match error {
+        crate::XbergError::Validation { message, source } => crate::XbergError::Validation {
+            message: format!("{path}: {message}"),
+            source,
+        },
+        other => other,
+    })
+}
+
 fn default_true() -> bool {
     true
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -948,6 +1100,63 @@ mod tests {
         assert_eq!(config.ocr_strategy, OcrStrategy::ScannedPages { min_confidence: 0.7 });
     }
 
+    /// Regression test for task #709: without an internal fallback token, the
+    /// `token.cancel()` calls at every `extraction_timeout_secs` call site
+    /// (`core/extractor/{file,bytes,batch}.rs`, `engine/extract_impl.rs`) have nothing
+    /// to signal on calls that do not explicitly supply a token. A Rust caller or the
+    /// REST job store may provide one; other paths still require the internal fallback.
+    #[test]
+    fn ensure_cancel_token_installs_a_token_when_a_timeout_is_configured_and_none_was_supplied() {
+        let mut config = ExtractionConfig {
+            extraction_timeout_secs: Some(30),
+            cancel_token: None,
+            ..Default::default()
+        };
+        config.ensure_cancel_token();
+        assert!(
+            config.cancel_token.is_some(),
+            "a timeout without a caller-supplied token must get an internal fallback"
+        );
+    }
+
+    /// A caller-supplied token, whether retained by a Rust caller or the REST job
+    /// cancellation path, must survive unchanged. `ensure_cancel_token` must never
+    /// replace it with a different token or the retained handle would stop observing
+    /// the token extractors poll.
+    #[test]
+    fn ensure_cancel_token_preserves_a_caller_supplied_token() {
+        let supplied = crate::cancellation::CancellationToken::new();
+        let mut config = ExtractionConfig {
+            extraction_timeout_secs: Some(30),
+            cancel_token: Some(supplied.clone()),
+            ..Default::default()
+        };
+        config.ensure_cancel_token();
+
+        supplied.cancel();
+        assert!(
+            config.cancel_token.expect("token must still be present").is_cancelled(),
+            "ensure_cancel_token must keep the SAME token (a clone of the same Arc), not \
+             install an unrelated one that never observes the caller's cancel() call"
+        );
+    }
+
+    /// Without a configured timeout, no internal timeout path needs an automatically
+    /// installed token. A caller may still supply its own explicit cancellation token.
+    #[test]
+    fn ensure_cancel_token_is_a_noop_without_a_configured_timeout() {
+        let mut config = ExtractionConfig {
+            extraction_timeout_secs: None,
+            cancel_token: None,
+            ..Default::default()
+        };
+        config.ensure_cancel_token();
+        assert!(
+            config.cancel_token.is_none(),
+            "no timeout means no internal fallback token is needed"
+        );
+    }
+
     use super::*;
     #[cfg(all(feature = "pdf", feature = "layout-detection"))]
     use crate::core::config::{AccelerationConfig, ExecutionProviderType, LayoutDetectionConfig};
@@ -955,6 +1164,255 @@ mod tests {
         CaptioningConfig, LlmConfig, NerConfig, OcrConfig, PageClassificationConfig, RedactionConfig,
         SummarizationConfig, TranslationConfig,
     };
+
+    fn wasm_managed_llm_json() -> serde_json::Value {
+        serde_json::json!({
+            "model": "test/model",
+            "credential_provider": { "type": "vertex_adc" }
+        })
+    }
+
+    fn wasm_ocr_and_embedding_cases(llm: &serde_json::Value) -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "ocr.vlm_config",
+                serde_json::json!({ "ocr": { "vlm_config": llm.clone() } }),
+            ),
+            (
+                "ocr.pipeline[].vlm_config",
+                serde_json::json!({
+                    "ocr": { "pipeline": { "stages": [{ "backend": "vlm", "vlm_config": llm.clone() }] } }
+                }),
+            ),
+            (
+                "chunking.embedding.model.llm",
+                serde_json::json!({
+                    "chunking": { "embedding": { "model": { "type": "llm", "llm": llm.clone() } } }
+                }),
+            ),
+        ]
+    }
+
+    fn wasm_direct_llm_cases(llm: &serde_json::Value) -> Vec<(&'static str, serde_json::Value)> {
+        vec![
+            (
+                "structured_extraction.llm",
+                serde_json::json!({ "structured_extraction": { "schema": {}, "llm": llm.clone() } }),
+            ),
+            (
+                "ner.llm",
+                serde_json::json!({ "ner": { "backend": "llm", "llm": llm.clone() } }),
+            ),
+            (
+                "summarization.llm",
+                serde_json::json!({ "summarization": { "llm": llm.clone() } }),
+            ),
+            (
+                "translation.llm",
+                serde_json::json!({ "translation": { "target_lang": "de", "llm": llm.clone() } }),
+            ),
+            (
+                "page_classification.llm",
+                serde_json::json!({ "page_classification": { "labels": ["invoice"], "llm": llm.clone() } }),
+            ),
+            (
+                "chunk_classification.llm",
+                serde_json::json!({
+                    "chunk_classification": {
+                        "definitions": [{ "label": "invoice", "description": "An invoice" }],
+                        "llm": llm.clone()
+                    }
+                }),
+            ),
+            (
+                "captioning.llm",
+                serde_json::json!({ "captioning": { "llm": llm.clone() } }),
+            ),
+        ]
+    }
+
+    #[test]
+    fn should_reject_wasm_credential_provider_in_every_nested_llm_config() {
+        let llm = wasm_managed_llm_json();
+        let cases = wasm_ocr_and_embedding_cases(&llm)
+            .into_iter()
+            .chain(wasm_direct_llm_cases(&llm));
+
+        for (path, json) in cases {
+            let config: ExtractionConfig = serde_json::from_value(json).expect("nested config must deserialize");
+            let error = config
+                .validate_nested_llm_configs(LlmConfig::validate_for_wasm_target)
+                .expect_err("managed credential provider must be rejected for wasm");
+            assert!(error.to_string().contains(path), "missing path `{path}` in {error}");
+        }
+    }
+
+    #[test]
+    fn should_validate_nested_llm_configs_through_public_extraction_validation() {
+        let config: ExtractionConfig = serde_json::from_value(serde_json::json!({
+            "structured_extraction": {
+                "schema": {},
+                "llm": { "model": "test/model", "top_p": 2.0 }
+            }
+        }))
+        .expect("nested config must deserialize");
+
+        let error = config
+            .validate()
+            .expect_err("nested invalid LLM config must be rejected");
+        assert!(
+            error.to_string().contains("structured_extraction.llm"),
+            "nested validation error must identify its config path: {error}"
+        );
+    }
+
+    #[test]
+    fn should_reject_invalid_ocr_element_confidence_through_public_validation() {
+        for min_confidence in [-0.1, 1.1, f64::NAN, f64::INFINITY] {
+            let config = ExtractionConfig {
+                ocr: Some(crate::core::config::OcrConfig {
+                    element_config: Some(crate::types::OcrElementConfig {
+                        min_confidence,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let error = config
+                .validate()
+                .expect_err("top-level validation must reject invalid OCR element confidence");
+            assert!(
+                error.to_string().contains("ocr.element_config.min_confidence"),
+                "validation error must identify the invalid field: {error}"
+            );
+        }
+    }
+
+    #[cfg(any(feature = "keywords-yake", feature = "keywords-rake"))]
+    #[test]
+    fn should_reject_direct_invalid_nested_keyword_range() {
+        let config = ExtractionConfig {
+            keywords: Some(crate::keywords::KeywordConfig {
+                ngram_range: crate::keywords::NgramRange { min: 0, max: 3 },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("top-level validation must reject an invalid nested keyword range");
+        assert_eq!(
+            error.to_string(),
+            "Validation error: ngram range minimum must be at least 1, got 0"
+        );
+    }
+
+    #[cfg(any(feature = "keywords-yake", feature = "keywords-rake"))]
+    #[test]
+    fn should_reject_direct_invalid_nested_keyword_score() {
+        for min_score in [-0.1, 1.1, f32::NAN] {
+            let config = ExtractionConfig {
+                keywords: Some(crate::keywords::KeywordConfig {
+                    min_score,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let error = config
+                .validate()
+                .expect_err("top-level validation must reject an invalid nested keyword score");
+            assert!(
+                error.to_string().contains("keywords.min_score"),
+                "validation error must identify the invalid field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_invalid_semantic_topic_threshold() {
+        for topic_threshold in [-0.1, 1.1, f32::NAN] {
+            let config = ExtractionConfig {
+                chunking: Some(crate::core::config::ChunkingConfig {
+                    topic_threshold: Some(topic_threshold),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let error = config
+                .validate()
+                .expect_err("top-level validation must reject an invalid semantic threshold");
+            assert!(
+                error.to_string().contains("chunking.topic_threshold"),
+                "validation error must identify the invalid field: {error}"
+            );
+        }
+    }
+
+    #[cfg(feature = "layout-types")]
+    #[test]
+    fn should_reject_invalid_layout_confidence_threshold() {
+        for confidence_threshold in [-0.1, 1.1, f32::NAN] {
+            let config = ExtractionConfig {
+                layout: Some(crate::core::config::LayoutDetectionConfig {
+                    confidence_threshold: Some(confidence_threshold),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+
+            let error = config
+                .validate()
+                .expect_err("top-level validation must reject an invalid layout threshold");
+            assert!(
+                error.to_string().contains("layout.confidence_threshold"),
+                "validation error must identify the invalid field: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn should_reject_invalid_nested_redaction_pattern() {
+        let config = ExtractionConfig {
+            redaction: Some(RedactionConfig {
+                custom_patterns: vec![crate::core::config::RedactionPattern::labeled("broken", "(")],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("top-level validation must reject an invalid redaction pattern");
+        assert!(
+            error.to_string().contains("broken"),
+            "validation error must identify the invalid custom pattern: {error}"
+        );
+    }
+
+    #[cfg(feature = "pdf")]
+    #[test]
+    fn should_reject_invalid_nested_pdf_options() {
+        let config = ExtractionConfig {
+            pdf_options: Some(crate::core::config::PdfConfig {
+                top_margin_fraction: Some(f32::NAN),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let error = config
+            .validate()
+            .expect_err("top-level validation must reject invalid PDF options");
+        assert!(
+            error.to_string().contains("pdf_options.top_margin_fraction"),
+            "validation error must identify the invalid field: {error}"
+        );
+    }
 
     #[cfg(all(feature = "pdf", feature = "layout-detection"))]
     #[test]

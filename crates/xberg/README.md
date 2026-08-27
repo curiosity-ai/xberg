@@ -33,9 +33,10 @@ xberg = "1.1.0"
 tokio = { version = "1", features = ["rt", "macros"] }
 ```
 
-Xberg uses a pure-Rust PDF backend (`pdf_oxide`) — no PDFium, no system libraries, and no
-linking configuration required. For the full list of Cargo feature flags, see the
-[Xberg documentation](https://docs.xberg.io).
+Xberg's default PDF backend is pure Rust (`xberg_native_pdf`) — no PDFium, no system libraries, and
+no linking configuration required. An optional PDFium-based engine is available behind the
+`pdf-pdfium` feature; see [PDF Backends](#pdf-backends) below. For the full list of Cargo feature
+flags, see the [Xberg documentation](https://docs.xberg.io).
 
 ## System Requirements
 
@@ -134,6 +135,38 @@ async fn main() -> xberg::Result<()> {
     for table in &document.tables {
         println!("{}", table.markdown);
     }
+    Ok(())
+}
+```
+
+## PDF Backends
+
+Two PDF engines are available, selected via `PdfConfig::backend`:
+
+- `PdfBackend::Native` (default) — xberg's own pure-Rust engine (`crates/xberg-native-pdf`). Full
+  support: text, tables, images, metadata, annotations, form fields, hierarchy, layout-aware reading
+  order, and OCR fallback.
+- `PdfBackend::Pdfium` — Google's PDFium engine, requires the `pdf-pdfium` Cargo feature. Deliberately
+  narrower in scope than `Native`: page count, per-page plain text, and Info-dictionary metadata only
+  (see `extractors::pdf::pdfium_engine`'s module doc for the exact gap list). Selecting it without the
+  feature enabled is rejected with an error, not a silent fallback to `Native`.
+
+```rust
+use xberg::{extract, ExtractInput, ExtractionConfig, PdfBackend, PdfConfig};
+
+#[tokio::main]
+async fn main() -> xberg::Result<()> {
+    let config = ExtractionConfig {
+        pdf_options: Some(PdfConfig {
+            backend: PdfBackend::Pdfium, // requires the `pdf-pdfium` feature
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let output = extract(ExtractInput::from_uri("document.pdf"), &config).await?;
+    let document = &output.results[0];
+    println!("{}", document.content);
     Ok(())
 }
 ```
@@ -262,7 +295,7 @@ xberg = { version = "1.1.0", features = ["cli"] }
 
 ## PDF Support
 
-Xberg uses **pdf_oxide** — a pure-Rust PDF library with no system dependencies.
+Xberg uses **xberg_native_pdf** — a pure-Rust PDF library with no system dependencies.
 Enable PDF extraction with the `pdf` feature:
 
 ```toml

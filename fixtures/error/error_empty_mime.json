@@ -7,7 +7,7 @@
 		"title": "Handle an empty MIME type",
 		"description": "Show how an empty MIME type is rejected consistently.",
 		"presentation": {
-			"files": [{ "field": "/bytes", "path": "test_documents/text/plain.txt" }]
+			"files": [{ "field": "/bytes", "path": "text/plain.txt" }]
 		}
 	},
 	"tags": ["error", "input", "mime"],

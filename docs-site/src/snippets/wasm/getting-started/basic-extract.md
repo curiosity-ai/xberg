@@ -1,8 +1,13 @@
+---
+language: typescript
+target: wasm
+---
+
 ```typescript title="Wasm"
-import { ExtractInputKind, extract, initWasm } from "@xberg-io/xberg-wasm";
+import init, { WasmExtractInputKind, extract } from "@xberg-io/xberg-wasm";
 
 async function main() {
-  await initWasm();
+  await init();
 
   const buffer = await fetch("document.pdf").then((r) => r.arrayBuffer());
   const bytes = new Uint8Array(buffer);
@@ -12,7 +17,7 @@ async function main() {
     bytes,
     mimeType: "application/pdf",
     filename: "document.pdf",
-  });
+  }, undefined);
 
   console.log("Extracted content:");
   console.log(output.results[0].content);

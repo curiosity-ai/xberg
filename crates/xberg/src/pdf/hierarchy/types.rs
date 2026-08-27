@@ -16,7 +16,7 @@ pub struct TextBlock {
 
 /// Text segment data extracted from PDF.
 ///
-/// Backend-agnostic: populated by either the pdf_oxide or another extractor.
+/// Backend-agnostic: populated by either the xberg_native_pdf or another extractor.
 #[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Clone)]
 pub struct SegmentData {

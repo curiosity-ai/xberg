@@ -4,7 +4,6 @@ build/
 dist/
 .polylint/
 # Ad-hoc PDF/image debug binaries
-/check_pdf_oxide
 /check_*
 # Hand-authored WASM JS distribution files (intentionally committed)
 !crates/xberg-wasm/dist/index.js
@@ -64,6 +63,7 @@ crates/xberg-node/*.tgz
 !crates/xberg-node/*.dylib
 !crates/xberg-node/*.so
 !crates/xberg-node/*.dll
+libpdfium.a
 .wrangler/
 .pnpm-store/
 
@@ -79,6 +79,7 @@ packages/ruby/vendor/
 # PHP
 vendor/
 !crates/xberg-candle-ocr/src/vendor/
+!crates/xberg-native-pdf/src/vendor/
 !crates/xberg-libwpd/vendor/
 # The vendored WordPerfect source archives are committed on purpose; re-include
 # them past the global `*.tar.gz` rule above (a dir negation alone won't).
@@ -232,6 +233,9 @@ temp-test-*
 packages/csharp/test_html_debug.cs
 # CI renders this from runtime.json.template at publish time; template is the source of truth.
 packages/csharp/Xberg/runtime.json
+
+# Pdfium test artifacts
+crates/xberg-pdfium-render/*.jpg
 
 # AI / MCP / Agent config
 .claude/

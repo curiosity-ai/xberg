@@ -28,6 +28,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 
+/// The full set of extensions xberg's MIME table treats as interchangeable aliases of
+/// `extension`'s format — e.g. `jpg` and `jpeg`, or `dbk`/`docbook`/`docbook4`/`docbook5`.
+///
+/// Returns `None` when xberg's MIME table doesn't recognize `extension` at all, so callers can
+/// treat unrecognized extensions as "nothing to check" instead of a validation failure.
+pub(crate) fn canonical_extension_family(extension: &str) -> Option<Vec<String>> {
+    let probe_path = PathBuf::from(format!("probe.{extension}"));
+    let mime_type = xberg::core::mime::detect_mime_type(&probe_path, false).ok()?;
+    xberg::get_extensions_for_mime(&mime_type).ok()
+}
+
 pub(crate) fn is_split_sidecar(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -103,7 +114,8 @@ impl Fixture {
     ///
     /// Performs comprehensive validation including:
     /// - Path validation (relative paths only)
-    /// - File type validation (non-empty)
+    /// - File type validation (non-empty, and naming the same format as the document's
+    ///   extension per xberg's MIME alias table)
     /// - Ground truth validation:
     ///   - Relative path requirement
     ///   - Valid source type
@@ -117,6 +129,8 @@ impl Fixture {
                 reason: "file_type cannot be empty".to_string(),
             });
         }
+
+        Self::validate_file_type_matches_document(fixture_path, &self.file_type, &self.document)?;
 
         if let Some(language) = self.metadata.get("ocr_language") {
             let Some(language) = language.as_str() else {
@@ -195,6 +209,43 @@ impl Fixture {
         }
 
         Ok(())
+    }
+
+    /// Reject a `file_type` that names a format unrelated to the document's own extension.
+    ///
+    /// `file_type` need not literally equal the document's extension: this corpus deliberately
+    /// keeps documents under several MIME-legal extension aliases of the same format (for
+    /// example `docbook4`/`docbook5` documents labelled `"docbook"`, mirroring xberg's own
+    /// `dbk`/`docbook`/`docbook4`/`docbook5` alias group), and some of those normalized labels
+    /// are pinned by `guardrails.json`. What must never happen is `file_type` naming a
+    /// *different* format than the one the document's own extension resolves to — e.g. a
+    /// `.jpg` file labelled `"pdf"`, or (the bug this guards against) fourteen `.jpg` images
+    /// labelled `"jpeg"` while every other `.jpg` fixture in the corpus correctly says `"jpg"`.
+    /// Extensions xberg's MIME table doesn't recognize are skipped rather than rejected, so a
+    /// legitimately new format never gets blocked by this check.
+    fn validate_file_type_matches_document(fixture_path: &Path, file_type: &str, document: &Path) -> Result<()> {
+        let Some(document_extension) = document.extension().and_then(|ext| ext.to_str()) else {
+            return Ok(());
+        };
+        let file_type_lower = file_type.to_lowercase();
+        let document_extension_lower = document_extension.to_lowercase();
+        if file_type_lower == document_extension_lower {
+            return Ok(());
+        }
+        let Some(family) = canonical_extension_family(&document_extension_lower) else {
+            return Ok(());
+        };
+        if family.contains(&file_type_lower) {
+            return Ok(());
+        }
+        Err(Error::InvalidFixture {
+            path: fixture_path.to_path_buf(),
+            reason: format!(
+                "file_type '{file_type}' does not match document extension '.{document_extension}' and is not one \
+                 of its recognized aliases ({}); use one of these",
+                family.join(", ")
+            ),
+        })
     }
 
     /// Resolve a fixture-owned relative path without allowing it to escape its trust boundary.
@@ -575,6 +626,75 @@ mod tests {
             file_type: "pdf".to_string(),
             file_size: 1024,
             expected_frameworks: vec!["xberg".to_string()],
+            metadata: HashMap::new(),
+            ground_truth: None,
+        };
+
+        assert!(fixture.validate(Path::new("fixture.json")).is_ok());
+    }
+
+    #[test]
+    fn file_type_matching_the_document_extension_exactly_is_accepted() {
+        let fixture = Fixture {
+            document: PathBuf::from("simple.typ"),
+            file_type: "typ".to_string(),
+            file_size: 1024,
+            expected_frameworks: vec![],
+            metadata: HashMap::new(),
+            ground_truth: None,
+        };
+
+        assert!(fixture.validate(Path::new("fixture.json")).is_ok());
+    }
+
+    #[test]
+    fn file_type_naming_a_recognized_alias_of_the_document_extension_is_accepted() {
+        // The corpus deliberately normalizes docbook4/docbook5 documents to the umbrella
+        // "docbook" label (see fixtures/docbook_tables4.json), and xberg's MIME table lists
+        // dbk/docbook/docbook4/docbook5 as legal aliases of the same format. That normalization
+        // must keep working even though "docbook" isn't literally the document's extension.
+        let fixture = Fixture {
+            document: PathBuf::from("tables.docbook4"),
+            file_type: "docbook".to_string(),
+            file_size: 1024,
+            expected_frameworks: vec![],
+            metadata: HashMap::new(),
+            ground_truth: None,
+        };
+
+        assert!(fixture.validate(Path::new("fixture.json")).is_ok());
+    }
+
+    #[test]
+    fn file_type_naming_an_unrelated_format_is_rejected_with_the_recognized_aliases() {
+        let fixture = Fixture {
+            document: PathBuf::from("photo.jpg"),
+            file_type: "pdf".to_string(),
+            file_size: 1024,
+            expected_frameworks: vec![],
+            metadata: HashMap::new(),
+            ground_truth: None,
+        };
+
+        let error = fixture.validate(Path::new("fixture.json")).unwrap_err().to_string();
+        assert!(
+            error.contains("file_type 'pdf' does not match document extension '.jpg'"),
+            "{error}"
+        );
+        assert!(error.contains("jpg"), "{error}");
+        assert!(error.contains("jpeg"), "{error}");
+    }
+
+    #[test]
+    fn file_type_for_an_extension_unknown_to_the_mime_table_is_not_rejected() {
+        // Extensions xberg's MIME table has never heard of (a genuinely new or synthetic
+        // format) must not be blocked by this guard — only extensions the table *does*
+        // recognize, but recognizes as a different format, are rejected.
+        let fixture = Fixture {
+            document: PathBuf::from("data.totally-unknown-extension"),
+            file_type: "something-else".to_string(),
+            file_size: 1024,
+            expected_frameworks: vec![],
             metadata: HashMap::new(),
             ground_truth: None,
         };

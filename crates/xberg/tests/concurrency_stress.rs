@@ -35,7 +35,9 @@ use std::time::Duration;
 use tokio::time::timeout;
 
 mod helpers;
-use helpers::{BytesInput, extract_bytes_document, extract_bytes_documents};
+use helpers::extract_bytes_document;
+#[cfg(feature = "tokio-runtime")]
+use helpers::{BytesInput, extract_bytes_documents};
 
 fn trim_trailing_newlines(value: &str) -> &str {
     value.trim_end_matches(['\n', '\r'])
@@ -104,6 +106,9 @@ async fn test_concurrent_extractions_mixed_formats() {
 /// Test concurrent batch extractions.
 ///
 /// Validates that batch processing correctly handles parallelism internally.
+// Without Xberg's Tokio runtime feature, batch extraction uses the sequential
+// path and intentionally erases its future without Send, so it cannot be spawned.
+#[cfg(feature = "tokio-runtime")]
 #[tokio::test]
 async fn test_concurrent_batch_extractions() {
     let config = ExtractionConfig::default();

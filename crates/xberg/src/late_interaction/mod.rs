@@ -11,7 +11,6 @@
 //! (tokenization, marker insertion, query augmentation, per-token
 //! normalization) is in [`engine`].
 //!
-//! Since v5.0.0.
 
 use std::sync::LazyLock;
 
@@ -39,7 +38,6 @@ const DEFAULT_MODEL_FILE: &str = "onnx/model.onnx";
 /// storage keeps the type FFI-friendly across binding boundaries; use
 /// [`MultiVectorEmbedding::rows`] internally to iterate per-token slices.
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct MultiVectorEmbedding {
@@ -50,6 +48,55 @@ pub struct MultiVectorEmbedding {
     pub dim: u32,
     /// Flat row-major buffer, length `num_tokens * dim`.
     pub data: Vec<f32>,
+}
+
+#[cfg(all(test, feature = "late-interaction"))]
+mod engine_cache_key_tests {
+    use super::*;
+    use crate::core::config::acceleration::{AccelerationConfig, ExecutionProviderType};
+
+    fn key(
+        additional_files: &[String],
+        max_length: usize,
+        query_max_length: usize,
+        acceleration: &AccelerationConfig,
+    ) -> LateInteractionEngineCacheKey {
+        LateInteractionEngineCacheKey::new(
+            "owner/model",
+            "model.onnx",
+            additional_files,
+            "revision",
+            max_length,
+            query_max_length,
+            "cache-root".to_string(),
+            crate::onnx::OnnxAccelerationCacheKey::from_resolved(acceleration.provider.clone(), acceleration.device_id),
+        )
+    }
+
+    #[test]
+    fn engine_cache_reuses_equal_configs_and_isolates_distinct_configs() {
+        let cpu = AccelerationConfig {
+            provider: ExecutionProviderType::Cpu,
+            device_id: 0,
+        };
+        let cuda = AccelerationConfig {
+            provider: ExecutionProviderType::Cuda,
+            device_id: 1,
+        };
+        let files = vec!["config.json".to_string(), "weights.onnx.data".to_string()];
+        let reversed_files = vec!["weights.onnx.data".to_string(), "config.json".to_string()];
+        let original = key(&files, 512, 32, &cpu);
+        let equal = key(&files, 512, 32, &cpu);
+        let mut cache = AHashMap::new();
+        cache.insert(original, 7_u8);
+
+        assert_eq!(cache.get(&equal), Some(&7));
+        assert_eq!(cache.get(&key(&files, 1024, 32, &cpu)), None);
+        assert_eq!(cache.get(&key(&files, 512, 64, &cpu)), None);
+        assert_eq!(cache.get(&key(&files, 512, 32, &cuda)), None);
+        assert_eq!(cache.get(&key(&[], 512, 32, &cpu)), None);
+        assert_eq!(cache.get(&key(&reversed_files, 512, 32, &cpu)), None);
+    }
 }
 
 impl MultiVectorEmbedding {
@@ -64,7 +111,6 @@ impl MultiVectorEmbedding {
     /// chunk). Uses `checked_mul` so an overflowing `num_tokens * dim` is
     /// reported as malformed instead of wrapping.
     ///
-    /// Since v5.0.0.
     pub fn is_well_formed(&self) -> bool {
         (self.num_tokens as usize)
             .checked_mul(self.dim as usize)
@@ -86,7 +132,6 @@ impl MultiVectorEmbedding {
 
 /// Static metadata for a bundled ColBERT preset (WASM/Android-safe, no ORT).
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct LateInteractionPreset {
@@ -151,7 +196,6 @@ pub static LATE_INTERACTION_PRESETS: LazyLock<Vec<LateInteractionPreset>> = Lazy
 
 /// Look up a bundled ColBERT preset by exact name.
 ///
-/// Since v5.0.0.
 #[cfg(any(feature = "late-interaction-presets", feature = "late-interaction"))]
 #[cfg_attr(alef, alef(skip))]
 pub fn get_preset(name: &str) -> Option<LateInteractionPreset> {
@@ -160,7 +204,6 @@ pub fn get_preset(name: &str) -> Option<LateInteractionPreset> {
 
 /// List the names of all bundled ColBERT presets.
 ///
-/// Since v5.0.0.
 #[cfg(any(feature = "late-interaction-presets", feature = "late-interaction"))]
 #[cfg_attr(alef, alef(skip))]
 pub fn list_presets() -> Vec<String> {
@@ -170,7 +213,6 @@ pub fn list_presets() -> Vec<String> {
 /// A single document match returned by [`max_sim_rank`], with its position in
 /// the input and MaxSim score.
 ///
-/// Since v5.0.0.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct LateInteractionMatch {
@@ -191,7 +233,6 @@ pub struct LateInteractionMatch {
 ///
 /// Pure CPU primitive — available without ONNX Runtime.
 ///
-/// Since v5.0.0.
 #[cfg(any(feature = "late-interaction-presets", feature = "late-interaction"))]
 pub fn max_sim_score(query: &MultiVectorEmbedding, doc: &MultiVectorEmbedding) -> f64 {
     if query.dim != doc.dim
@@ -221,7 +262,6 @@ pub fn max_sim_score(query: &MultiVectorEmbedding, doc: &MultiVectorEmbedding) -
 ///
 /// Pure CPU primitive — available without ONNX Runtime.
 ///
-/// Since v5.0.0.
 #[cfg(any(feature = "late-interaction-presets", feature = "late-interaction"))]
 pub fn max_sim_rank(query: &MultiVectorEmbedding, docs: &[MultiVectorEmbedding]) -> Vec<LateInteractionMatch> {
     let mut results: Vec<LateInteractionMatch> = docs
@@ -241,7 +281,51 @@ pub fn max_sim_rank(query: &MultiVectorEmbedding, docs: &[MultiVectorEmbedding])
 type CachedEngine = Arc<LateInteractionEngine>;
 
 #[cfg(feature = "late-interaction")]
-static ENGINE_CACHE: LazyLock<RwLock<AHashMap<String, CachedEngine>>> = LazyLock::new(|| RwLock::new(AHashMap::new()));
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct LateInteractionEngineCacheKey {
+    repo_name: String,
+    model_file: String,
+    additional_files: Vec<String>,
+    revision: String,
+    max_length: usize,
+    query_max_length: usize,
+    cache_root: String,
+    acceleration: crate::onnx::OnnxAccelerationCacheKey,
+}
+
+#[cfg(feature = "late-interaction")]
+impl LateInteractionEngineCacheKey {
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "every argument is a distinct dimension of the cache key this constructor builds; \
+                  grouping any of them would just move the same fields behind another struct"
+    )]
+    fn new(
+        repo_name: &str,
+        model_file: &str,
+        additional_files: &[String],
+        revision: &str,
+        max_length: usize,
+        query_max_length: usize,
+        cache_root: String,
+        acceleration: crate::onnx::OnnxAccelerationCacheKey,
+    ) -> Self {
+        Self {
+            repo_name: repo_name.to_string(),
+            model_file: model_file.to_string(),
+            additional_files: additional_files.to_vec(),
+            revision: revision.to_string(),
+            max_length,
+            query_max_length,
+            cache_root,
+            acceleration,
+        }
+    }
+}
+
+#[cfg(feature = "late-interaction")]
+static ENGINE_CACHE: LazyLock<RwLock<AHashMap<LateInteractionEngineCacheKey, CachedEngine>>> =
+    LazyLock::new(|| RwLock::new(AHashMap::new()));
 
 /// Bounds concurrent blocking inference tasks spawned by [`embed_multi_vector_async`].
 #[cfg(all(feature = "late-interaction", feature = "tokio-runtime"))]
@@ -316,12 +400,15 @@ fn get_or_init_engine(
     accel: Option<crate::core::config::acceleration::AccelerationConfig>,
 ) -> crate::Result<Arc<LateInteractionEngine>> {
     let revision = (repo_name == "xberg-io/late-interaction-models").then_some(LATE_INTERACTION_REVISION);
-    let cache_key = crate::model_download::hf_cache_key(cache_dir.as_deref());
-    let engine_key = format!(
-        "{repo_name}_{model_file}_{}_{}_{}",
+    let engine_key = LateInteractionEngineCacheKey::new(
+        repo_name,
+        model_file,
+        additional_files,
         revision.unwrap_or("main"),
-        cache_key,
-        query_max_length
+        max_length,
+        query_max_length,
+        crate::model_download::hf_cache_key(cache_dir.as_deref()),
+        crate::onnx::OnnxAccelerationCacheKey::new(accel.as_ref()),
     );
 
     match ENGINE_CACHE.read() {
@@ -409,7 +496,6 @@ fn map_engine_err(e: engine::LateInteractionError) -> crate::XbergError {
 /// Returns an error if the model cannot be downloaded/loaded, if ONNX Runtime
 /// is unavailable, or if a `Plugin` model is selected (not yet supported).
 ///
-/// Since v5.0.0.
 #[cfg_attr(alef, alef(skip))]
 #[cfg(feature = "late-interaction")]
 pub fn embed_multi_vector<T: AsRef<str>>(
@@ -440,7 +526,6 @@ pub fn embed_multi_vector<T: AsRef<str>>(
 /// Async wrapper over [`embed_multi_vector`]: runs the blocking ONNX inference
 /// on a bounded blocking-task pool so it does not stall the async runtime.
 ///
-/// Since v5.0.0.
 #[cfg(all(feature = "late-interaction", feature = "tokio-runtime"))]
 #[cfg_attr(alef, alef(skip))]
 pub async fn embed_multi_vector_async(

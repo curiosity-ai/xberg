@@ -130,7 +130,9 @@ const MAX_MODEL_BYTES: u64 = 256 * 1024 * 1024;
 /// Windows replace fallback) is the layout model manager's `atomic_publish`.
 fn download_to_staging(url: &str, staging: &std::path::Path) -> Result<(), String> {
     let result = (|| {
-        let response = ureq::get(url).call().map_err(|e| format!("download {url} failed: {e}"))?;
+        let response = ureq::get(url)
+            .call()
+            .map_err(|e| format!("download {url} failed: {e}"))?;
         if response.status() != 200 {
             return Err(format!("download {url} failed: HTTP {}", response.status()));
         }

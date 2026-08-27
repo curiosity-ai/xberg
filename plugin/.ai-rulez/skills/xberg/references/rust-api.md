@@ -8,11 +8,11 @@ Complete API reference for the Xberg document extraction library in Rust. Xberg 
 cargo add xberg
 ```
 
-The crate version is `1.0.2`. Add it to `Cargo.toml`:
+The crate version is `1.1.0`. Add it to `Cargo.toml`:
 
 ```toml
 [dependencies]
-xberg = { version = "1.0.2", features = ["full"] }
+xberg = { version = "1.1.0", features = ["full"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
@@ -148,7 +148,7 @@ pub struct ExtractionConfig {
     pub postprocessor: Option<PostProcessorConfig>,
     pub max_concurrent_extractions: Option<usize>,
     pub result_format: ResultFormat,       // Unified | ElementBased
-    pub output_format: OutputFormat,       // Plain | Markdown | Djot | Html
+    pub output_format: OutputFormat,       // Plain | Markdown | Djot | Html | Json | DocTags | Custom
     pub security_limits: Option<SecurityLimits>,
     // ... additional optional fields
 }
@@ -203,7 +203,6 @@ pub struct ChunkingConfig {
     pub chunker_type: ChunkerType,  // Text | Markdown | Semantic
     pub embedding: Option<EmbeddingConfig>,
     pub preset: Option<String>,
-    pub prepend_heading_context: bool,
     // ...
 }
 ```
@@ -218,7 +217,6 @@ let config = ExtractionConfig {
         max_characters: 512,
         overlap: 50,
         chunker_type: ChunkerType::Markdown,
-        prepend_heading_context: true,
         ..Default::default()
     }),
     ..Default::default()
@@ -230,7 +228,7 @@ let config = ExtractionConfig {
 `ExtractionConfig::output_format` controls the `content` text format:
 
 ```rust
-pub enum OutputFormat { Plain, Markdown, Djot, Html, Json, Structured, Custom(String) }
+pub enum OutputFormat { Plain, Markdown, Djot, Html, Json, DocTags, Custom(String) }
 ```
 
 `ExtractionConfig::result_format` controls the result structure:
@@ -404,4 +402,4 @@ pub type Result<T> = std::result::Result<T, XbergError>;
 
 ## Version
 
-This reference targets Xberg `1.0.2`.
+This reference targets Xberg `1.1.0`.

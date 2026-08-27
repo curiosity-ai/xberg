@@ -112,8 +112,8 @@ This runs both linting and formatting checks. For language-specific tests:
 
 ```bash title="Terminal"
 task rust:test
-task python:test
-task node:test
+task python:e2e
+task node:e2e
 ```
 
 ### 5. Commit with conventional messages
@@ -123,13 +123,15 @@ We use [Conventional Commits](https://www.conventionalcommits.org/). The pre-com
 ```text
 feat: add PDF table extraction support
 fix: handle empty MIME type in archive entries
-docs: update Python API reference for v4.4
+docs: update Python extraction examples
 perf: parallelize layout inference
 ```
 
 ### 6. Update documentation
 
-When adding user-facing features, add or update pages under `docs/` and reference them in `zensical.toml`.
+When adding user-facing features, update pages under `docs-site/src/content/docs/` and add navigation
+entries in `docs-site/astro.config.mjs` when needed. Put reusable maintained examples under
+`docs-site/src/snippets/`; use fixture-backed Alef snippets for shared public APIs.
 
 ---
 
@@ -192,16 +194,19 @@ Don't worry about failing CI on your first PR. Maintainers will help you resolve
 
 ## CI/CD
 
-Xberg ships six GitHub Actions workflows under `.github/workflows/`. The first two run automatically on contributor PRs; the rest are manual or release-driven and contributors do not need to invoke them.
+Workflows under `.github/workflows/` are split by domain and use path filters, so a pull request runs
+only the checks relevant to its changes.
 
-| Workflow              | Trigger                                     | What it does                                                                                                                                                          |
-| --------------------- | ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ci.yaml`             | Push to `main`, every PR                    | Clippy, fmt, unit + integration tests, type checks for the Python and TypeScript bindings. Runs on `ubuntu-24.04-arm`. This is the canonical "PR is mergeable" check. |
-| `docs.yaml`           | Push/PR touching `docs/**`, manual dispatch | Builds the docs site in strict mode, validates `--8<--` snippet includes, runs prose linting, and deploys to GitHub Pages from `main`.                                |
-| `publish.yaml`        | Manual dispatch, GitHub release event       | Publishes to PyPI, npm, crates.io, Docker Hub, Homebrew, and other registries. Not run on PRs.                                                                        |
-| `publish-docker.yaml` | Manual dispatch, GitHub release event       | Builds and publishes the Xberg Docker images.                                                                                                                     |
-| `benchmarks.yaml`     | Manual dispatch only                        | Three-iteration performance run with quality metrics on `ubuntu-24.04-arm`. Used to compare proposed changes against `main`.                                          |
-| `profiling.yaml`      | Manual dispatch only                        | Generates flamegraphs for six fixture types (small/medium PDFs, simple DOCX, and others) for performance investigations.                                              |
+| Workflow family | What it verifies |
+| ---------------- | ---------------- |
+| `ci-lint.yaml` | Formatting, linting, governance, generated freshness, and repository policy gates |
+| `ci-rust.yaml` | Rust workspace builds and tests on Linux x86_64, Linux arm64, and macOS |
+| `ci-e2e.yaml` | Generated cross-language bindings and end-to-end suites |
+| `ci-docs.yaml` | Documentation build and deployment through the shared docs workflow |
+| `ci-mobile.yaml`, `ci-musl-*.yaml`, `ci-gpu.yaml` | Platform-specific mobile, musl, and GPU coverage |
+| `ci-docker.yaml`, `ci-integrations.yaml` | Container and integration-package coverage |
+| `publish*.yaml` | Release preparation and registry-specific publishing |
+| `benchmarks.yaml`, `profiling.yaml` | Manually dispatched performance and profiling runs |
 
 ### Reading workflow failures
 
@@ -209,7 +214,9 @@ Xberg ships six GitHub Actions workflows under `.github/workflows/`. The first t
 Please run checks locally before you open a PR. For example `task check` plus tests for any language bindings you touched (see the [Development Workflow](/guides/development/) guide for common commands). That catches most CI failures faster than iterating on GitHub alone.
 :::
 
-Open the failing PR's **Checks** tab and click into the failing job to expand its log. The job name maps directly to the step in `ci.yaml` that failed (for example, `clippy` or `python-test`). To re-run after pushing a fix, GitHub Actions will pick the new commit up automatically; to re-run without a new commit (for flakes), use the **Re-run failed jobs** button at the top right of the workflow run page.
+Open the failing PR's **Checks** tab and click into the failing job to expand its log. The check name
+identifies its domain workflow and job. Pushing a fix starts a new path-matched run; for a confirmed
+flake, use **Re-run failed jobs** on the workflow run page.
 
 If a check is reporting "expected check missing" rather than failing outright, the workflow file probably wasn't reachable from your branch — rebase on `main` and the check will register on the next push.
 

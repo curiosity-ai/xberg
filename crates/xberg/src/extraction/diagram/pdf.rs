@@ -24,9 +24,9 @@
 //! a reader sees them, so every y is flipped on the way in and everything
 //! downstream stays in one coordinate space.
 
-use pdf_oxide::elements::{PathContent, PathOperation};
+use xberg_native_pdf::elements::{PathContent, PathOperation};
 
-use crate::pdf::oxide::OxideDocument;
+use crate::pdf::native::NativeDocument;
 use crate::types::diagram::DiagramGraph;
 
 use super::polyline::{Polyline, classify, halfway_along};
@@ -50,7 +50,7 @@ const MIN_OUTLINES: usize = 2;
 /// Pages that fail to parse are skipped rather than propagated: a diagram is
 /// an extra, and no PDF should fail to extract because one page's content
 /// stream is malformed.
-pub(crate) fn recover(doc: &mut OxideDocument) -> Vec<DiagramGraph> {
+pub(crate) fn recover(doc: &mut NativeDocument) -> Vec<DiagramGraph> {
     let Ok(page_count) = doc.doc.page_count() else {
         return Vec::new();
     };
@@ -64,13 +64,13 @@ pub(crate) fn recover(doc: &mut OxideDocument) -> Vec<DiagramGraph> {
     graphs
 }
 
-fn recover_page(doc: &mut OxideDocument, page_index: usize) -> Option<DiagramGraph> {
+fn recover_page(doc: &mut NativeDocument, page_index: usize) -> Option<DiagramGraph> {
     let (x0, y0, x1, y1) = doc.doc.get_page_media_box(page_index).ok()?;
     let canvas = ((x1 - x0).abs(), (y1 - y0).abs());
     let origin = (x0.min(x1), y0.min(y1));
     let top = y0.max(y1);
 
-    let paths = crate::pdf::oxide::guard_oxide_panic(
+    let paths = crate::pdf::native::guard_native_panic(
         || doc.doc.extract_paths(page_index).map_err(|error| error.to_string()),
         |message| message,
     )
@@ -86,13 +86,13 @@ fn recover_page(doc: &mut OxideDocument, page_index: usize) -> Option<DiagramGra
         return None;
     }
 
-    // Read directly rather than through `oxide::text`, whose helper is gated on
+    // Read directly rather than through `native::text`, whose helper is gated on
     // layout detection and reorders sparse columns in place. Labels want the
     // spans where they were drawn, not in reading order. ~keep
-    let page_text = crate::pdf::oxide::guard_oxide_panic(
+    let page_text = crate::pdf::native::guard_native_panic(
         || {
             doc.doc
-                .extract_page_text_with_options(page_index, pdf_oxide::ReadingOrder::ColumnAware)
+                .extract_page_text_with_options(page_index, xberg_native_pdf::ReadingOrder::ColumnAware)
                 .map_err(|error| error.to_string())
         },
         |message| message,
@@ -135,7 +135,7 @@ fn collect_path(
     let dashed = path.dash_pattern.as_ref().is_some_and(|(dashes, _)| !dashes.is_empty());
 
     // Whether the path was filled, which is not the same question as whether a
-    // fill colour is known. pdf_oxide starts the stroke colour at black and
+    // fill colour is known. xberg_native_pdf starts the stroke colour at black and
     // never clears it, and reports `stroke_color: None` only for a path it
     // finalized without stroking, so an absent stroke colour *is* the fill
     // flag. Reading `fill_color` instead would miss every path painted in the
@@ -248,8 +248,8 @@ fn split_subpaths(operations: &[PathOperation], origin: (f32, f32), top: f32) ->
     subpaths
 }
 
-/// `#rrggbb` from pdf_oxide's 0..=1 channels.
-fn hex(color: &pdf_oxide::layout::Color) -> String {
+/// `#rrggbb` from xberg_native_pdf's 0..=1 channels.
+fn hex(color: &xberg_native_pdf::layout::Color) -> String {
     let channel = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
     format!(
         "#{:02x}{:02x}{:02x}",
@@ -264,12 +264,12 @@ mod tests {
     use super::*;
     use crate::types::diagram::DiagramShape;
 
-    fn colour(r: f32, g: f32, b: f32) -> pdf_oxide::layout::Color {
-        pdf_oxide::layout::Color { r, g, b }
+    fn colour(r: f32, g: f32, b: f32) -> xberg_native_pdf::layout::Color {
+        xberg_native_pdf::layout::Color { r, g, b }
     }
 
-    fn path(operations: Vec<PathOperation>, fill: Option<pdf_oxide::layout::Color>) -> PathContent {
-        let mut content = PathContent::new(pdf_oxide::geometry::Rect::new(0.0, 0.0, 0.0, 0.0));
+    fn path(operations: Vec<PathOperation>, fill: Option<xberg_native_pdf::layout::Color>) -> PathContent {
+        let mut content = PathContent::new(xberg_native_pdf::geometry::Rect::new(0.0, 0.0, 0.0, 0.0));
         content.operations = operations;
         content.fill_color = fill;
         content.stroke_color = Some(colour(0.0, 0.0, 0.0));

@@ -2,7 +2,7 @@
 //!
 //! This module defines types for representing paginated document structures.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::sync::Arc;
 
 use super::extraction::BoundingBox;
@@ -69,6 +69,71 @@ pub struct PageBoundary {
 ///
 /// Captures per-page information including dimensions, content counts,
 /// and visibility state (for presentations).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PageDimensions {
+    /// Page width in points or pixels.
+    pub width: f64,
+    /// Page height in points or pixels.
+    pub height: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PageDimensionsWire {
+    Positional((f64, f64)),
+    Named { width: f64, height: f64 },
+}
+
+impl Serialize for PageDimensions {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (self.width, self.height).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PageDimensions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match PageDimensionsWire::deserialize(deserializer)? {
+            PageDimensionsWire::Positional(dimensions) => dimensions.into(),
+            PageDimensionsWire::Named { width, height } => Self { width, height },
+        })
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::PartialSchema for PageDimensions {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{ArrayBuilder, ArrayItems, Object, Type};
+
+        ArrayBuilder::new()
+            .items(ArrayItems::False)
+            .prefix_items([Object::with_type(Type::Number), Object::with_type(Type::Number)])
+            .min_items(Some(2))
+            .max_items(Some(2))
+            .into()
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::ToSchema for PageDimensions {}
+
+impl From<(f64, f64)> for PageDimensions {
+    fn from((width, height): (f64, f64)) -> Self {
+        Self { width, height }
+    }
+}
+
+impl From<PageDimensions> for (f64, f64) {
+    fn from(dimensions: PageDimensions) -> Self {
+        (dimensions.width, dimensions.height)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct PageInfo {
@@ -79,11 +144,9 @@ pub struct PageInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
 
-    /// Dimensions in points (PDF) or pixels (images): (width, height)
-    #[serde(skip)]
-    #[cfg_attr(feature = "api", schema(value_type = Option<[f64; 2]>))]
-    #[cfg_attr(alef, alef(skip))]
-    pub dimensions: Option<(f64, f64)>,
+    /// Dimensions in points (PDF) or pixels (images).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<PageDimensions>,
 
     /// Number of images on this page
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,6 +220,10 @@ pub struct PageContent {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub image_indices: Vec<u32>,
 
+    /// OCR image preprocessing applied to this page's raster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_preprocessing: Option<super::ImagePreprocessingMetadata>,
+
     /// Hierarchy information for the page (when hierarchy extraction is enabled)
     ///
     /// Contains text hierarchy levels (H1-H6) extracted from the page content.
@@ -223,7 +290,7 @@ pub struct LayoutRegion {
 
 impl LayoutRegion {
     /// Deprecated: use the `class_name` field directly.
-    #[deprecated(since = "4.10.0", note = "Use `class_name` field instead")]
+    #[deprecated(since = "1.1.0", note = "Use `class_name` field instead")]
     pub fn class(&self) -> &str {
         &self.class_name
     }
@@ -248,6 +315,100 @@ pub struct PageHierarchy {
 ///
 /// Represents a block of text with semantic heading information extracted from
 /// font size clustering and hierarchical analysis.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct HierarchicalBoundingBox {
+    /// Left coordinate.
+    pub left: f32,
+    /// Top coordinate.
+    pub top: f32,
+    /// Right coordinate.
+    pub right: f32,
+    /// Bottom coordinate.
+    pub bottom: f32,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum HierarchicalBoundingBoxWire {
+    Positional((f32, f32, f32, f32)),
+    Named {
+        left: f32,
+        top: f32,
+        right: f32,
+        bottom: f32,
+    },
+}
+
+impl Serialize for HierarchicalBoundingBox {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (self.left, self.top, self.right, self.bottom).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for HierarchicalBoundingBox {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match HierarchicalBoundingBoxWire::deserialize(deserializer)? {
+            HierarchicalBoundingBoxWire::Positional(bbox) => bbox.into(),
+            HierarchicalBoundingBoxWire::Named {
+                left,
+                top,
+                right,
+                bottom,
+            } => Self {
+                left,
+                top,
+                right,
+                bottom,
+            },
+        })
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::PartialSchema for HierarchicalBoundingBox {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        use utoipa::openapi::schema::{ArrayBuilder, ArrayItems, Object, Type};
+
+        ArrayBuilder::new()
+            .items(ArrayItems::False)
+            .prefix_items([
+                Object::with_type(Type::Number),
+                Object::with_type(Type::Number),
+                Object::with_type(Type::Number),
+                Object::with_type(Type::Number),
+            ])
+            .min_items(Some(4))
+            .max_items(Some(4))
+            .into()
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::ToSchema for HierarchicalBoundingBox {}
+
+impl From<(f32, f32, f32, f32)> for HierarchicalBoundingBox {
+    fn from((left, top, right, bottom): (f32, f32, f32, f32)) -> Self {
+        Self {
+            left,
+            top,
+            right,
+            bottom,
+        }
+    }
+}
+
+impl From<HierarchicalBoundingBox> for (f32, f32, f32, f32) {
+    fn from(bbox: HierarchicalBoundingBox) -> Self {
+        (bbox.left, bbox.top, bbox.right, bbox.bottom)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "api", derive(utoipa::ToSchema))]
 pub struct HierarchicalBlock {
@@ -271,14 +432,97 @@ pub struct HierarchicalBlock {
 
     /// Bounding box information for the block
     ///
-    /// Contains coordinates as (left, top, right, bottom) in PDF units.
+    /// Contains left, top, right, and bottom coordinates in PDF units.
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "api", schema(value_type = Option<[f32; 4]>))]
-    #[cfg_attr(alef, alef(skip))]
-    pub bbox: Option<(f32, f32, f32, f32)>,
+    pub bbox: Option<HierarchicalBoundingBox>,
 }
 
 /// Helper for skipping default bool values in serialization.
 fn is_default_bool(v: &bool) -> bool {
     !*v
+}
+
+#[cfg(test)]
+mod binding_value_serde_tests {
+    use super::{HierarchicalBlock, HierarchicalBoundingBox, PageDimensions, PageInfo};
+    use serde_json::json;
+
+    #[cfg(feature = "api")]
+    fn assert_legacy_array_schema<T: utoipa::PartialSchema>(length: usize) {
+        let schema = serde_json::to_value(T::schema()).expect("schema must serialize");
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["minItems"], length);
+        assert_eq!(schema["maxItems"], length);
+        assert_eq!(schema["items"], false);
+        assert_eq!(schema["prefixItems"].as_array().map(Vec::len), Some(length));
+    }
+
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_describe_binding_dtos_as_legacy_array_schemas() {
+        assert_legacy_array_schema::<PageDimensions>(2);
+        assert_legacy_array_schema::<HierarchicalBoundingBox>(4);
+    }
+
+    #[test]
+    fn should_preserve_legacy_page_dimension_tuple_wire_format() {
+        let legacy = json!({
+            "number": 1,
+            "dimensions": [612.0, 792.0]
+        });
+        let page: PageInfo = serde_json::from_value(legacy.clone()).expect("legacy page info must deserialize");
+        let named: PageDimensions = serde_json::from_value(json!({"width": 612.0, "height": 792.0}))
+            .expect("named page dimensions must deserialize");
+        let dimensions = page.dimensions.expect("dimensions must be present");
+
+        assert_eq!(dimensions.width, 612.0);
+        assert_eq!(dimensions.height, 792.0);
+        assert_eq!(serde_json::to_value(page).expect("page info must serialize"), legacy);
+        assert_eq!(named, dimensions);
+        assert_eq!(
+            serde_json::to_value(named).expect("named page dimensions must serialize"),
+            json!([612.0, 792.0])
+        );
+    }
+
+    #[test]
+    fn should_accept_page_info_without_dimensions() {
+        let page: PageInfo = serde_json::from_value(json!({
+            "number": 2
+        }))
+        .expect("page info without dimensions must deserialize");
+
+        assert!(page.dimensions.is_none());
+    }
+
+    #[test]
+    fn should_preserve_legacy_hierarchy_bbox_tuple_wire_format() {
+        let legacy = json!({
+            "text": "Heading",
+            "font_size": 18.0,
+            "level": "h1",
+            "bbox": [1.0, 2.0, 101.0, 22.0]
+        });
+        let block: HierarchicalBlock =
+            serde_json::from_value(legacy.clone()).expect("legacy hierarchy block must deserialize");
+        let named: HierarchicalBoundingBox = serde_json::from_value(json!({
+            "left": 1.0,
+            "top": 2.0,
+            "right": 101.0,
+            "bottom": 22.0
+        }))
+        .expect("named hierarchy bounding box must deserialize");
+        let bbox = block.bbox.expect("bounding box must be present");
+
+        assert_eq!((bbox.left, bbox.top, bbox.right, bbox.bottom), (1.0, 2.0, 101.0, 22.0));
+        assert_eq!(named, bbox);
+        assert_eq!(
+            serde_json::to_value(block).expect("hierarchy block must serialize"),
+            legacy
+        );
+        assert_eq!(
+            serde_json::to_value(named).expect("named hierarchy bounding box must serialize"),
+            json!([1.0, 2.0, 101.0, 22.0])
+        );
+    }
 }

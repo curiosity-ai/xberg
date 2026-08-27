@@ -1196,7 +1196,9 @@ fn detect_office_format_from_archive<R: Read + Seek>(archive: &mut zip::ZipArchi
         return Some(IWORK_NUMBERS_MIME_TYPE);
     }
     if has(archive, "Index/Presentation.iwa")
-        || archive.file_names().any(|n| n.starts_with("Index/Slide-") || n.starts_with("Index/Slide_"))
+        || archive
+            .file_names()
+            .any(|n| n.starts_with("Index/Slide-") || n.starts_with("Index/Slide_"))
     {
         return Some(IWORK_KEYNOTE_MIME_TYPE);
     }
@@ -1545,7 +1547,7 @@ mod tests {
         .await;
     }
 
-    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    #[cfg(feature = "hwpx")]
     #[test]
     fn should_detect_hwpx_without_a_content_hpf_from_its_mimetype_entry() {
         // Real Hangul packages carry `version.xml` and `Contents/section0.xml`
@@ -1553,8 +1555,7 @@ mod tests {
         let mut buffer = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buffer));
-            let stored =
-                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.start_file("mimetype", stored).unwrap();
             std::io::Write::write_all(&mut writer, b"application/hwp+zip").unwrap();
             writer
@@ -1586,7 +1587,7 @@ mod tests {
         assert_eq!(detect_mime_type_from_bytes(content).unwrap(), "application/docbook+xml");
     }
 
-    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    #[cfg(feature = "office")]
     #[test]
     fn should_detect_a_deck_whose_main_part_is_written_late_in_the_archive() {
         // A real 27-slide deck names `ppt/presentation.xml` 107 KB in, so a
@@ -1597,7 +1598,9 @@ mod tests {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buffer));
             let options = zip::write::SimpleFileOptions::default();
             for index in 0..12 {
-                writer.start_file(format!("ppt/media/image{index}.bin"), options).unwrap();
+                writer
+                    .start_file(format!("ppt/media/image{index}.bin"), options)
+                    .unwrap();
                 std::io::Write::write_all(&mut writer, &vec![index as u8; 8192]).unwrap();
             }
             writer.start_file("ppt/presentation.xml", options).unwrap();
@@ -1614,13 +1617,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         assert_eq!(
-            detected,
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            detected, "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             "the deck is identified by its parts, not by its name"
         );
     }
 
-    #[cfg(any(feature = "office", feature = "hwpx", feature = "iwork", feature = "archives"))]
+    #[cfg(feature = "hwpx")]
     #[test]
     fn should_keep_zip_routing_for_an_hwpx_package_without_its_manifest() {
         // `unhwp` needs `Contents/content.hpf`. Without it the HWPX extractor
@@ -1629,8 +1631,7 @@ mod tests {
         let mut buffer = Vec::new();
         {
             let mut writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buffer));
-            let stored =
-                zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            let stored = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
             writer.start_file("mimetype", stored).unwrap();
             std::io::Write::write_all(&mut writer, b"application/hwp+zip").unwrap();
             writer

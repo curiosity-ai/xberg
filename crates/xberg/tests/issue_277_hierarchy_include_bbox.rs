@@ -1,7 +1,7 @@
 //! Regression test for issue #277: `HierarchyConfig::include_bbox` had zero readers.
 //!
 //! `HierarchyConfig::k_clusters` (its sibling) was already threaded into
-//! `extract_all_from_oxide_document` (crates/xberg/src/extractors/pdf/extraction.rs), so the
+//! `extract_all_from_native_document` (crates/xberg/src/extractors/pdf/extraction.rs), so the
 //! struct was reached during extraction — only `include_bbox` was ignored, meaning bounding-box
 //! coordinates were always attached to hierarchy blocks regardless of the configured value.
 

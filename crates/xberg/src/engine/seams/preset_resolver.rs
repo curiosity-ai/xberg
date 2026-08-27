@@ -2,10 +2,7 @@
 //!
 //! The in-core default is [`CorePresetResolver`], which looks presets up in the
 //! embedded [`Registry`] and merges overrides via
-//! [`presets::resolve`](crate::presets::resolve) — exactly what xberg does
-//! today. Alternative resolvers (a custom registry, a preset source loaded at
-//! startup) implement this trait and are injected via
-//! [`EngineBuilder::with_preset_resolver`](super::super::EngineBuilder::with_preset_resolver).
+//! [`presets::resolve`](crate::presets::resolve).
 
 use std::collections::BTreeMap;
 

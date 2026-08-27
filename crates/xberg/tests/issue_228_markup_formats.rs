@@ -21,6 +21,7 @@ use xberg::core::mime::validate_mime_type;
 use xberg::extractors::ensure_initialized;
 use xberg::plugins::registry::get_document_extractor_registry;
 use xberg::types::document_structure::NodeContent;
+use xberg::types::{MarkdownCodeBlock, MarkdownLink};
 
 /// Markup MIME types deliberately dropped from the catalogue rather than implemented.
 const REMOVED_MIME_TYPES: [&str; 4] = ["text/troff", "text/x-mdoc", "text/x-pod", "text/x-dokuwiki"];
@@ -258,12 +259,24 @@ async fn should_populate_text_metadata_for_asciidoc() {
     );
     assert_eq!(
         text_metadata.code_blocks.as_deref(),
-        Some([("rust".to_string(), "fn main() {\n    println!(\"hi\");\n}".to_string())].as_slice()),
+        Some(
+            [MarkdownCodeBlock {
+                language: "rust".to_string(),
+                code: "fn main() {\n    println!(\"hi\");\n}".to_string(),
+            }]
+            .as_slice()
+        ),
         "TextMetadata.code_blocks was hardcoded None before #228"
     );
     assert_eq!(
         text_metadata.links.as_deref(),
-        Some([("the docs".to_string(), "https://example.com/docs".to_string())].as_slice()),
+        Some(
+            [MarkdownLink {
+                text: "the docs".to_string(),
+                url: "https://example.com/docs".to_string(),
+            }]
+            .as_slice()
+        ),
         "TextMetadata.links was hardcoded None before #228"
     );
 }

@@ -87,6 +87,74 @@ pub struct TesseractAPI {
 unsafe impl Send for TesseractAPI {}
 unsafe impl Sync for TesseractAPI {}
 
+/// Validates the arguments to [`TesseractAPI::set_image`] before they are
+/// handed to Tesseract's C API.
+///
+/// All products are computed in `i64`, not `i32`. `width`, `bytes_per_pixel`,
+/// `height`, and `bytes_per_line` are caller-supplied `i32` values, and
+/// `i32 * i32` can overflow: for example `width = 100_000` and
+/// `bytes_per_pixel = 100_000` produce a mathematical product of
+/// 10,000,000,000, which wraps to 1,410,065,408 as a 32-bit signed integer.
+/// A `bytes_per_line` at or above that wrapped value would then pass the
+/// `bytes_per_line < width * bytes_per_pixel` guard even though the real
+/// per-row byte count is far larger, so the buffer-length check below would
+/// under-validate `image_data` and Tesseract would read past its end using
+/// the original (un-wrapped) `width`/`height`/`bytes_per_line`. `i32::MAX`
+/// squared fits well within `i64::MAX`, so the `i64` products here cannot
+/// overflow for any `i32` input.
+///
+/// # Errors
+///
+/// Returns [`TesseractError::InvalidDimensions`] if `width` or `height` is
+/// not positive, [`TesseractError::InvalidBytesPerPixel`] if
+/// `bytes_per_pixel` is not positive, [`TesseractError::InvalidBytesPerLine`]
+/// if `bytes_per_line` is narrower than one row of pixel data, or
+/// [`TesseractError::InvalidImageData`] if `image_data_len` is smaller than
+/// `height * bytes_per_line` bytes.
+#[cfg(any(feature = "build-tesseract", feature = "build-tesseract-wasm"))]
+fn validate_image_buffer(
+    image_data_len: usize,
+    width: i32,
+    height: i32,
+    bytes_per_pixel: i32,
+    bytes_per_line: i32,
+) -> Result<()> {
+    if width <= 0 || height <= 0 {
+        return Err(TesseractError::InvalidDimensions);
+    }
+
+    if bytes_per_pixel <= 0 {
+        return Err(TesseractError::InvalidBytesPerPixel);
+    }
+
+    let min_bytes_per_line = i64::from(width) * i64::from(bytes_per_pixel);
+    if i64::from(bytes_per_line) < min_bytes_per_line {
+        return Err(TesseractError::InvalidBytesPerLine);
+    }
+
+    let expected_size = i64::from(height) * i64::from(bytes_per_line);
+    if (image_data_len as i64) < expected_size {
+        return Err(TesseractError::InvalidImageData);
+    }
+
+    Ok(())
+}
+
+/// Converts Leptonica's `boxa->n` element count (a C `int`) into a `usize`.
+///
+/// `boxaGetCount` returns the raw `c_int` field of a Leptonica `Boxa`. It is
+/// documented to be non-negative for a valid `Boxa`, but that is an invariant
+/// enforced by the C library, not by this FFI signature: a corrupted or
+/// exhausted `Boxa` handed back across the boundary could carry a negative
+/// count. A bare `as usize` cast wraps a negative value into a huge `usize`,
+/// which panics with "capacity overflow" the moment it reaches
+/// `Vec::with_capacity`. Treat a negative count the same as zero, matching the
+/// empty result every caller already returns for a null `boxa`.
+#[cfg(any(feature = "build-tesseract", feature = "build-tesseract-wasm"))]
+fn boxa_count_to_usize(count: c_int) -> usize {
+    usize::try_from(count).unwrap_or(0)
+}
+
 #[cfg(any(feature = "build-tesseract", feature = "build-tesseract-wasm"))]
 impl TesseractAPI {
     /// Creates a new instance of the Tesseract API.
@@ -248,11 +316,17 @@ impl TesseractAPI {
     ///
     /// # Returns
     ///
-    /// Returns the value of the variable as an integer.
+    /// Returns the value of the variable as an integer, or
+    /// [`TesseractError::GetVariableError`] if no such variable exists.
     pub fn get_int_variable(&self, name: &str) -> Result<i32> {
         let name = CString::new(name).map_err(|_| TesseractError::NullByteInString)?;
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        Ok(unsafe { TessBaseAPIGetIntVariable(*handle, name.as_ptr()) })
+        let mut value: c_int = 0;
+        let found = unsafe { TessBaseAPIGetIntVariable(*handle, name.as_ptr(), &raw mut value) };
+        if found == 0 {
+            return Err(TesseractError::GetVariableError);
+        }
+        Ok(value)
     }
 
     /// Gets a boolean variable.
@@ -263,11 +337,17 @@ impl TesseractAPI {
     ///
     /// # Returns
     ///
-    /// Returns the value of the variable as a boolean.
+    /// Returns the value of the variable as a boolean, or
+    /// [`TesseractError::GetVariableError`] if no such variable exists.
     pub fn get_bool_variable(&self, name: &str) -> Result<bool> {
         let name = CString::new(name).map_err(|_| TesseractError::NullByteInString)?;
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        Ok(unsafe { TessBaseAPIGetBoolVariable(*handle, name.as_ptr()) } != 0)
+        let mut value: c_int = 0;
+        let found = unsafe { TessBaseAPIGetBoolVariable(*handle, name.as_ptr(), &raw mut value) };
+        if found == 0 {
+            return Err(TesseractError::GetVariableError);
+        }
+        Ok(value != 0)
     }
 
     /// Gets a double variable.
@@ -278,11 +358,17 @@ impl TesseractAPI {
     ///
     /// # Returns
     ///
-    /// Returns the value of the variable as a double.
+    /// Returns the value of the variable as a double, or
+    /// [`TesseractError::GetVariableError`] if no such variable exists.
     pub fn get_double_variable(&self, name: &str) -> Result<f64> {
         let name = CString::new(name).map_err(|_| TesseractError::NullByteInString)?;
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
-        Ok(unsafe { TessBaseAPIGetDoubleVariable(*handle, name.as_ptr()) })
+        let mut value: c_double = 0.0;
+        let found = unsafe { TessBaseAPIGetDoubleVariable(*handle, name.as_ptr(), &raw mut value) };
+        if found == 0 {
+            return Err(TesseractError::GetVariableError);
+        }
+        Ok(value)
     }
 
     /// Sets the page segmentation mode.
@@ -1170,22 +1256,7 @@ impl TesseractAPI {
         bytes_per_pixel: i32,
         bytes_per_line: i32,
     ) -> Result<()> {
-        if width <= 0 || height <= 0 {
-            return Err(TesseractError::InvalidDimensions);
-        }
-
-        if bytes_per_pixel <= 0 {
-            return Err(TesseractError::InvalidBytesPerPixel);
-        }
-
-        if bytes_per_line < width * bytes_per_pixel {
-            return Err(TesseractError::InvalidBytesPerLine);
-        }
-
-        let expected_size = (height * bytes_per_line) as usize;
-        if image_data.len() < expected_size {
-            return Err(TesseractError::InvalidImageData);
-        }
+        validate_image_buffer(image_data.len(), width, height, bytes_per_pixel, bytes_per_line)?;
 
         let handle = self.handle.lock().map_err(|_| TesseractError::MutexLockError)?;
 
@@ -1388,7 +1459,7 @@ impl TesseractAPI {
             });
         }
         let count = unsafe { boxaGetCount(boxa) };
-        let mut boxes = Vec::with_capacity(count as usize);
+        let mut boxes = Vec::with_capacity(boxa_count_to_usize(count));
         for i in 0..count {
             let mut x = 0_i32;
             let mut y = 0_i32;
@@ -1442,7 +1513,7 @@ impl TesseractAPI {
             });
         }
         let count = unsafe { boxaGetCount(boxa) };
-        let mut boxes = Vec::with_capacity(count as usize);
+        let mut boxes = Vec::with_capacity(boxa_count_to_usize(count));
         for i in 0..count {
             let mut x = 0_i32;
             let mut y = 0_i32;
@@ -1504,7 +1575,7 @@ impl TesseractAPI {
             });
         }
         let count = unsafe { boxaGetCount(boxa) };
-        let n = count as usize;
+        let n = boxa_count_to_usize(count);
         let mut boxes = Vec::with_capacity(n);
         let mut block_ids_vec: Option<Vec<i32>> = if blockids_ptr.is_null() {
             None
@@ -1595,7 +1666,7 @@ impl TesseractAPI {
             });
         }
         let count = unsafe { boxaGetCount(boxa) };
-        let n = count as usize;
+        let n = boxa_count_to_usize(count);
         let mut boxes = Vec::with_capacity(n);
         let mut block_ids_vec: Option<Vec<i32>> = if blockids_ptr.is_null() {
             None
@@ -1788,9 +1859,12 @@ ffi_extern! {
     fn TessBaseAPIMeanTextConf(handle: *mut c_void) -> c_int;
     fn TessBaseAPISetVariable(handle: *mut c_void, name: *const c_char, value: *const c_char) -> c_int;
     fn TessBaseAPIGetStringVariable(handle: *mut c_void, name: *const c_char) -> *const c_char;
-    fn TessBaseAPIGetIntVariable(handle: *mut c_void, name: *const c_char) -> c_int;
-    fn TessBaseAPIGetBoolVariable(handle: *mut c_void, name: *const c_char) -> c_int;
-    fn TessBaseAPIGetDoubleVariable(handle: *mut c_void, name: *const c_char) -> c_double;
+    // These three return `BOOL` = "the variable exists" and deliver the value through the
+    // third out-pointer; tesseract's `BOOL` is `int` (capi.h). Omitting the out-pointer
+    // makes tesseract store through an uninitialized argument register. ~keep
+    fn TessBaseAPIGetIntVariable(handle: *mut c_void, name: *const c_char, value: *mut c_int) -> c_int;
+    fn TessBaseAPIGetBoolVariable(handle: *mut c_void, name: *const c_char, value: *mut c_int) -> c_int;
+    fn TessBaseAPIGetDoubleVariable(handle: *mut c_void, name: *const c_char, value: *mut c_double) -> c_int;
     fn TessBaseAPISetPageSegMode(handle: *mut c_void, mode: c_int);
     fn TessBaseAPIGetPageSegMode(handle: *mut c_void) -> c_int;
     #[cfg(any(target_arch = "wasm32", not(feature = "build-tesseract")))]
@@ -1982,5 +2056,233 @@ mod live_engine_tests {
             TessBaseAPIDelete(addr as *mut c_void);
         }
         assert!(!is_registered(addr));
+    }
+
+    /// `TessBaseAPIGet{Bool,Int,Double}Variable` return only *whether the variable
+    /// exists* and deliver the value through a third out-pointer. Declaring them
+    /// without that parameter left the argument register holding whatever the previous
+    /// call had put there, and tesseract stored through it — a wild write that
+    /// corrupted the engine's own `Mutex` and killed the process on `Drop`
+    /// (SIGSEGV on Linux, SIGBUS on macOS). Reading a variable back after flipping it
+    /// pins both halves: the value must be the one that was set, not the constant
+    /// "this variable exists".
+    ///
+    /// Tesseract's parameter vectors are populated by the `TessBaseAPI` constructor, so
+    /// every assertion below holds on an engine that was never `init`ed. That matters:
+    /// gating this test on loadable `eng` tessdata made it exit before its first
+    /// assertion on any machine without a trained-data file, which is the one way it
+    /// could pass while the bug was present. ~keep
+    #[test]
+    fn get_variable_accessors_return_the_stored_value() {
+        /// `set_variable` writes a decimal string; the parsed double must round-trip
+        /// exactly, so this only absorbs a formatting difference, never a wrong value. ~keep
+        const DOUBLE_TOLERANCE: f64 = 1e-12;
+        const EXPECTED_INT: i32 = 17;
+        const EXPECTED_DOUBLE: f64 = 0.5;
+
+        let api = TesseractAPI::new().expect("create engine");
+
+        // A bool variable must track both states. The pre-fix code returned the C
+        // "this variable exists" flag, which is 1 for both, so only the `false` leg
+        // distinguishes a real read from that constant. ~keep
+        api.set_variable("hocr_font_info", "1").expect("set hocr_font_info");
+        assert!(
+            api.get_bool_variable("hocr_font_info").expect("read hocr_font_info"),
+            "hocr_font_info was set to 1 and must read back as true"
+        );
+        api.set_variable("hocr_font_info", "0").expect("clear hocr_font_info");
+        assert!(
+            !api.get_bool_variable("hocr_font_info").expect("read hocr_font_info"),
+            "hocr_font_info was set to 0 and must read back as false, not the existence flag"
+        );
+
+        // 17 is neither 0 nor 1, so it cannot be confused with the existence flag. ~keep
+        api.set_variable("edges_max_children_per_outline", &EXPECTED_INT.to_string())
+            .expect("set int variable");
+        assert_eq!(
+            api.get_int_variable("edges_max_children_per_outline")
+                .expect("read int variable"),
+            EXPECTED_INT,
+            "the int accessor must yield the stored value, not the existence flag"
+        );
+
+        api.set_variable("classify_min_slope", &EXPECTED_DOUBLE.to_string())
+            .expect("set double variable");
+        let read_double = api
+            .get_double_variable("classify_min_slope")
+            .expect("read double variable");
+        assert!(
+            (read_double - EXPECTED_DOUBLE).abs() < DOUBLE_TOLERANCE,
+            "the double accessor must yield {EXPECTED_DOUBLE}, got {read_double}"
+        );
+
+        // An absent variable has no value to report, so each accessor must surface the
+        // miss rather than hand back a default that reads as real data. ~keep
+        let missing = "xberg_no_such_tesseract_variable";
+        assert!(
+            matches!(api.get_bool_variable(missing), Err(TesseractError::GetVariableError)),
+            "an unknown bool variable must be GetVariableError, not a silent default"
+        );
+        assert!(
+            matches!(api.get_int_variable(missing), Err(TesseractError::GetVariableError)),
+            "an unknown int variable must be GetVariableError, not a silent default"
+        );
+        assert!(
+            matches!(api.get_double_variable(missing), Err(TesseractError::GetVariableError)),
+            "an unknown double variable must be GetVariableError, not a silent default"
+        );
+    }
+}
+
+#[cfg(all(test, any(feature = "build-tesseract", feature = "build-tesseract-wasm")))]
+mod set_image_validation_tests {
+    use super::*;
+
+    /// Positive control: an ordinary tightly-packed RGB buffer (no row
+    /// padding) must still be accepted byte-for-byte the same as before the
+    /// overflow fix, since none of these values are anywhere near i32
+    /// overflow range.
+    #[test]
+    fn accepts_ordinary_tightly_packed_rgb_buffer() {
+        let width = 4;
+        let height = 4;
+        let bytes_per_pixel = 3;
+        let bytes_per_line = width * bytes_per_pixel;
+        let data = vec![0u8; (height * bytes_per_line) as usize];
+
+        assert!(validate_image_buffer(data.len(), width, height, bytes_per_pixel, bytes_per_line).is_ok());
+    }
+
+    /// Positive control: a padded row (`bytes_per_line` wider than
+    /// `width * bytes_per_pixel`, as the docs on `set_image` say is allowed)
+    /// must still be accepted, proving the fix didn't tighten the padded-row
+    /// case that ordinary callers rely on.
+    #[test]
+    fn accepts_padded_row_stride() {
+        let width = 4;
+        let height = 2;
+        let bytes_per_pixel = 3;
+        let min_bytes_per_line = width * bytes_per_pixel;
+        let bytes_per_line = min_bytes_per_line + 4; // padded to a 16-byte stride
+        let data = vec![0u8; (height * bytes_per_line) as usize];
+
+        assert!(validate_image_buffer(data.len(), width, height, bytes_per_pixel, bytes_per_line).is_ok());
+    }
+
+    /// Negative control: a buffer one byte short of what tightly-packed
+    /// dimensions require must still be rejected, proving the fix didn't
+    /// loosen the ordinary short-buffer case.
+    #[test]
+    fn rejects_buffer_one_byte_short() {
+        let width = 4;
+        let height = 4;
+        let bytes_per_pixel = 3;
+        let bytes_per_line = width * bytes_per_pixel;
+        let data = vec![0u8; (height * bytes_per_line) as usize - 1];
+
+        let result = validate_image_buffer(data.len(), width, height, bytes_per_pixel, bytes_per_line);
+        assert!(matches!(result, Err(TesseractError::InvalidImageData)));
+    }
+
+    /// `width * bytes_per_pixel` (100_000 * 100_000 = 10_000_000_000)
+    /// overflows `i32::MAX` (2_147_483_647) and wraps to 1_410_065_408 under
+    /// plain `i32` multiplication. Against the unfixed code this either
+    /// panics with "attempt to multiply with overflow" (debug/test builds,
+    /// which enable overflow checks by default) or, in a release build
+    /// (overflow checks off), silently wraps and lets a `bytes_per_line` of
+    /// 1 pass the `bytes_per_line < width * bytes_per_pixel` guard — the
+    /// exact FFI buffer-over-read this fix closes. The `i64` arithmetic used
+    /// here must instead cleanly return `InvalidBytesPerLine`.
+    #[test]
+    fn rejects_oversized_dimensions_without_overflow_panic() {
+        let width = 100_000;
+        let height = 1;
+        let bytes_per_pixel = 100_000;
+        let bytes_per_line = 1;
+        let data = [0u8; 1];
+
+        let result = validate_image_buffer(data.len(), width, height, bytes_per_pixel, bytes_per_line);
+        assert!(matches!(result, Err(TesseractError::InvalidBytesPerLine)));
+    }
+
+    /// Same overflow-magnitude inputs as above, but with `bytes_per_line`
+    /// itself set to the wrapped i32 value (1_410_065_408) that the unfixed
+    /// `i32 * i32` comparison would have produced. Under the unfixed code in
+    /// a release build this satisfies `bytes_per_line < width * bytes_per_pixel`
+    /// (comparing the wrapped value to itself) and then computes
+    /// `expected_size = height * bytes_per_line` with `height = 1`, which
+    /// also fits in `i32` here — so the buffer-length check alone would not
+    /// have caught it either. The fixed function must still reject it
+    /// because the true required row width (10_000_000_000 bytes) vastly
+    /// exceeds any real buffer.
+    #[test]
+    fn rejects_bytes_per_line_equal_to_wrapped_i32_product() {
+        let width = 100_000;
+        let height = 1;
+        let bytes_per_pixel = 100_000;
+        let wrapped_i32_product: i32 = 1_410_065_408;
+        // No real buffer is allocated: only the *length* participates in the
+        // arithmetic under test, and a genuine 1.4 GiB allocation would make
+        // this test needlessly slow/memory-hungry without exercising anything
+        // `wrapped_i32_product as usize` doesn't already cover.
+        let claimed_data_len = wrapped_i32_product as usize;
+
+        let result = validate_image_buffer(claimed_data_len, width, height, bytes_per_pixel, wrapped_i32_product);
+        assert!(matches!(result, Err(TesseractError::InvalidBytesPerLine)));
+    }
+
+    #[test]
+    fn rejects_non_positive_width_or_height() {
+        assert!(matches!(
+            validate_image_buffer(0, 0, 10, 3, 30),
+            Err(TesseractError::InvalidDimensions)
+        ));
+        assert!(matches!(
+            validate_image_buffer(0, 10, 0, 3, 30),
+            Err(TesseractError::InvalidDimensions)
+        ));
+        assert!(matches!(
+            validate_image_buffer(0, -1, 10, 3, 30),
+            Err(TesseractError::InvalidDimensions)
+        ));
+    }
+
+    #[test]
+    fn rejects_non_positive_bytes_per_pixel() {
+        assert!(matches!(
+            validate_image_buffer(0, 10, 10, 0, 30),
+            Err(TesseractError::InvalidBytesPerPixel)
+        ));
+        assert!(matches!(
+            validate_image_buffer(0, 10, 10, -3, 30),
+            Err(TesseractError::InvalidBytesPerPixel)
+        ));
+    }
+}
+
+#[cfg(all(test, any(feature = "build-tesseract", feature = "build-tesseract-wasm")))]
+mod boxa_count_tests {
+    use super::*;
+
+    /// Positive control: an ordinary non-negative count must convert exactly,
+    /// unchanged from the plain `as usize` cast it replaces.
+    #[test]
+    fn converts_non_negative_count_exactly() {
+        assert_eq!(boxa_count_to_usize(0), 0);
+        assert_eq!(boxa_count_to_usize(42), 42);
+        assert_eq!(boxa_count_to_usize(c_int::MAX), c_int::MAX as usize);
+    }
+
+    /// Against the unfixed `count as usize` cast, a negative `boxaGetCount`
+    /// result wraps to a `usize` near `usize::MAX` (e.g. `-1i32 as usize` is
+    /// `18446744073709551615` on 64-bit targets), which panics with "capacity
+    /// overflow" the moment it reaches `Vec::with_capacity`. The fixed
+    /// conversion must instead treat any negative count as empty, matching
+    /// the empty `BoundingBoxArray` every caller already returns for a null
+    /// `boxa`.
+    #[test]
+    fn treats_negative_count_as_zero() {
+        assert_eq!(boxa_count_to_usize(-1), 0);
+        assert_eq!(boxa_count_to_usize(c_int::MIN), 0);
     }
 }

@@ -7,7 +7,7 @@
 		"title": "extract_batch: archive size cap triggers error",
 		"description": "extract_batch: archive size cap triggers error",
 		"presentation": {
-			"files": [{ "field": "/inputs/0/bytes", "path": "test_documents/text/fake_text.txt" }]
+			"files": [{ "field": "/inputs/0/bytes", "path": "text/fake_text.txt" }]
 		},
 		"side_effects": "safe"
 	},

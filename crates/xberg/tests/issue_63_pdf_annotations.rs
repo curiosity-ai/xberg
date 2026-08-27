@@ -1,6 +1,6 @@
 //! Regression test for issue #63: PDF annotation subtype widening + rendering.
 //!
-//! Before this fix, `crates/xberg/src/pdf/oxide/annotations.rs` collapsed
+//! Before this fix, `crates/xberg/src/pdf/native/annotations.rs` collapsed
 //! Ink/Square/Circle/Polygon/Squiggly/Caret/FileAttachment/Sound/Movie annotations
 //! all down to `PdfAnnotationType::Other`, and `PdfAnnotation` carried no author,
 //! modification date, colour, subject, or `/QuadPoints`-derived text — so a

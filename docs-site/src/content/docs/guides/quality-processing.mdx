@@ -2,21 +2,7 @@
 title: "Quality Processing"
 ---
 
-import { Tabs, TabItem } from "@astrojs/starlight/components";
-import { Content as Snip_python_config_quality_processing_config } from "../../../snippets/python/config/quality_processing_config.md";
-import { Content as Snip_typescript_config_quality_processing_config } from "../../../snippets/typescript/config/quality_processing_config.md";
-import { Content as Snip_rust_advanced_quality_processing_config } from "../../../snippets/rust/advanced/quality_processing_config.md";
-import { Content as Snip_go_config_quality_processing_config } from "../../../snippets/go/config/quality_processing_config.md";
-import { Content as Snip_java_config_quality_processing_config } from "../../../snippets/java/config/quality_processing_config.md";
-import { Content as Snip_csharp_advanced_quality_processing_config } from "../../../snippets/csharp/advanced/quality_processing_config.md";
-import { Content as Snip_ruby_config_quality_processing_config } from "../../../snippets/ruby/config/quality_processing_config.md";
-import { Content as Snip_python_utils_quality_processing_example } from "../../../snippets/python/utils/quality_processing_example.md";
-import { Content as Snip_typescript_utils_quality_processing_example } from "../../../snippets/typescript/utils/quality_processing_example.md";
-import { Content as Snip_rust_advanced_quality_processing_example } from "../../../snippets/rust/advanced/quality_processing_example.md";
-import { Content as Snip_go_advanced_quality_processing_example } from "../../../snippets/go/advanced/quality_processing_example.md";
-import { Content as Snip_java_advanced_quality_processing_example } from "../../../snippets/java/advanced/quality_processing_example.md";
-import { Content as Snip_csharp_advanced_quality_processing_example } from "../../../snippets/csharp/advanced/quality_processing_example.md";
-import { Content as Snip_ruby_advanced_quality_processing_example } from "../../../snippets/ruby/advanced/quality_processing_example.md";
+import ApiSnippetGroup from "../../../components/ApiSnippetGroup.astro";
 
 Score extracted text on a 0.0–1.0 scale, where 1.0 is highest quality. Scoring starts from `1.0` for clean prose: OCR, script, and navigation noise subtract penalties, while document structure and metadata add bonuses. The result is clamped to `[0.0, 1.0]`. Empty text scores `0.0`; text shorter than 10 characters scores `0.1`.
 
@@ -32,83 +18,11 @@ OCR, script, and navigation penalties apply at every text length, including shor
 
 ## Configuration
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
-
-<Snip_python_config_quality_processing_config />
-
-</TabItem>
-<TabItem label="TypeScript">
-
-<Snip_typescript_config_quality_processing_config />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_advanced_quality_processing_config />
-
-</TabItem>
-<TabItem label="Go">
-
-<Snip_go_config_quality_processing_config />
-
-</TabItem>
-<TabItem label="Java">
-
-<Snip_java_config_quality_processing_config />
-
-</TabItem>
-<TabItem label="C#">
-
-<Snip_csharp_advanced_quality_processing_config />
-
-</TabItem>
-<TabItem label="Ruby">
-
-<Snip_ruby_config_quality_processing_config />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="contract/config_quality_enabled" />
 
 ## Example
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
-
-<Snip_python_utils_quality_processing_example />
-
-</TabItem>
-<TabItem label="TypeScript">
-
-<Snip_typescript_utils_quality_processing_example />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_advanced_quality_processing_example />
-
-</TabItem>
-<TabItem label="Go">
-
-<Snip_go_advanced_quality_processing_example />
-
-</TabItem>
-<TabItem label="Java">
-
-<Snip_java_advanced_quality_processing_example />
-
-</TabItem>
-<TabItem label="C#">
-
-<Snip_csharp_advanced_quality_processing_example />
-
-</TabItem>
-<TabItem label="Ruby">
-
-<Snip_ruby_advanced_quality_processing_example />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="contract/config_quality_enabled" />
 
 ## See also
 

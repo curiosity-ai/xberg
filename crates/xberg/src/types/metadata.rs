@@ -680,6 +680,256 @@ pub struct XmlMetadata {
     pub unique_elements: Vec<String>,
 }
 
+/// A link extracted from Markdown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkdownLink {
+    /// Visible link text.
+    pub text: String,
+    /// Link destination.
+    pub url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MarkdownLinkWire {
+    Positional((String, String)),
+    Named { text: String, url: String },
+}
+
+impl Serialize for MarkdownLink {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (&self.text, &self.url).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MarkdownLink {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match MarkdownLinkWire::deserialize(deserializer)? {
+            MarkdownLinkWire::Positional(link) => link.into(),
+            MarkdownLinkWire::Named { text, url } => Self { text, url },
+        })
+    }
+}
+
+impl From<(String, String)> for MarkdownLink {
+    fn from((text, url): (String, String)) -> Self {
+        Self { text, url }
+    }
+}
+
+impl From<MarkdownLink> for (String, String) {
+    fn from(link: MarkdownLink) -> Self {
+        (link.text, link.url)
+    }
+}
+
+/// A fenced code block extracted from Markdown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkdownCodeBlock {
+    /// Declared language identifier, or an empty string when absent.
+    pub language: String,
+    /// Code block content.
+    pub code: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum MarkdownCodeBlockWire {
+    Positional((String, String)),
+    Named { language: String, code: String },
+}
+
+impl Serialize for MarkdownCodeBlock {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (&self.language, &self.code).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for MarkdownCodeBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match MarkdownCodeBlockWire::deserialize(deserializer)? {
+            MarkdownCodeBlockWire::Positional(block) => block.into(),
+            MarkdownCodeBlockWire::Named { language, code } => Self { language, code },
+        })
+    }
+}
+
+impl From<(String, String)> for MarkdownCodeBlock {
+    fn from((language, code): (String, String)) -> Self {
+        Self { language, code }
+    }
+}
+
+impl From<MarkdownCodeBlock> for (String, String) {
+    fn from(block: MarkdownCodeBlock) -> Self {
+        (block.language, block.code)
+    }
+}
+
+/// A string key-value attribute.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeyValueAttribute {
+    /// Attribute name.
+    pub key: String,
+    /// Attribute value.
+    pub value: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum KeyValueAttributeWire {
+    Positional((String, String)),
+    Named { key: String, value: String },
+}
+
+impl Serialize for KeyValueAttribute {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (&self.key, &self.value).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for KeyValueAttribute {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match KeyValueAttributeWire::deserialize(deserializer)? {
+            KeyValueAttributeWire::Positional(attribute) => attribute.into(),
+            KeyValueAttributeWire::Named { key, value } => Self { key, value },
+        })
+    }
+}
+
+impl From<(String, String)> for KeyValueAttribute {
+    fn from((key, value): (String, String)) -> Self {
+        Self { key, value }
+    }
+}
+
+impl From<KeyValueAttribute> for (String, String) {
+    fn from(attribute: KeyValueAttribute) -> Self {
+        (attribute.key, attribute.value)
+    }
+}
+
+/// Image dimensions in pixels.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ImageDimensions {
+    /// Width in pixels.
+    pub width: u32,
+    /// Height in pixels.
+    pub height: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum ImageDimensionsWire {
+    Positional((u32, u32)),
+    Named { width: u32, height: u32 },
+}
+
+impl Serialize for ImageDimensions {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        (self.width, self.height).serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ImageDimensions {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match ImageDimensionsWire::deserialize(deserializer)? {
+            ImageDimensionsWire::Positional(dimensions) => dimensions.into(),
+            ImageDimensionsWire::Named { width, height } => Self { width, height },
+        })
+    }
+}
+
+#[cfg(feature = "api")]
+fn legacy_pair_schema(
+    item_type: utoipa::openapi::schema::Type,
+) -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+    use utoipa::openapi::schema::{ArrayBuilder, ArrayItems, Object};
+
+    ArrayBuilder::new()
+        .items(ArrayItems::False)
+        .prefix_items([Object::with_type(item_type.clone()), Object::with_type(item_type)])
+        .min_items(Some(2))
+        .max_items(Some(2))
+        .into()
+}
+
+#[cfg(feature = "api")]
+impl utoipa::PartialSchema for MarkdownLink {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        legacy_pair_schema(utoipa::openapi::schema::Type::String)
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::ToSchema for MarkdownLink {}
+
+#[cfg(feature = "api")]
+impl utoipa::PartialSchema for MarkdownCodeBlock {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        legacy_pair_schema(utoipa::openapi::schema::Type::String)
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::ToSchema for MarkdownCodeBlock {}
+
+#[cfg(feature = "api")]
+impl utoipa::PartialSchema for KeyValueAttribute {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        legacy_pair_schema(utoipa::openapi::schema::Type::String)
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::ToSchema for KeyValueAttribute {}
+
+#[cfg(feature = "api")]
+impl utoipa::PartialSchema for ImageDimensions {
+    fn schema() -> utoipa::openapi::RefOr<utoipa::openapi::schema::Schema> {
+        legacy_pair_schema(utoipa::openapi::schema::Type::Integer)
+    }
+}
+
+#[cfg(feature = "api")]
+impl utoipa::ToSchema for ImageDimensions {}
+
+impl From<(u32, u32)> for ImageDimensions {
+    fn from((width, height): (u32, u32)) -> Self {
+        Self { width, height }
+    }
+}
+
+impl From<ImageDimensions> for (u32, u32) {
+    fn from(dimensions: ImageDimensions) -> Self {
+        (dimensions.width, dimensions.height)
+    }
+}
+
 /// Text/Markdown metadata.
 ///
 /// Extracted from plain text and Markdown files. Includes word counts and,
@@ -698,17 +948,13 @@ pub struct TextMetadata {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<Vec<String>>,
 
-    /// Markdown links as (text, url) tuples (for Markdown files)
+    /// Markdown links (for Markdown files).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "api", schema(value_type = Option<Vec<[String; 2]>>))]
-    #[cfg_attr(alef, alef(skip))]
-    pub links: Option<Vec<(String, String)>>,
+    pub links: Option<Vec<MarkdownLink>>,
 
-    /// Code blocks as (language, code) tuples (for Markdown files)
+    /// Code blocks (for Markdown files).
     #[serde(skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "api", schema(value_type = Option<Vec<[String; 2]>>))]
-    #[cfg_attr(alef, alef(skip))]
-    pub code_blocks: Option<Vec<(String, String)>>,
+    pub code_blocks: Option<Vec<MarkdownCodeBlock>>,
 }
 
 /// Text direction enumeration for HTML documents.
@@ -759,10 +1005,8 @@ pub struct LinkMetadata {
     pub link_type: LinkType,
     /// Rel attribute values
     pub rel: Vec<String>,
-    /// Additional attributes as key-value pairs
-    #[cfg_attr(feature = "api", schema(value_type = Vec<[String; 2]>))]
-    #[cfg_attr(alef, alef(skip))]
-    pub attributes: Vec<(String, String)>,
+    /// Additional attributes as key-value pairs.
+    pub attributes: Vec<KeyValueAttribute>,
 }
 
 /// Link type classification.
@@ -796,16 +1040,12 @@ pub struct ImageMetadataType {
     /// Title attribute
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// Image dimensions as (width, height) if available
-    #[cfg_attr(feature = "api", schema(value_type = Option<[u32; 2]>))]
-    #[cfg_attr(alef, alef(skip))]
-    pub dimensions: Option<(u32, u32)>,
+    /// Image dimensions if available.
+    pub dimensions: Option<ImageDimensions>,
     /// Image type classification
     pub image_type: ImageType,
-    /// Additional attributes as key-value pairs
-    #[cfg_attr(feature = "api", schema(value_type = Vec<[String; 2]>))]
-    #[cfg_attr(alef, alef(skip))]
-    pub attributes: Vec<(String, String)>,
+    /// Additional attributes as key-value pairs.
+    pub attributes: Vec<KeyValueAttribute>,
 }
 
 /// Image type classification.
@@ -994,7 +1234,7 @@ impl From<html_to_markdown_rs::HtmlMetadata> for HtmlMetadata {
                         html_to_markdown_rs::LinkType::Other => LinkType::Other,
                     },
                     rel: l.rel,
-                    attributes: l.attributes.into_iter().collect(),
+                    attributes: l.attributes.into_iter().map(Into::into).collect(),
                 })
                 .collect(),
             images: metadata
@@ -1004,14 +1244,17 @@ impl From<html_to_markdown_rs::HtmlMetadata> for HtmlMetadata {
                     src: img.src,
                     alt: img.alt,
                     title: img.title,
-                    dimensions: img.dimensions.map(|d| (d.width, d.height)),
+                    dimensions: img.dimensions.map(|d| ImageDimensions {
+                        width: d.width,
+                        height: d.height,
+                    }),
                     image_type: match img.image_type {
                         html_to_markdown_rs::ImageType::DataUri => ImageType::DataUri,
                         html_to_markdown_rs::ImageType::InlineSvg => ImageType::InlineSvg,
                         html_to_markdown_rs::ImageType::External => ImageType::External,
                         html_to_markdown_rs::ImageType::Relative => ImageType::Relative,
                     },
-                    attributes: img.attributes.into_iter().collect(),
+                    attributes: img.attributes.into_iter().map(Into::into).collect(),
                 })
                 .collect(),
             structured_data: metadata
@@ -1352,5 +1595,121 @@ mod code_metadata_serde_tests {
         };
         assert_eq!(chunks.len(), 1);
         assert_eq!(chunks[0].node_types, vec!["function_item".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod binding_value_serde_tests {
+    use super::{ImageDimensions, KeyValueAttribute, MarkdownCodeBlock, MarkdownLink, TextMetadata};
+    use serde_json::json;
+
+    #[cfg(feature = "api")]
+    fn assert_legacy_array_schema<T: utoipa::PartialSchema>(length: usize) {
+        let schema = serde_json::to_value(T::schema()).expect("schema must serialize");
+        assert_eq!(schema["type"], "array");
+        assert_eq!(schema["minItems"], length);
+        assert_eq!(schema["maxItems"], length);
+        assert_eq!(schema["items"], false);
+        assert_eq!(schema["prefixItems"].as_array().map(Vec::len), Some(length));
+    }
+
+    #[cfg(feature = "api")]
+    #[test]
+    fn should_describe_binding_dtos_as_legacy_array_schemas() {
+        assert_legacy_array_schema::<MarkdownLink>(2);
+        assert_legacy_array_schema::<MarkdownCodeBlock>(2);
+        assert_legacy_array_schema::<KeyValueAttribute>(2);
+        assert_legacy_array_schema::<ImageDimensions>(2);
+    }
+
+    #[test]
+    fn should_preserve_legacy_markdown_tuple_wire_format() {
+        let legacy = json!({
+            "line_count": 4,
+            "word_count": 7,
+            "character_count": 42,
+            "links": [["Xberg", "https://xberg.io"]],
+            "code_blocks": [["rust", "fn main() {}"]]
+        });
+
+        let metadata: TextMetadata = serde_json::from_value(legacy.clone()).expect("legacy metadata must deserialize");
+        let named_link: MarkdownLink = serde_json::from_value(json!({
+            "text": "Xberg",
+            "url": "https://xberg.io"
+        }))
+        .expect("named Markdown link must deserialize");
+        let named_code_block: MarkdownCodeBlock = serde_json::from_value(json!({
+            "language": "rust",
+            "code": "fn main() {}"
+        }))
+        .expect("named code block must deserialize");
+        let link = metadata
+            .links
+            .as_ref()
+            .and_then(|links| links.first())
+            .expect("link must be present");
+        let code_block = metadata
+            .code_blocks
+            .as_ref()
+            .and_then(|blocks| blocks.first())
+            .expect("code block must be present");
+        assert_eq!(
+            link,
+            &MarkdownLink {
+                text: "Xberg".into(),
+                url: "https://xberg.io".into()
+            }
+        );
+        assert_eq!(
+            code_block,
+            &MarkdownCodeBlock {
+                language: "rust".into(),
+                code: "fn main() {}".into()
+            }
+        );
+        assert_eq!(serde_json::to_value(metadata).expect("metadata must serialize"), legacy);
+        assert_eq!(
+            serde_json::to_value(named_link).expect("named Markdown link must serialize"),
+            json!(["Xberg", "https://xberg.io"])
+        );
+        assert_eq!(
+            serde_json::to_value(named_code_block).expect("named code block must serialize"),
+            json!(["rust", "fn main() {}"])
+        );
+    }
+
+    #[test]
+    fn should_preserve_legacy_attribute_and_dimension_tuple_wire_format() {
+        let attribute: KeyValueAttribute =
+            serde_json::from_value(json!(["role", "button"])).expect("legacy attribute must deserialize");
+        let dimensions: ImageDimensions =
+            serde_json::from_value(json!([640, 480])).expect("legacy dimensions must deserialize");
+        let named_attribute: KeyValueAttribute = serde_json::from_value(json!({"key": "role", "value": "button"}))
+            .expect("named attribute must deserialize");
+        let named_dimensions: ImageDimensions = serde_json::from_value(json!({"width": 640, "height": 480}))
+            .expect("named image dimensions must deserialize");
+
+        assert_eq!(attribute.key, "role");
+        assert_eq!(attribute.value, "button");
+        assert_eq!(dimensions.width, 640);
+        assert_eq!(dimensions.height, 480);
+        assert_eq!(named_attribute, attribute);
+        assert_eq!(named_dimensions, dimensions);
+        assert_eq!(
+            serde_json::to_value(attribute).expect("attribute must serialize"),
+            json!(["role", "button"])
+        );
+        assert_eq!(
+            serde_json::to_value(dimensions).expect("dimensions must serialize"),
+            json!([640, 480])
+        );
+        assert_eq!(
+            serde_json::to_value(named_attribute).expect("named attribute must serialize"),
+            json!(["role", "button"])
+        );
+        assert_eq!(
+            serde_json::to_value(named_dimensions).expect("named dimensions must serialize"),
+            json!([640, 480])
+        );
     }
 }

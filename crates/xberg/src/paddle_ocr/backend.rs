@@ -37,9 +37,9 @@ use crate::core::config::OcrConfig;
 use crate::ocr::conversion::{detailed_text_block_to_elements, elements_to_hocr_words};
 use crate::plugins::{OcrBackend, OcrBackendType, Plugin};
 use crate::table_core::{reconstruct_table, table_to_markdown};
-use crate::types::{
-    ExtractedDocument, FormatMetadata, Metadata, OcrElement, OcrElementConfig, OcrElementLevel, OcrMetadata, Table,
-};
+#[cfg(test)]
+use crate::types::OcrElementLevel;
+use crate::types::{ExtractedDocument, FormatMetadata, Metadata, OcrElement, OcrElementConfig, OcrMetadata, Table};
 
 #[cfg(test)]
 use super::config::DEFAULT_RECOGNITION_BATCH_SIZE;
@@ -111,10 +111,47 @@ fn engine_pool_key(
     format!("{version}/{tier}/{model_key}/{accel_key}/{backend_key}")
 }
 
-const INFERENCE_THREAD_COUNT: usize = 1;
+/// Intra-op thread count for PaddleOCR's shared inference session.
+///
+/// PaddleOCR keeps one session per model per pool key, and `OrtBackend` guards it with a
+/// `Mutex` because `ort::Session::run` takes `&mut self` (ort 2.0.0-rc.13). Concurrent page
+/// OCR therefore serializes on that mutex, so the session is always exactly one worker and can
+/// safely claim the whole process budget — the same shape `layout/engine.rs::from_config` and
+/// `inference/ort_backend.rs` already use. The previous hardcoded `1` left it single-core.
+///
+/// If layout detection and PaddleOCR are ever made to run concurrently (today PaddleOCR's
+/// per-page `join_set` in `extractors/pdf/ocr.rs` only reaches this session after layout's own
+/// pass), this must go through `resolve_batch_execution_plan` instead, or two full-budget
+/// sessions could oversubscribe the process.
+///
+/// The `tract` backend takes the same `num_thread` parameter but ignores it (`TractBackend::load`).
+fn paddle_inference_thread_count() -> usize {
+    paddle_session_thread_budget(crate::core::config::concurrency::resolve_thread_budget(None))
+}
+
+/// Pure core of [`paddle_inference_thread_count`], split out so the policy is testable
+/// without a live ORT session or host-CPU detection.
+fn paddle_session_thread_budget(total_budget: usize) -> usize {
+    total_budget.max(1)
+}
+
 use crate::ocr_metadata_keys::OCR_ORIENTATION_CONFIDENCE_METADATA_KEY as ORIENTATION_CONFIDENCE_METADATA_KEY;
 const VERTICAL_TEXT_MIN_ASPECT_RATIO: f32 = 1.5;
 const VERTICAL_COLUMN_MIN_OVERLAP_RATIO: f32 = 0.5;
+
+/// Pixel tolerance for grouping word left-edges into the same table column
+/// (see [`crate::table_core::detect_columns`]), used by the table-detection loop in
+/// [`PaddleOcrBackend::process_image`].
+///
+/// Measured on the two fixtures this module's table tests use (real PaddleOCR word geometry from
+/// `ocr_image.tiff`'s dense numeric stock table and page 1 of `ordinance_2197_scanned.pdf`'s
+/// prose): widening this past 20px consistently merges *different* real columns together on the
+/// stock table (its side-by-side sub-tables and mixed text/numeric columns sit closer together
+/// than a single generic threshold can separate), which lowers the reconstructed grid's numeric
+/// cell fraction and makes it *less* likely to clear `post_process_table`'s validation, not more.
+/// 20px is kept unchanged from the pre-fix value; the discriminator below, not this threshold, is
+/// what tells the resulting grid apart from a fabricated one.
+const TABLE_COLUMN_ALIGNMENT_THRESHOLD_PX: u32 = 20;
 
 #[derive(Debug)]
 struct RotationOutcome {
@@ -250,6 +287,132 @@ pub struct PaddleOcrBackend {
     /// Hardware acceleration configuration for ORT sessions (set at construction).
     /// Per-request acceleration from `OcrConfig.acceleration` takes precedence.
     acceleration: Option<crate::core::config::acceleration::AccelerationConfig>,
+}
+
+/// Number of buckets in `DropScoreDiscardStats::histogram`, spanning the score range
+/// `[0.0, 1.0]` in equal-width steps (bucket 0 is `[0.0, 0.2)`, ..., bucket 4 is `[0.8, 1.0]`).
+const DROP_SCORE_HISTOGRAM_BUCKETS: usize = 5;
+
+/// Instrumentation-only summary of what the `drop_score` filter in `PaddleOcrBackend::perform_ocr`
+/// discards.
+///
+/// This exists to answer a question the removed-gate measurement documented on
+/// `PaddleOcrBackend::process_image` (#675) could not: the surviving detections' mean
+/// recognition confidence cannot see what `drop_score` (default 0.5) already discarded before
+/// those detections ever became elements. Recording it does not change which detections
+/// survive `perform_ocr`'s filter — `record` is only ever called for blocks the filter has
+/// already decided to drop.
+#[derive(Debug, Default, Clone, Copy)]
+struct DropScoreDiscardStats {
+    discarded_count: usize,
+    /// Subset of `discarded_count` whose `text_score` was NaN (excluded from
+    /// sum/min/max/histogram since NaN has no ordering).
+    nan_count: usize,
+    sum: f64,
+    min: f32,
+    max: f32,
+    histogram: [u32; DROP_SCORE_HISTOGRAM_BUCKETS],
+}
+
+impl DropScoreDiscardStats {
+    /// Record one discarded detection's `text_score`. Must only be called for scores the live
+    /// filter has already excluded, and must not itself decide inclusion/exclusion.
+    fn record(&mut self, score: f32) {
+        self.discarded_count += 1;
+        if score.is_nan() {
+            self.nan_count += 1;
+            return;
+        }
+        let scored_before = self.discarded_count - self.nan_count == 1;
+        self.min = if scored_before { score } else { self.min.min(score) };
+        self.max = if scored_before { score } else { self.max.max(score) };
+        self.sum += f64::from(score);
+
+        let bucket = ((score.clamp(0.0, 1.0) * DROP_SCORE_HISTOGRAM_BUCKETS as f32) as usize)
+            .min(DROP_SCORE_HISTOGRAM_BUCKETS - 1);
+        self.histogram[bucket] += 1;
+    }
+
+    /// Count of discarded, non-NaN scores the mean/min/max/histogram are computed over.
+    fn scored_count(&self) -> usize {
+        self.discarded_count - self.nan_count
+    }
+
+    /// Mean of discarded, non-NaN scores; `0.0` when there is nothing to average (this is a
+    /// "no discards to report" reading, not a measured score of zero).
+    fn mean(&self) -> f64 {
+        let scored_count = self.scored_count();
+        if scored_count == 0 {
+            0.0
+        } else {
+            self.sum / scored_count as f64
+        }
+    }
+}
+
+/// The exact `drop_score` filter predicate from `PaddleOcrBackend::perform_ocr`, factored out
+/// so the boundary case (`text_score == drop_score`) is unit-testable without exercising the
+/// full detection pipeline. `perform_ocr`'s filter calls this and only this to decide
+/// inclusion; `DropScoreDiscardStats::record` never does.
+fn passes_drop_score(text_score: f32, drop_score: f32) -> bool {
+    text_score >= drop_score && !text_score.is_nan()
+}
+
+/// Mean/min/max summary of a `box_score` population (DBNet's detection-region confidence),
+/// computed alongside `DropScoreDiscardStats` in `perform_ocr` so it can be compared against
+/// `text_score` (CRNN's recognition confidence) page by page.
+///
+/// This distinction matters because `drop_score` (#675) filters on `text_score`, and
+/// `text_score` is the exact signal `PaddleOcrBackend::process_image`'s doc comment already
+/// measured as unable to separate plat/drawing noise from real text: on
+/// `ordinance_2197_scanned.pdf` every one of the 16 pages' surviving `text_score`-derived mean
+/// recognition confidence landed between 0.79 and 0.99, good and bad pages alike, and the
+/// worst-case page-level minimum for a *bad* page (0.9546) exceeds several *good* pages' means.
+/// `box_score` is a different signal — the detection region's own confidence, gated separately
+/// by `det_db_box_thresh` before recognition ever runs — and has never been measured this way.
+/// Recording it here changes nothing about which blocks survive; see the identical caveat on
+/// `DropScoreDiscardStats`.
+#[derive(Debug, Default, Clone, Copy)]
+struct BoxScoreSummary {
+    count: usize,
+    sum: f64,
+    min: f32,
+    max: f32,
+}
+
+impl BoxScoreSummary {
+    /// Record one block's `box_score`. NaN scores are counted separately and excluded from
+    /// sum/min/max, matching `DropScoreDiscardStats`'s treatment of NaN `text_score`.
+    fn record(&mut self, score: f32) {
+        if score.is_nan() {
+            return;
+        }
+        let first = self.count == 0;
+        self.count += 1;
+        self.min = if first { score } else { self.min.min(score) };
+        self.max = if first { score } else { self.max.max(score) };
+        self.sum += f64::from(score);
+    }
+
+    /// Mean of recorded, non-NaN scores; `0.0` when nothing has been recorded (a "no data"
+    /// reading, not a measured score of zero).
+    fn mean(&self) -> f64 {
+        if self.count == 0 {
+            0.0
+        } else {
+            self.sum / self.count as f64
+        }
+    }
+}
+
+/// Result of clustering, reconstructing, and validating OCR table candidates from a
+/// page's word boxes. Factored out of `process_image` so the table-building logic is
+/// unit-testable without spinning up a PaddleOCR engine (see `build_ocr_tables_from_words`).
+struct BuiltOcrTables {
+    tables: Vec<Table>,
+    table_count: u32,
+    table_rows: Option<u32>,
+    table_cols: Option<u32>,
 }
 
 impl PaddleOcrBackend {
@@ -526,7 +689,7 @@ impl PaddleOcrBackend {
             cls_model_path,
             rec_model_path,
             dict_path,
-            INFERENCE_THREAD_COUNT,
+            paddle_inference_thread_count(),
             builder_fn,
         )
     }
@@ -570,7 +733,7 @@ impl PaddleOcrBackend {
             cls_model_path,
             rec_model_path,
             dict_path,
-            INFERENCE_THREAD_COUNT,
+            paddle_inference_thread_count(),
         )
     }
 
@@ -640,6 +803,7 @@ impl PaddleOcrBackend {
         language: &str,
         effective_config: Arc<PaddleOcrConfig>,
         accel: Option<&crate::core::config::acceleration::AccelerationConfig>,
+        page_rotation_degrees: u32,
     ) -> Result<PaddlePageOcr> {
         let family = language_to_script_family(language);
         let engine = self
@@ -664,6 +828,12 @@ impl PaddleOcrBackend {
             plugin_name: "paddle-ocr".to_string(),
         })??;
 
+        Self::reorder_blocks_for_page_rotation(
+            &mut text_blocks,
+            page_rotation_degrees,
+            processed_width,
+            processed_height,
+        );
         let vertical_cjk = Self::sort_vertical_cjk_blocks(&mut text_blocks, language);
 
         let mut line_elements = Vec::with_capacity(text_blocks.len());
@@ -749,6 +919,124 @@ impl PaddleOcrBackend {
         narrower_width > 0 && overlap as f32 / narrower_width as f32 >= VERTICAL_COLUMN_MIN_OVERLAP_RATIO
     }
 
+    /// Read the page-rotation hint `extractors::pdf::ocr` injects into
+    /// `OcrConfig.backend_options` before dispatching a page to this backend (#640).
+    ///
+    /// This is the PDF page's own `/Rotate` value, not PaddleOCR's own `auto_rotate`
+    /// orientation-detection correction (a separate, independent axis handled by
+    /// `detect_and_rotate`/`rotate_for_detected_orientation`). Absent or malformed
+    /// values are treated as "no rotation" so callers that don't set the hint (direct
+    /// image OCR, other backends' tests reusing this config, etc.) are unaffected.
+    fn page_rotation_degrees_from_backend_options(config: &OcrConfig) -> u32 {
+        config
+            .backend_options
+            .as_ref()
+            .and_then(|opts| opts.get("page_rotation_degrees"))
+            .and_then(serde_json::Value::as_u64)
+            .map(|degrees| (degrees % 360) as u32)
+            .unwrap_or(0)
+    }
+
+    /// Compose the PDF page's `/Rotate` hint (`page_rotation_degrees_from_backend_options`)
+    /// with any rotation `detect_and_rotate` already applied to the raster, yielding the
+    /// residual rotation `reorder_blocks_for_page_rotation` must correct for.
+    ///
+    /// `reorder_blocks_for_page_rotation`'s premise is that its blocks are in the *raw*
+    /// MediaBox raster frame the `/Rotate` hint describes. When `OcrConfig.auto_rotate` is
+    /// enabled, `process_image` may hand `do_ocr` an already-rotated raster instead — in
+    /// which case reordering by the raw `/Rotate` value alone double-corrects: once by the
+    /// pixel rotation `detect_and_rotate` performed, once by the reorder itself.
+    ///
+    /// `auto_rotate_applied_degrees` is `Some(orientation.degrees)` when auto-rotation
+    /// actually rotated the raster (`RotationOutcome::auto_rotated()` is `true`), or `None`
+    /// otherwise — whether because `auto_rotate` is disabled, orientation detection found
+    /// nothing to correct (`degrees == 0` or confidence below threshold), or detection
+    /// itself failed and fell back to `RotationOutcome::unrotated`. In every `None` case the
+    /// raster handed to OCR is still the raw MediaBox raster, so the residual rotation is
+    /// `page_rotation_degrees` unchanged — this is what keeps `auto_rotate: false` (and the
+    /// detection-failure fallback) byte-identical to the pre-existing behavior.
+    ///
+    /// When a rotation *was* applied, it was a pixel rotation of `(360 - degrees) % 360`
+    /// (see `rotate_for_detected_orientation`'s `rotate90`/`rotate180`/`rotate270` match),
+    /// composed onto the raw raster's own `page_rotation_degrees` rotation-away-from-upright.
+    /// The new raster's residual rotation-away-from-upright is therefore
+    /// `(page_rotation_degrees + (360 - degrees)) % 360`, which is `0` exactly when
+    /// orientation detection correctly identified the same rotation the `/Rotate` hint
+    /// already describes.
+    fn residual_rotation_for_reorder(page_rotation_degrees: u32, auto_rotate_applied_degrees: Option<u32>) -> u32 {
+        let page = page_rotation_degrees % 360;
+        match auto_rotate_applied_degrees {
+            Some(applied_degrees) => (page + 360 - applied_degrees % 360) % 360,
+            None => page,
+        }
+    }
+
+    /// Map a point from the OCR raster's coordinate space back to true reading-order
+    /// (display) coordinates, given the correction angle that produced that raster.
+    ///
+    /// Mirrors `crate::pdf::render::ocr_page_correction_degrees`'s quarter-turn
+    /// convention (duplicated as plain arithmetic below so this module has no
+    /// dependency on the `pdf` feature): the raster this backend receives was
+    /// obtained by rotating the displayed page by `correction_degrees`, so this
+    /// applies the same inverse quarter-turn arithmetic used elsewhere in the OCR
+    /// pipeline (`extractors::pdf::ocr::inverse_rotate_ocr_point`) to undo it,
+    /// without touching any stored bbox — only used to compute a sort key.
+    fn reading_order_point(
+        x: f32,
+        y: f32,
+        correction_degrees: u32,
+        raster_width: f32,
+        raster_height: f32,
+    ) -> (f32, f32) {
+        match correction_degrees {
+            90 => (y, raster_height - x),
+            180 => (raster_width - x, raster_height - y),
+            270 => (raster_width - y, x),
+            _ => (x, y),
+        }
+    }
+
+    /// Reorder detector blocks into true reading order when the page they were
+    /// rendered from carries a `/Rotate` value (#640).
+    ///
+    /// `normalize_rendered_page_for_ocr` (`crate::pdf::render`) intentionally hands
+    /// OCR backends a raster in the PDF page's raw MediaBox orientation rather than
+    /// its display orientation, so bbox math elsewhere in the pipeline needs no axis
+    /// swap (see the #530 regression test in `crate::pdf::render`). PaddleOCR's
+    /// detector still finds and reads the text fine in that orientation — it warps
+    /// each detected quad upright before recognition — but its natural block order
+    /// is `(y, x)` in *raster* space, which is only true reading order when the page
+    /// isn't rotated. On a rotated page that raster-space order groups lines into
+    /// several descending runs instead of a single top-to-bottom pass.
+    ///
+    /// Only the block *order* changes here; every block's stored bbox stays in the
+    /// raster space the caller rescales from, matching Tesseract's convention on the
+    /// same route.
+    fn reorder_blocks_for_page_rotation(
+        blocks: &mut [xberg_paddle_ocr::DetailedTextBlock],
+        page_rotation_degrees: u32,
+        raster_width: u32,
+        raster_height: u32,
+    ) {
+        let correction_degrees = (360 - page_rotation_degrees % 360) % 360;
+        if correction_degrees == 0 || raster_width == 0 || raster_height == 0 || blocks.len() < 2 {
+            return;
+        }
+        let (width, height) = (raster_width as f32, raster_height as f32);
+        let key = |block: &xberg_paddle_ocr::DetailedTextBlock| {
+            Self::block_bounds(block)
+                .map(|(min_x, min_y, _, _)| {
+                    Self::reading_order_point(min_x as f32, min_y as f32, correction_degrees, width, height)
+                })
+                .unwrap_or((f32::MAX, f32::MAX))
+        };
+        blocks.sort_by(|a, b| {
+            let (ax, ay) = key(a);
+            let (bx, by) = key(b);
+            ay.total_cmp(&by).then_with(|| ax.total_cmp(&bx))
+        });
+    }
+
     fn is_vertical_text_block(block: &xberg_paddle_ocr::DetailedTextBlock) -> bool {
         let Some((min_x, min_y, max_x, max_y)) = Self::block_bounds(block) else {
             return false;
@@ -773,14 +1061,21 @@ impl PaddleOcrBackend {
         ))
     }
 
-    /// Perform actual OCR inference (runs in blocking context).
-    /// PaddleOcrEngine::detect takes `&self`; no mutex is needed for parallel page OCR.
+    /// Clamp the configured recognition batch size to the supported range.
     fn effective_rec_batch_size(config: &PaddleOcrConfig) -> u32 {
         config
             .rec_batch_num
             .clamp(MIN_RECOGNITION_BATCH_SIZE, MAX_RECOGNITION_BATCH_SIZE)
     }
 
+    /// Perform actual OCR inference (runs in blocking context).
+    ///
+    /// `PaddleOcrEngine::detect` takes `&self`, but that does **not** mean pages OCR
+    /// concurrently: each underlying `ort::Session` is still wrapped in a `Mutex`
+    /// (`crates/xberg-paddle-ocr/src/inference/ort_backend.rs`) because `ort::Session::run`
+    /// requires `&mut self`. Concurrent calls into this function serialize on that mutex —
+    /// see `paddle_inference_thread_count` above for why that is handled by widening the
+    /// session's own intra-op thread budget instead.
     fn perform_ocr(
         image_bytes: &[u8],
         ocr_engine: &Arc<PaddleOcrEngine>,
@@ -822,15 +1117,155 @@ impl PaddleOcrBackend {
             })?;
 
         let drop_score = config.drop_score;
+        let total_detected = result.text_blocks.len();
+        let mut discarded = DropScoreDiscardStats::default();
+        let mut kept_box_scores = BoxScoreSummary::default();
+        let mut discarded_box_scores = BoxScoreSummary::default();
         let text_blocks: Vec<_> = result
             .text_blocks
             .into_iter()
-            .filter(|block| block.block.text_score >= drop_score && !block.block.text_score.is_nan())
+            .filter(|block| {
+                // `passes_drop_score` is the same predicate this replaced (`text_score >=
+                // drop_score && !text_score.is_nan()`), factored out so its boundary case is
+                // unit-testable. `discarded.record` is a side effect only, called exclusively
+                // for blocks this predicate rejects, and never influences the boolean returned.
+                let keep = passes_drop_score(block.block.text_score, drop_score);
+                if keep {
+                    kept_box_scores.record(block.block.box_score);
+                } else {
+                    discarded.record(block.block.text_score);
+                    discarded_box_scores.record(block.block.box_score);
+                }
+                keep
+            })
             .collect();
+
+        // What `drop_score` (default 0.5) discards above, before any of it becomes an element
+        // or contributes text — the population the confidence-gate measurement on
+        // `process_image` (#675) explicitly could not see, since the surviving detections' mean
+        // cannot see what never survived. No page number or path reaches this function
+        // (`perform_ocr` takes only `image_bytes`, `ocr_engine`, `config`), so pages are
+        // identified by a content hash of the exact bytes OCR'd here; compute the same hash
+        // offline over a known page image to line these numbers up against it.
+        let page_hash = blake3::hash(image_bytes).to_hex()[..16].to_string();
+        tracing::debug!(
+            target: "xberg::paddle::confidence",
+            page_hash,
+            drop_score,
+            total_detected,
+            kept = text_blocks.len(),
+            discarded_count = discarded.discarded_count,
+            discarded_nan_count = discarded.nan_count,
+            discarded_mean_score = discarded.mean(),
+            discarded_min_score = discarded.min,
+            discarded_max_score = discarded.max,
+            discarded_histogram = ?discarded.histogram,
+            // `box_score` is DBNet's detection-region confidence, independent of the `text_score`
+            // recognition confidence above — see `BoxScoreSummary`'s doc comment for why this is
+            // the untested signal worth sweeping instead of `drop_score` itself.
+            kept_box_score_mean = kept_box_scores.mean(),
+            kept_box_score_min = kept_box_scores.min,
+            kept_box_score_max = kept_box_scores.max,
+            discarded_box_score_mean = discarded_box_scores.mean(),
+            discarded_box_score_min = discarded_box_scores.min,
+            discarded_box_score_max = discarded_box_scores.max,
+            "PaddleOCR drop_score discard stats"
+        );
 
         tracing::debug!(text_block_count = text_blocks.len(), "PaddleOCR detection completed");
 
         Ok((text_blocks, processed_width, processed_height))
+    }
+
+    /// Clusters `words` into table-candidate regions, reconstructs a grid for each, validates
+    /// it structurally, and builds the `Table` entries `process_image` returns -- including a
+    /// real `bounding_box` derived from the region's word extents (#defect-1: previously left
+    /// `None`, which meant nothing downstream -- `table_bboxes_by_page` /
+    /// `filter_segments_by_table_bboxes` -- could suppress the prose the table duplicates).
+    fn build_ocr_tables_from_words(words: &[crate::table_core::HocrWord]) -> BuiltOcrTables {
+        let mut tables: Vec<Table> = vec![];
+        let mut table_count = 0u32;
+        let mut table_rows: Option<u32> = None;
+        let mut table_cols: Option<u32> = None;
+
+        for region_words in crate::table_core::cluster_words_into_table_regions(words) {
+            if region_words.len() < crate::table_core::MIN_TABLE_CANDIDATE_WORDS {
+                continue;
+            }
+
+            let cells = reconstruct_table(&region_words, TABLE_COLUMN_ALIGNMENT_THRESHOLD_PX, 0.5);
+            if cells.is_empty() || cells[0].is_empty() {
+                continue;
+            }
+
+            // Pixel-space extents of the words that formed this region, mirroring
+            // Tesseract's derivation in `ocr::processor::execution::process_ocr_result`
+            // (region_left/top/right/bottom from region_words' min/max). This is the
+            // same raster pixel space (x0=left, y0=top, x1=right, y1=bottom, y increasing
+            // downward) already used for every other OCR-sourced `BoundingBox` in this
+            // file (see the line-element bbox construction in `process_image`).
+            let region_left = region_words.iter().map(|w| w.left).min().unwrap_or(0);
+            let region_top = region_words.iter().map(|w| w.top).min().unwrap_or(0);
+            let region_right = region_words.iter().map(|w| w.left + w.width).max().unwrap_or(0);
+            let region_bottom = region_words.iter().map(|w| w.top + w.height).max().unwrap_or(0);
+
+            // PaddleOCR has no per-word table-candidate confidence carve-out the way
+            // Tesseract's TSV does, so every recognised word on the page is a clustering
+            // candidate (`elements_to_hocr_words` above just filters by OCR confidence, not
+            // "is this tabular"). Left unfiltered, a page of ordinary prose reconstructs into
+            // one giant sparse grid: each line's words rarely share x-positions with any other
+            // line, so `reconstruct_table`'s column detection manufactures one column per word
+            // (xberg-io/xberg — measured 36 columns / 390 rows of near-empty cells on a
+            // 16-page municipal ordinance with zero real tables). Tesseract's own OCR table
+            // path (`ocr::processor::execution::process_ocr_result`) avoids this by running
+            // every candidate grid through `pdf::table_reconstruct::post_process_table`, the
+            // shared structural validator (column count, cell-content density, prose-length,
+            // and column-flow heuristics tuned against the PDF native-text table corpus) —
+            // reused here rather than duplicated so both backends reject the same shapes for
+            // the same reasons. Only available under the `pdf` feature (same as Tesseract's own
+            // gate at `ocr::processor::execution`); without it, table candidates pass through
+            // unfiltered, matching Tesseract's degraded behavior in that build.
+            #[cfg(feature = "pdf")]
+            let cleaned = crate::pdf::table_reconstruct::post_process_table(cells, false, false);
+            #[cfg(not(feature = "pdf"))]
+            let cleaned = Some(cells);
+            let Some(cells) = cleaned else {
+                continue;
+            };
+
+            table_count += 1;
+            if table_rows.is_none() {
+                table_rows = Some(cells.len() as u32);
+                table_cols = cells.first().map(|row| row.len() as u32);
+            }
+
+            let table_markdown = table_to_markdown(&cells);
+
+            tables.push(Table {
+                cells,
+                markdown: table_markdown,
+                // `process_image` OCRs a single image/page at a time and has no
+                // document-level page context to draw from here — Tesseract's own
+                // equivalent push site (`ocr::processor::execution::process_ocr_result`)
+                // hardcodes the same value for the same reason; callers with real
+                // multi-page context (e.g. the PDF mixed route) reassign it afterward.
+                page_number: 1,
+                bounding_box: Some(crate::types::extraction::BoundingBox {
+                    x0: region_left as f64,
+                    y0: region_top as f64,
+                    x1: region_right as f64,
+                    y1: region_bottom as f64,
+                }),
+                ..Default::default()
+            });
+        }
+
+        BuiltOcrTables {
+            tables,
+            table_count,
+            table_rows,
+            table_cols,
+        }
     }
 
     fn select_output_elements(
@@ -838,16 +1273,11 @@ impl PaddleOcrBackend {
         words: &[OcrElement],
         config: Option<&OcrElementConfig>,
     ) -> Vec<OcrElement> {
-        let Some(config) = config.filter(|config| config.include_elements) else {
+        let Some(config) = config else {
             return Vec::new();
         };
-        let mut elements = match config.min_level {
-            OcrElementLevel::Word => lines.iter().chain(words).cloned().collect::<Vec<_>>(),
-            OcrElementLevel::Line => lines.to_vec(),
-            OcrElementLevel::Block | OcrElementLevel::Page => Vec::new(),
-        };
-        elements.retain(|element| element.confidence.recognition >= config.min_confidence);
-        elements
+        let elements = lines.iter().chain(words).cloned().collect::<Vec<_>>();
+        config.select_elements(&elements)
     }
 }
 
@@ -926,6 +1356,17 @@ impl OcrBackend for PaddleOcrBackend {
         };
 
         let effective_accel = self.resolve_acceleration(config.acceleration.as_ref());
+        let page_rotation_degrees = Self::page_rotation_degrees_from_backend_options(config);
+        // `rotation_outcome` is only `Some` while `config.auto_rotate` is true (populated
+        // above); when it's `None`, `residual_rotation_for_reorder` falls back to
+        // `page_rotation_degrees` unchanged, keeping `auto_rotate: false` byte-identical.
+        let auto_rotate_applied_degrees = rotation_outcome
+            .as_ref()
+            .filter(|outcome| outcome.auto_rotated())
+            .and_then(|outcome| outcome.orientation)
+            .map(|orientation| orientation.degrees);
+        let residual_page_rotation_degrees =
+            Self::residual_rotation_for_reorder(page_rotation_degrees, auto_rotate_applied_degrees);
 
         let PaddlePageOcr {
             text,
@@ -939,10 +1380,42 @@ impl OcrBackend for PaddleOcrBackend {
                 paddle_lang,
                 Arc::clone(&effective_config),
                 effective_accel.as_ref(),
+                residual_page_rotation_degrees,
             )
             .await?;
         let rotation_outcome =
             rotation_outcome.unwrap_or_else(|| RotationOutcome::unrotated(processed_width, processed_height));
+
+        // PaddleOCR pages are deliberately NOT gated on recognition confidence. This logging
+        // records the measurement that ruled it out, so the absence does not read as an
+        // oversight and the next attempt does not repeat it (#675).
+        //
+        // Measured on ordinance_2197_scanned.pdf, whose 16 pages include 5 plat/drawing pages
+        // that Tesseract drops at mean confidence 36-62 against its threshold of 75: every one
+        // of the 16 PaddleOCR pages reports a mean recognition confidence between 0.7909 and
+        // 0.9898. The engine is 79-99% confident on pages whose text reads
+        // "e, n h me nd me n ae c que by l an pable re, a". The five lowest means are 0.7909,
+        // 0.8220, 0.8678, 0.8684 and 0.9298 while the sixth is 0.9393 — a gap of 0.0095 — so no
+        // threshold separates the drawings from legitimate text. Minimum confidence is no
+        // better: the highest per-page minimum, 0.9546, belongs to a page in the bad set.
+        //
+        // A different signal is needed. The most promising is what `drop_score` (default 0.5)
+        // DISCARDS above, since the surviving detections' mean cannot see it.
+        let recognition_confidences: Vec<f64> = line_elements
+            .iter()
+            .map(|element| element.confidence.recognition)
+            .collect();
+        if !recognition_confidences.is_empty() {
+            let observed = recognition_confidences.iter().sum::<f64>() / recognition_confidences.len() as f64;
+            let min = recognition_confidences.iter().copied().fold(f64::INFINITY, f64::min);
+            tracing::debug!(
+                target: "xberg::paddle::confidence",
+                detections = recognition_confidences.len(),
+                mean_recognition_confidence = observed,
+                min_recognition_confidence = min,
+                "PaddleOCR page recognition confidence"
+            );
+        }
 
         let text_blocks_count = line_elements.len();
 
@@ -951,8 +1424,15 @@ impl OcrBackend for PaddleOcrBackend {
             use crate::types::internal::{ElementKind, InternalDocument, InternalElement};
             use crate::types::ocr_elements::OcrElementLevel;
 
+            // PaddleOCR has no paragraph concept of its own (only per-line
+            // geometry), so lines are grouped into blocks here and tagged with
+            // the same `hocr_block_id` attribute Tesseract's hOCR parser writes,
+            // letting `pdf::structure::adapters::ocr_doc_to_paragraphs` merge
+            // them with zero changes to its merge logic (#631).
+            let block_ids = crate::ocr::conversion::assign_line_block_ids(&line_elements);
+
             let mut doc = InternalDocument::new("pdf");
-            for elem in &line_elements {
+            for (elem, block_id) in line_elements.iter().zip(block_ids) {
                 let (left, top, width, height) = elem.geometry.to_aabb();
                 let bbox = BoundingBox {
                     x0: left as f64,
@@ -971,6 +1451,11 @@ impl OcrBackend for PaddleOcrBackend {
                 ie.bbox = Some(bbox);
                 ie.ocr_confidence = Some(elem.confidence.clone());
                 ie.ocr_geometry = Some(elem.geometry.clone());
+                ie.attributes = Some(
+                    [(crate::ocr::hocr_parser::HOCR_BLOCK_ID_ATTRIBUTE.to_string(), block_id)]
+                        .into_iter()
+                        .collect(),
+                );
                 doc.push_element(ie);
             }
             doc
@@ -992,26 +1477,11 @@ impl OcrBackend for PaddleOcrBackend {
         if effective_config.enable_table_detection && !line_elements.is_empty() {
             let table_elements = line_elements.iter().chain(&word_elements).cloned().collect::<Vec<_>>();
             let words = elements_to_hocr_words(&table_elements, 0.3);
-
-            if !words.is_empty() {
-                let cells = reconstruct_table(&words, 20, 0.5);
-
-                if !cells.is_empty() {
-                    table_count = 1;
-                    table_rows = Some(cells.len() as u32);
-                    table_cols = cells.first().map(|row| row.len() as u32);
-
-                    let table_markdown = table_to_markdown(&cells);
-
-                    tables.push(Table {
-                        cells,
-                        markdown: table_markdown,
-                        page_number: 1,
-                        bounding_box: None,
-                        ..Default::default()
-                    });
-                }
-            }
+            let built = Self::build_ocr_tables_from_words(&words);
+            tables = built.tables;
+            table_count = built.table_count;
+            table_rows = built.table_rows;
+            table_cols = built.table_cols;
         }
 
         let metadata = Metadata {
@@ -1059,6 +1529,19 @@ impl OcrBackend for PaddleOcrBackend {
 
     fn backend_type(&self) -> OcrBackendType {
         OcrBackendType::PaddleOCR
+    }
+
+    /// PaddleOCR never derives a page-level aggregate confidence: per-element `text_score`
+    /// exists but no page-level number is written.
+    fn confidence_semantics(&self) -> crate::plugins::ConfidenceSemantics {
+        crate::plugins::ConfidenceSemantics::None
+    }
+
+    /// Measured on a `/Rotate 270` scanned ordinance: PaddleOCR warps each detected min-area-rect
+    /// quad upright before recognition, so the recognised text is correct, but the block list
+    /// stays in raw raster `(y, x)` order — the caller must reorder blocks itself.
+    fn page_orientation_handling(&self) -> crate::plugins::PageOrientationHandling {
+        crate::plugins::PageOrientationHandling::RecognisesRotatedText
     }
 
     fn supported_languages(&self) -> Vec<String> {
@@ -1133,6 +1616,131 @@ mod tests {
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
+
+    /// `passes_drop_score` is the live predicate `perform_ocr`'s filter calls; this pins its
+    /// current boundary behaviour: `text_score == drop_score` is `>=`, so it survives (is kept,
+    /// not discarded). This test would fail if that boundary were ever flipped to strict `>`,
+    /// which is the only way it can discriminate — the predicate is a one-line direct copy of
+    /// the pre-instrumentation filter condition, so there is no separate "old" behaviour to
+    /// diverge from today.
+    #[test]
+    fn passes_drop_score_keeps_the_exact_threshold_score() {
+        let drop_score = 0.5_f32;
+        assert!(passes_drop_score(drop_score, drop_score));
+        assert!(passes_drop_score(drop_score + 0.01, drop_score));
+        assert!(!passes_drop_score(drop_score - 0.01, drop_score));
+    }
+
+    /// NaN scores are excluded regardless of `drop_score`, matching the pre-instrumentation
+    /// `&& !text_score.is_nan()` clause verbatim.
+    #[test]
+    fn passes_drop_score_rejects_nan_scores() {
+        assert!(!passes_drop_score(f32::NAN, 0.5));
+        assert!(!passes_drop_score(f32::NAN, 0.0));
+    }
+
+    /// Drives `DropScoreDiscardStats::record` with a synthetic set of discarded scores whose
+    /// count, mean, min, max, and histogram bucketing are all known by hand, and asserts every
+    /// field against the hand-computed value rather than a re-derived formula. This is a new
+    /// struct built for this task, so there is no pre-instrumentation behaviour to diverge
+    /// from — the test pins the arithmetic (mean = sum/count over non-NaN scores; NaN counted
+    /// separately and excluded from sum/min/max/histogram; 5 equal-width buckets over
+    /// `[0.0, 1.0]`) rather than catching a regression.
+    #[test]
+    fn drop_score_discard_stats_computes_exact_summary_from_synthetic_scores() {
+        let mut stats = DropScoreDiscardStats::default();
+        // Non-NaN discarded scores: 0.05, 0.15, 0.35, 0.49, plus two NaNs.
+        for score in [0.05_f32, 0.15, 0.35, 0.49] {
+            stats.record(score);
+        }
+        stats.record(f32::NAN);
+        stats.record(f32::NAN);
+
+        assert_eq!(stats.discarded_count, 6);
+        assert_eq!(stats.nan_count, 2);
+        assert_eq!(stats.scored_count(), 4);
+        assert!((stats.mean() - (0.05 + 0.15 + 0.35 + 0.49) / 4.0).abs() < 1e-6);
+        assert!((stats.min - 0.05).abs() < 1e-6);
+        assert!((stats.max - 0.49).abs() < 1e-6);
+        // Bucket width 0.2: [0.0,0.2) gets 0.05 and 0.15; [0.2,0.4) gets 0.35; [0.4,0.6) gets
+        // 0.49; the top two buckets stay empty since nothing discarded here reaches 0.6.
+        assert_eq!(stats.histogram, [2, 1, 1, 0, 0]);
+    }
+
+    /// An empty (no discards) summary reports zeroed fields rather than NaN/undefined values,
+    /// so a "nothing discarded" page reads as `discarded_count = 0` with a well-defined mean of
+    /// `0.0`, not a division-by-zero artifact.
+    #[test]
+    fn drop_score_discard_stats_defaults_to_zero_with_no_discards() {
+        let stats = DropScoreDiscardStats::default();
+        assert_eq!(stats.discarded_count, 0);
+        assert_eq!(stats.nan_count, 0);
+        assert_eq!(stats.mean(), 0.0);
+        assert_eq!(stats.min, 0.0);
+        assert_eq!(stats.max, 0.0);
+        assert_eq!(stats.histogram, [0, 0, 0, 0, 0]);
+    }
+
+    /// A score exactly at a bucket boundary (0.2, 0.4, 0.6, 0.8) must round into the bucket
+    /// starting there, not the one below — confirms `(score * buckets) as usize` truncates
+    /// rather than rounding-to-nearest, and that a score of exactly `1.0` clamps into the last
+    /// bucket instead of indexing one past the end.
+    #[test]
+    fn drop_score_discard_stats_histogram_boundaries_land_in_the_upper_bucket() {
+        let mut stats = DropScoreDiscardStats::default();
+        for score in [0.0_f32, 0.2, 0.4, 0.6, 0.8, 1.0] {
+            stats.record(score);
+        }
+        assert_eq!(stats.histogram, [1, 1, 1, 1, 2]);
+    }
+
+    /// Drives `BoxScoreSummary::record` with a synthetic set of scores whose count, mean, min,
+    /// and max are known by hand. This is a new struct built for this task, so there is no
+    /// pre-instrumentation behaviour to diverge from — the test pins the arithmetic (mean =
+    /// sum/count over non-NaN scores) rather than catching a regression.
+    #[test]
+    fn box_score_summary_computes_exact_summary_from_synthetic_scores() {
+        let mut stats = BoxScoreSummary::default();
+        for score in [0.62_f32, 0.71, 0.88, 0.93] {
+            stats.record(score);
+        }
+        stats.record(f32::NAN);
+
+        assert_eq!(stats.count, 4);
+        assert!((stats.mean() - (0.62 + 0.71 + 0.88 + 0.93) / 4.0).abs() < 1e-6);
+        assert!((stats.min - 0.62).abs() < 1e-6);
+        assert!((stats.max - 0.93).abs() < 1e-6);
+    }
+
+    /// An empty (no recorded scores) summary reports zeroed fields rather than NaN/undefined
+    /// values, matching `DropScoreDiscardStats::mean`'s "no data" convention.
+    #[test]
+    fn box_score_summary_defaults_to_zero_with_no_scores() {
+        let stats = BoxScoreSummary::default();
+        assert_eq!(stats.count, 0);
+        assert_eq!(stats.mean(), 0.0);
+        assert_eq!(stats.min, 0.0);
+        assert_eq!(stats.max, 0.0);
+    }
+
+    /// The session must receive the *entire* resolved process budget, not the hardcoded `1`
+    /// this replaced. `workers * intra_threads <= budget` still holds because the mutex caps
+    /// PaddleOCR to one concurrent worker. Honest caveat: this is a new pure function, so there
+    /// is no unfixed version of it to fail against — the assertion's value is pinning the policy
+    /// so a future clamp back to `1` (or a multi-session pool) is forced to revisit it.
+    #[test]
+    fn paddle_session_thread_budget_grants_the_full_resolved_budget() {
+        assert_eq!(paddle_session_thread_budget(1), 1);
+        assert_eq!(paddle_session_thread_budget(4), 4);
+        assert_eq!(paddle_session_thread_budget(8), 8);
+    }
+
+    /// `resolve_thread_budget` never returns `0`, but the pure function must not assume it —
+    /// `with_intra_threads(0)` would be a session-construction footgun.
+    #[test]
+    fn paddle_session_thread_budget_floors_at_one() {
+        assert_eq!(paddle_session_thread_budget(0), 1);
+    }
 
     const CONCURRENT_INITIALIZER_COUNT: usize = 8;
 
@@ -1303,7 +1911,7 @@ mod tests {
             include_elements: true,
             min_level: OcrElementLevel::Word,
             min_confidence: 0.5,
-            build_hierarchy: false,
+            build_hierarchy: true,
         };
 
         let selected = PaddleOcrBackend::select_output_elements(&lines, &words, Some(&config));
@@ -1312,6 +1920,7 @@ mod tests {
             selected.iter().map(|element| element.text.as_str()).collect::<Vec<_>>(),
             ["line", "kept"]
         );
+        assert_eq!(selected[1].parent_id.as_deref(), selected[0].element_id());
     }
 
     #[test]
@@ -1366,6 +1975,154 @@ mod tests {
             blocks.iter().map(|block| block.block.text.as_str()).collect::<Vec<_>>(),
             ["first", "second"]
         );
+    }
+
+    /// #640 — on a page rendered from a `/Rotate 270` PDF page, the OCR raster is in
+    /// the page's raw MediaBox orientation (`normalize_rendered_page_for_ocr`), so
+    /// text that reads top-to-bottom on the page appears as a column running along
+    /// the raster's X axis. The detector's own `(y, x)`-in-raster-space order groups
+    /// these lines into several descending runs instead of one top-to-bottom pass;
+    /// `reorder_blocks_for_page_rotation` must recover the true (monotonic) order.
+    ///
+    /// This fails against the unfixed code: without a `reorder_blocks_for_page_rotation`
+    /// call, blocks are left in the order the detector handed them — raw ascending
+    /// raster `min_y` (90, 100, 105, 110), i.e. `["line3", "line1", "line4", "line2"]`
+    /// — not the monotonic `["line1", "line2", "line3", "line4"]` asserted below.
+    #[test]
+    fn reorders_blocks_into_monotonic_order_on_a_rotated_page() {
+        // Detector order: ascending raster min_y (90, 100, 105, 110) — not true
+        // reading order, which runs by descending raster min_x instead (800, 600,
+        // 400, 200) on this /Rotate 270 page.
+        let mut blocks = vec![
+            detailed_block("line3", 400, 90, 20, 20),
+            detailed_block("line1", 800, 100, 20, 20),
+            detailed_block("line4", 200, 105, 20, 20),
+            detailed_block("line2", 600, 110, 20, 20),
+        ];
+
+        PaddleOcrBackend::reorder_blocks_for_page_rotation(&mut blocks, 270, 900, 1000);
+
+        let order: Vec<&str> = blocks.iter().map(|block| block.block.text.as_str()).collect();
+        assert_eq!(
+            order,
+            ["line1", "line2", "line3", "line4"],
+            "reading order must be monotonic"
+        );
+    }
+
+    /// #640 — an unrotated page (`page_rotation_degrees == 0`, the overwhelmingly
+    /// common case) must not be touched at all: reordering by a no-op correction
+    /// would silently perturb pages that are already correct (guards against
+    /// introducing a *second* rotation bug while fixing this one).
+    #[test]
+    fn leaves_block_order_unchanged_when_page_is_not_rotated() {
+        let mut blocks = vec![
+            detailed_block("first", 10, 10, 20, 20),
+            detailed_block("second", 10, 40, 20, 20),
+            detailed_block("third", 10, 70, 20, 20),
+        ];
+        let original: Vec<String> = blocks.iter().map(|block| block.block.text.clone()).collect();
+
+        PaddleOcrBackend::reorder_blocks_for_page_rotation(&mut blocks, 0, 900, 1000);
+
+        let order: Vec<&str> = blocks.iter().map(|block| block.block.text.as_str()).collect();
+        assert_eq!(order, original.iter().map(String::as_str).collect::<Vec<_>>());
+    }
+
+    /// #640 — `extractors::pdf::ocr` threads the page's `/Rotate` value through
+    /// `OcrConfig.backend_options["page_rotation_degrees"]`; absent (or non-numeric)
+    /// values must resolve to "no rotation" so direct image OCR and other backends'
+    /// configs reusing this field are unaffected.
+    #[test]
+    fn reads_page_rotation_hint_from_backend_options() {
+        let with_hint = OcrConfig {
+            backend_options: Some(serde_json::json!({"page_rotation_degrees": 270})),
+            ..Default::default()
+        };
+        assert_eq!(
+            PaddleOcrBackend::page_rotation_degrees_from_backend_options(&with_hint),
+            270
+        );
+
+        let without_hint = OcrConfig::default();
+        assert_eq!(
+            PaddleOcrBackend::page_rotation_degrees_from_backend_options(&without_hint),
+            0
+        );
+
+        let non_numeric = OcrConfig {
+            backend_options: Some(serde_json::json!({"page_rotation_degrees": "sideways"})),
+            ..Default::default()
+        };
+        assert_eq!(
+            PaddleOcrBackend::page_rotation_degrees_from_backend_options(&non_numeric),
+            0
+        );
+    }
+
+    /// The defect this guards: `reorder_blocks_for_page_rotation`'s premise is that its
+    /// blocks live in the *raw* MediaBox raster the `/Rotate` hint describes. When
+    /// `auto_rotate` actually rotated the raster before OCR, reordering by the raw
+    /// `/Rotate` value alone double-corrects — once via the pixel rotation already
+    /// applied, once via the reorder itself.
+    ///
+    /// Exhaustive over all four quarter-turns of `page_rotation_degrees` crossed with
+    /// "not auto-rotated" and every quarter-turn `detect_and_rotate` could actually apply
+    /// (`auto_rotate_applied_degrees`). This fails against the unfixed code path, which
+    /// passes the raw `page_rotation_degrees` straight to `do_ocr` regardless of whether
+    /// auto-rotation ran — i.e. it never applies the `Some(_)` composition below at all.
+    #[test]
+    fn residual_rotation_composes_page_rotate_with_applied_auto_rotation() {
+        // Not auto-rotated (config off, low-confidence detection, or detection failure
+        // falling back to `RotationOutcome::unrotated`): the raster is still the raw
+        // MediaBox raster, so the residual must equal `page_rotation_degrees` unchanged.
+        for page_rotation_degrees in [0, 90, 180, 270] {
+            assert_eq!(
+                PaddleOcrBackend::residual_rotation_for_reorder(page_rotation_degrees, None),
+                page_rotation_degrees,
+                "page_rotation_degrees={page_rotation_degrees} must pass through unchanged when not auto-rotated"
+            );
+        }
+
+        // Auto-rotated: a detector reading `applied_degrees` on the raw raster caused a
+        // pixel rotation of `(360 - applied_degrees) % 360`. When the detector's estimate
+        // matches the page's own `/Rotate` value, the raster is now upright and the
+        // residual must be 0 — no further reordering.
+        for page_rotation_degrees in [0u32, 90, 180, 270] {
+            assert_eq!(
+                PaddleOcrBackend::residual_rotation_for_reorder(page_rotation_degrees, Some(page_rotation_degrees)),
+                0,
+                "page_rotation_degrees={page_rotation_degrees} must fully cancel when the detector agrees with it"
+            );
+        }
+
+        // General composition table: residual = (page_rotation_degrees + 360 -
+        // applied_degrees) % 360, for every quarter-turn combination.
+        let cases: [(u32, u32, u32); 16] = [
+            (0, 90, 270),
+            (0, 180, 180),
+            (0, 270, 90),
+            (90, 90, 0),
+            (90, 180, 270),
+            (90, 270, 180),
+            (180, 90, 90),
+            (180, 180, 0),
+            (180, 270, 270),
+            (270, 90, 180),
+            (270, 180, 90),
+            (270, 270, 0),
+            (0, 0, 0),
+            (90, 0, 90),
+            (180, 0, 180),
+            (270, 0, 270),
+        ];
+        for (page_rotation_degrees, applied_degrees, expected_residual) in cases {
+            assert_eq!(
+                PaddleOcrBackend::residual_rotation_for_reorder(page_rotation_degrees, Some(applied_degrees)),
+                expected_residual,
+                "page_rotation_degrees={page_rotation_degrees}, applied_degrees={applied_degrees}"
+            );
+        }
     }
 
     #[test]
@@ -1593,7 +2350,12 @@ mod tests {
     #[test]
     fn test_paddle_ocr_table_detection_disabled_by_default() {
         let backend = PaddleOcrBackend::new().unwrap();
-        assert!(!backend.supports_table_detection());
+        assert!(
+            !backend.supports_table_detection(),
+            "paddle has no table-vs-prose discriminator, so enabling it by default fabricates \
+             wide garbage tables out of ordinary prose -- measured 390 fabricated rows on a \
+             document containing no tables at all"
+        );
     }
 
     #[test]
@@ -1769,5 +2531,903 @@ mod tests {
         PADDLE_TL_ACCEL.with(|cell| {
             cell.replace(None);
         });
+    }
+
+    /// Builds a `HocrWord` at the given pixel geometry, purely for clustering/reconstruction
+    /// tests below — text content is irrelevant to region splitting.
+    fn hocr_word_at(text: &str, left: u32, top: u32, width: u32, height: u32) -> crate::table_core::HocrWord {
+        crate::table_core::HocrWord {
+            text: text.to_string(),
+            left,
+            top,
+            width,
+            height,
+            confidence: 90.0,
+        }
+    }
+
+    /// Defect regression: the `Table` PaddleOCR emits must carry a real `bounding_box`
+    /// derived from the words that formed the table region, not the hardcoded `None` the
+    /// unfixed code pushed regardless of geometry.
+    ///
+    /// Without the fix, `Table.bounding_box` is unconditionally `None`, so this test's
+    /// equality assertion fails: `left` is `None` instead of
+    /// `Some(BoundingBox { x0: 0.0, y0: 500.0, x1: 240.0, y1: 535.0 })`. That `None` is exactly
+    /// why nothing downstream (`pdf::structure::pipeline::table_bboxes_by_page` /
+    /// `filter_segments_by_table_bboxes`) can suppress the prose the table duplicates.
+    #[test]
+    fn build_ocr_tables_from_words_populates_bounding_box_from_region_extents() {
+        let words = vec![
+            // 2 rows x 3 cols: left=0..240, top=500..535 in pixel space.
+            hocr_word_at("B11", 0, 500, 40, 15),
+            hocr_word_at("B12", 100, 500, 40, 15),
+            hocr_word_at("B13", 200, 500, 40, 15),
+            hocr_word_at("B21", 0, 520, 40, 15),
+            hocr_word_at("B22", 100, 520, 40, 15),
+            hocr_word_at("B23", 200, 520, 40, 15),
+        ];
+
+        let built = PaddleOcrBackend::build_ocr_tables_from_words(&words);
+
+        assert_eq!(
+            built.tables.len(),
+            1,
+            "the 3x2 grid should be detected as exactly one table"
+        );
+        let table = &built.tables[0];
+        assert_eq!(
+            table.bounding_box,
+            Some(crate::types::extraction::BoundingBox {
+                x0: 0.0,
+                y0: 500.0,
+                x1: 240.0,
+                y1: 535.0,
+            }),
+            "bounding_box must be derived from the region's word extents, not left None"
+        );
+    }
+
+    /// Two tables stacked vertically with a large blank gap between them must become two
+    /// separate regions, not one region spanning both.
+    ///
+    /// Without the fix, paddle's table path called `reconstruct_table` once over every
+    /// table-confidence word on the whole page (`table_count` hardcoded to at most 1), so the
+    /// words from both tables below would be reconstructed together, and this test's row-count
+    /// assertion on the *first* region would fail (it would see all 8 words merged into one
+    /// region with 4 rows instead of two 2-row regions).
+    #[test]
+    fn cluster_words_into_table_regions_splits_two_vertically_separated_tables() {
+        let words = vec![
+            // Table 1: 2 rows x 2 cols, rows at y=0 and y=20, height 15.
+            hocr_word_at("A1", 0, 0, 40, 15),
+            hocr_word_at("B1", 100, 0, 40, 15),
+            hocr_word_at("A2", 0, 20, 40, 15),
+            hocr_word_at("B2", 100, 20, 40, 15),
+            // Large vertical gap (well beyond 3x avg word height of 15).
+            hocr_word_at("C1", 0, 500, 40, 15),
+            hocr_word_at("D1", 100, 500, 40, 15),
+            hocr_word_at("C2", 0, 520, 40, 15),
+            hocr_word_at("D2", 100, 520, 40, 15),
+        ];
+
+        let regions = crate::table_core::cluster_words_into_table_regions(&words);
+
+        assert_eq!(regions.len(), 2, "a wide vertical gap must split into two regions");
+        assert_eq!(regions[0].len(), 4, "first region should contain only table 1's words");
+        assert_eq!(regions[1].len(), 4, "second region should contain only table 2's words");
+    }
+
+    /// Two sub-tables placed side by side, sharing the same row y-positions, must land in a
+    /// *single* region (and therefore a single reconstructed table spanning both), because
+    /// there is no vertical gap between them for the region split to key off of. This is the
+    /// newspaper-stock-table shape from `test_documents/images_extra/ocr_image.tiff`.
+    ///
+    /// Without the fix (whole-page `reconstruct_table` call, no clustering at all) this case
+    /// happened to already work by accident, since one big call also keeps them together — the
+    /// case that actually distinguishes "region clustering exists" is the vertically-separated
+    /// test above. This test guards against a *wrong* clustering fix that keys off horizontal
+    /// position (which would wrongly split side-by-side tables into two regions and defeat the
+    /// merged-shared-row reconstruction).
+    #[test]
+    fn cluster_words_into_table_regions_keeps_side_by_side_tables_in_one_region() {
+        let words = vec![
+            // Left sub-table columns at x=0, x=60. Right sub-table columns at x=300, x=360.
+            hocr_word_at("L1", 0, 0, 40, 15),
+            hocr_word_at("L2", 60, 0, 40, 15),
+            hocr_word_at("R1", 300, 0, 40, 15),
+            hocr_word_at("R2", 360, 0, 40, 15),
+            hocr_word_at("L3", 0, 20, 40, 15),
+            hocr_word_at("L4", 60, 20, 40, 15),
+            hocr_word_at("R3", 300, 20, 40, 15),
+            hocr_word_at("R4", 360, 20, 40, 15),
+        ];
+
+        let regions = crate::table_core::cluster_words_into_table_regions(&words);
+
+        assert_eq!(
+            regions.len(),
+            1,
+            "side-by-side sub-tables sharing rows must stay in one region"
+        );
+        assert_eq!(regions[0].len(), 8);
+    }
+
+    /// End-to-end reconstruction over the side-by-side case: `reconstruct_table` must detect
+    /// all four columns (two per sub-table) and both shared rows, producing one merged table
+    /// rather than dropping either sub-table's columns.
+    #[test]
+    fn reconstruct_table_merges_side_by_side_subtables_onto_shared_rows() {
+        let words = vec![
+            hocr_word_at("L1", 0, 0, 40, 15),
+            hocr_word_at("L2", 60, 0, 40, 15),
+            hocr_word_at("R1", 300, 0, 40, 15),
+            hocr_word_at("R2", 360, 0, 40, 15),
+            hocr_word_at("L3", 0, 20, 40, 15),
+            hocr_word_at("L4", 60, 20, 40, 15),
+            hocr_word_at("R3", 300, 20, 40, 15),
+            hocr_word_at("R4", 360, 20, 40, 15),
+        ];
+
+        let regions = crate::table_core::cluster_words_into_table_regions(&words);
+        assert_eq!(regions.len(), 1);
+
+        let cells = reconstruct_table(&regions[0], 20, 0.5);
+        assert_eq!(cells.len(), 2, "both shared rows should be reconstructed");
+        assert_eq!(
+            cells[0].len(),
+            4,
+            "all four columns from both sub-tables should be detected"
+        );
+    }
+
+    /// A page-scale defect test: two real tables of *differing* shapes (2 cols vs 3 cols), far
+    /// apart vertically, plus a small cluster of stray words below the noise threshold. This
+    /// exercises the whole loop the fix adds in `process_image` (region splitting + per-region
+    /// `MIN_TABLE_CANDIDATE_WORDS` filtering), not just the clustering helper in isolation.
+    ///
+    /// Without the fix, all three clusters' words would be fed through one whole-page
+    /// `reconstruct_table` call and reported as `table_count == 1` with row/col counts describing
+    /// a single nonsensical merged grid, rather than 2 real tables and the stray cluster dropped.
+    #[test]
+    fn table_region_pipeline_reports_two_tables_of_differing_shape_and_drops_noise() {
+        let mut words = vec![
+            // Table A: 3 rows x 2 cols (6 words, exactly at MIN_TABLE_CANDIDATE_WORDS so it
+            // survives the noise gate).
+            hocr_word_at("A11", 0, 0, 40, 15),
+            hocr_word_at("A12", 100, 0, 40, 15),
+            hocr_word_at("A21", 0, 20, 40, 15),
+            hocr_word_at("A22", 100, 20, 40, 15),
+            hocr_word_at("A31", 0, 40, 40, 15),
+            hocr_word_at("A32", 100, 40, 40, 15),
+        ];
+        // Table B: 2 rows x 3 cols, far below table A.
+        words.extend([
+            hocr_word_at("B11", 0, 500, 40, 15),
+            hocr_word_at("B12", 100, 500, 40, 15),
+            hocr_word_at("B13", 200, 500, 40, 15),
+            hocr_word_at("B21", 0, 520, 40, 15),
+            hocr_word_at("B22", 100, 520, 40, 15),
+            hocr_word_at("B23", 200, 520, 40, 15),
+        ]);
+        // Stray noise cluster: only 2 words, far below both tables, must be dropped by the
+        // MIN_TABLE_CANDIDATE_WORDS gate.
+        words.extend([
+            hocr_word_at("N1", 0, 1000, 40, 15),
+            hocr_word_at("N2", 100, 1000, 40, 15),
+        ]);
+
+        let mut reconstructed_tables: Vec<Vec<Vec<String>>> = Vec::new();
+        for region_words in crate::table_core::cluster_words_into_table_regions(&words) {
+            if region_words.len() < crate::table_core::MIN_TABLE_CANDIDATE_WORDS {
+                continue;
+            }
+            let cells = reconstruct_table(&region_words, 20, 0.5);
+            if cells.is_empty() || cells[0].is_empty() {
+                continue;
+            }
+            reconstructed_tables.push(cells);
+        }
+
+        assert_eq!(
+            reconstructed_tables.len(),
+            2,
+            "exactly two tables should survive: A and B, with the stray pair dropped"
+        );
+        assert_eq!(reconstructed_tables[0].len(), 3, "table A should have 3 rows");
+        assert_eq!(reconstructed_tables[0][0].len(), 2, "table A should have 2 columns");
+        assert_eq!(reconstructed_tables[1].len(), 2, "table B should have 2 rows");
+        assert_eq!(reconstructed_tables[1][0].len(), 3, "table B should have 3 columns");
+    }
+
+    /// Real (text, left, top, width, height) word geometry captured from PaddleOCR word-level
+    /// output on page 1 of `test_documents/pdf_scanned/ordinance_2197_scanned.pdf` (a 16-page
+    /// municipal ordinance with zero real tables; see
+    /// `test_documents/ground_truth/pdf/ordinance_2197.txt`, which has zero pipe rows). All 355
+    /// words recognised on the page are included: unfiltered, they cluster into one region (no
+    /// gap in a page of continuous body text exceeds the region-split threshold) and
+    /// `reconstruct_table` fabricates a 24-row x 36-column grid from it (measured directly from
+    /// this fixture), because ordinary paragraph prose has no genuine repeated column structure --
+    /// each line's word x-positions rarely coincide with any other line's under the paddle table
+    /// path's 20px column threshold.
+    #[cfg(feature = "pdf")]
+    const PROSE_PAGE_WORDS: &[(&str, u32, u32, u32, u32)] = &[
+        ("district", 260, 134, 40, 75),
+        ("zonn", 373, 134, 41, 60),
+        ("zoning", 403, 134, 39, 70),
+        ("comprehensive", 748, 134, 40, 156),
+        ("located", 460, 136, 41, 73),
+        ("hereby", 547, 136, 42, 67),
+        ("and", 839, 136, 31, 38),
+        ("SOUTHEAST", 1296, 136, 41, 154),
+        ("ordinance:", 175, 137, 33, 109),
+        ("Texas.", 347, 137, 34, 67),
+        ("Development", 1150, 137, 45, 137),
+        ("Parkway", 1181, 137, 40, 86),
+        ("AN", 1412, 137, 44, 39),
+        ("requested", 865, 138, 33, 93),
+        ("public", 953, 138, 33, 66),
+        ("City", 1065, 138, 41, 41),
+        ("land", 1212, 138, 39, 44),
+        ("PLAN", 1326, 138, 41, 65),
+        ("A", 430, 141, 41, 12),
+        ("THEREFORE:", 725, 141, 33, 152),
+        ("PROVIDING", 1385, 142, 40, 143),
+        ("DISTRICT", 1357, 144, 39, 120),
+        ("attached", 430, 161, 41, 81),
+        ("ORDINANCE", 1411, 188, 45, 150),
+        ("located", 1212, 190, 39, 70),
+        ("Council,", 1065, 194, 41, 82),
+        ("dsrt", 373, 209, 41, 74),
+        ("hearing", 953, 209, 33, 72),
+        ("Se", 285, 210, 44, 26),
+        ("declared", 546, 211, 42, 87),
+        ("Section1.That", 576, 211, 40, 173),
+        ("classification.", 257, 212, 42, 140),
+        ("at", 460, 212, 41, 19),
+        ("Section", 489, 212, 41, 80),
+        ("e,", 977, 214, 44, 39),
+        ("Section", 201, 216, 40, 72),
+        ("district", 403, 219, 39, 70),
+        ("WHEREAS,", 1096, 219, 41, 122),
+        ("WHEREAS,", 779, 220, 41, 121),
+        ("WHEREAS,", 1239, 221, 41, 123),
+        ("WHEREAS,", 1007, 222, 45, 122),
+        ("WHEREAS,", 891, 225, 45, 124),
+        ("FOR", 1326, 228, 41, 52),
+        ("and", 1181, 238, 40, 32),
+        ("the", 460, 240, 41, 25),
+        ("zoning", 865, 242, 33, 66),
+        ("hereto", 430, 257, 41, 60),
+        ("n", 977, 258, 44, 17),
+        ("on", 285, 268, 44, 19),
+        ("southeast", 460, 274, 41, 96),
+        ("within", 1211, 274, 40, 64),
+        ("TO", 1357, 274, 39, 29),
+        ("recommending", 1064, 277, 42, 152),
+        ("classifcaon", 372, 284, 42, 135),
+        ("(PD)", 1150, 284, 44, 48),
+        ("Creek", 1180, 284, 41, 60),
+        ("h", 977, 287, 44, 18),
+        ("on", 953, 292, 33, 22),
+        ("4.", 201, 296, 40, 18),
+        ("3.That", 285, 298, 44, 78),
+        ("classification", 402, 298, 40, 129),
+        ("APPROXIMATELY", 1325, 298, 42, 223),
+        ("true", 545, 300, 42, 39),
+        ("CORNER", 1296, 300, 41, 106),
+        ("2.", 489, 301, 41, 19),
+        ("FOR", 1384, 302, 41, 50),
+        ("plan", 748, 304, 40, 47),
+        ("PLANNED", 1356, 313, 40, 120),
+        ("change", 865, 319, 33, 66),
+        ("such", 953, 320, 33, 44),
+        ("and", 430, 325, 41, 32),
+        ("That", 201, 329, 40, 45),
+        ("That", 489, 335, 41, 46),
+        ("District", 1149, 335, 45, 78),
+        ("me", 976, 339, 44, 25),
+        ("the", 1211, 339, 39, 31),
+        ("the", 1007, 347, 44, 34),
+        ("and", 545, 348, 41, 39),
+        ("the", 1096, 349, 41, 33),
+        ("the", 778, 350, 42, 33),
+        ("OF", 1411, 350, 44, 32),
+        ("the", 1239, 351, 41, 27),
+        ("the", 891, 358, 45, 36),
+        ("Bend", 1180, 359, 41, 45),
+        ("and", 747, 365, 40, 33),
+        ("incorporated", 429, 366, 42, 128),
+        ("corner", 460, 372, 41, 67),
+        ("requested", 953, 375, 33, 94),
+        ("A", 1384, 376, 40, 16),
+        ("the", 284, 379, 45, 33),
+        ("BE", 662, 379, 41, 31),
+        ("the", 200, 382, 41, 32),
+        ("nd", 976, 383, 44, 25),
+        ("City", 1211, 385, 39, 37),
+        ("current", 1238, 386, 42, 74),
+        ("THE", 1411, 387, 44, 54),
+        ("OF", 637, 389, 33, 32),
+        ("the", 489, 390, 41, 33),
+        ("City", 1095, 390, 41, 40),
+        ("City", 1007, 391, 44, 42),
+        ("the", 576, 393, 40, 24),
+        ("correct.", 544, 395, 42, 80),
+        ("and", 865, 396, 33, 33),
+        ("City", 778, 398, 41, 39),
+        ("City", 891, 403, 44, 42),
+        ("now", 747, 412, 40, 40),
+        ("IT", 662, 413, 41, 31),
+        ("OF", 1296, 416, 41, 31),
+        ("CHANGE", 1384, 416, 40, 103),
+        ("Drive,", 1180, 419, 40, 66),
+        ("m", 976, 420, 44, 17),
+        ("following", 200, 422, 40, 99),
+        ("City's", 284, 423, 44, 48),
+        ("Final", 1149, 423, 44, 48),
+        ("THE", 637, 427, 33, 49),
+        ("zoning", 489, 431, 41, 67),
+        ("of", 1211, 431, 39, 24),
+        ("facts", 575, 433, 41, 46),
+        ("nder", 372, 434, 41, 47),
+        ("approval", 1064, 437, 41, 88),
+        ("Planning", 1095, 438, 41, 88),
+        ("the", 865, 440, 33, 27),
+        ("of", 459, 441, 41, 18),
+        ("Planning", 1006, 442, 45, 86),
+        ("to", 402, 443, 40, 18),
+        ("DEVELOPMENT", 1355, 443, 40, 198),
+        ("CITY", 1411, 446, 44, 61),
+        ("ORDAINED", 661, 447, 42, 133),
+        ("Council", 777, 453, 42, 80),
+        ("Planning", 890, 454, 45, 88),
+        ("LAKE", 1295, 457, 41, 65),
+        ("Sugar", 1211, 463, 39, 57),
+        ("e", 976, 464, 44, 17),
+        ("property", 1238, 468, 41, 81),
+        ("Lake", 459, 469, 41, 45),
+        ("deems", 747, 473, 40, 67),
+        ("Planned", 402, 475, 39, 78),
+        ("same", 865, 478, 33, 49),
+        ("zoning", 953, 480, 33, 60),
+        ("official", 284, 482, 44, 70),
+        ("the", 372, 482, 41, 33),
+        ("Development", 1147, 482, 45, 129),
+        ("and", 575, 488, 41, 31),
+        ("CITY", 637, 488, 33, 60),
+        ("be", 1180, 494, 40, 18),
+        ("herein", 429, 502, 41, 60),
+        ("ORDINANCE", 1474, 502, 32, 148),
+        ("district", 488, 506, 42, 74),
+        ("n", 975, 508, 45, 18),
+        ("COUNCIL", 1410, 519, 45, 113),
+        ("rezoned", 1179, 521, 41, 80),
+        ("comprehensive", 371, 523, 41, 149),
+        ("Pointe", 459, 524, 41, 60),
+        ("recitations", 575, 528, 40, 108),
+        ("Land", 1210, 528, 39, 51),
+        ("POINTE", 1295, 532, 41, 93),
+        ("0.7906", 1325, 532, 41, 79),
+        ("is", 865, 533, 33, 22),
+        ("of", 1064, 533, 40, 19),
+        ("and", 1094, 534, 42, 40),
+        ("Exhibits", 199, 536, 41, 85),
+        ("ae", 975, 537, 44, 47),
+        ("and", 1006, 538, 44, 34),
+        ("finds", 777, 542, 41, 46),
+        ("OF", 1383, 543, 40, 29),
+        ("it", 747, 547, 39, 20),
+        ("change;", 953, 551, 33, 78),
+        ("owner", 1237, 557, 42, 61),
+        ("OF", 637, 559, 33, 33),
+        ("and", 890, 559, 44, 36),
+        ("herein", 865, 560, 33, 61),
+        ("the", 1063, 560, 41, 32),
+        ("zoning", 283, 563, 45, 63),
+        ("Development", 401, 569, 40, 131),
+        ("by", 429, 571, 41, 25),
+        ("appropriate", 746, 580, 40, 114),
+        ("classification", 488, 582, 41, 136),
+        ("Zoning", 1005, 582, 45, 71),
+        ("Zoning", 1094, 582, 41, 67),
+        ("(the", 1210, 587, 39, 37),
+        ("BY", 661, 591, 41, 30),
+        ("Parkway", 459, 592, 41, 87),
+        ("rezoning", 1063, 594, 41, 87),
+        ("ZONING", 1383, 596, 40, 96),
+        ("SUGAR", 637, 598, 33, 82),
+        ("that", 777, 604, 41, 39),
+        ("Zoning", 889, 604, 45, 73),
+        ("reference,", 429, 605, 41, 100),
+        ("from", 1179, 616, 41, 46),
+        ("Plan;", 1147, 621, 44, 48),
+        ("has", 1237, 625, 41, 34),
+        ("ACRES", 1325, 627, 40, 85),
+        ("are", 199, 629, 40, 31),
+        ("THE", 661, 632, 41, 51),
+        ("incorporated", 865, 632, 33, 126),
+        ("c", 975, 633, 44, 18),
+        ("and", 953, 634, 33, 39),
+        ("PARKWAY", 1295, 635, 41, 126),
+        ("map", 283, 636, 44, 41),
+        ("\"City\"),", 1210, 639, 39, 76),
+        ("set", 574, 644, 41, 33),
+        ("OF", 1410, 644, 44, 33),
+        ("(PD)", 1355, 645, 39, 55),
+        ("the", 776, 652, 42, 32),
+        ("NO.", 1474, 661, 32, 47),
+        ("Commission", 1004, 663, 45, 123),
+        ("Commission", 1093, 665, 42, 121),
+        ("requested", 1236, 667, 42, 95),
+        ("attached", 198, 669, 41, 85),
+        ("que", 974, 677, 45, 62),
+        ("Business", 1178, 677, 41, 88),
+        ("zoning", 370, 679, 42, 68),
+        ("forth", 574, 679, 41, 53),
+        ("and", 1147, 679, 44, 34),
+        ("be", 283, 680, 44, 27),
+        ("THE", 1409, 681, 45, 54),
+        ("Commission", 888, 686, 45, 127),
+        ("and", 459, 688, 40, 31),
+        ("request;", 1063, 689, 40, 87),
+        ("LAND,", 637, 691, 33, 82),
+        ("CITY", 660, 693, 42, 58),
+        ("zoning", 776, 693, 41, 66),
+        ("is", 429, 707, 41, 26),
+        ("to", 746, 707, 40, 20),
+        ("FROM", 1382, 709, 41, 70),
+        ("2197", 1474, 709, 32, 53),
+        ("amended", 282, 710, 45, 92),
+        ("DISTRICT", 1354, 710, 40, 114),
+        ("(PD)", 401, 715, 40, 46),
+        ("at", 1209, 723, 40, 18),
+        ("of", 488, 726, 41, 19),
+        ("Creek", 459, 729, 40, 52),
+        ("OF", 1325, 730, 40, 30),
+        ("changed", 428, 734, 42, 87),
+        ("in", 574, 740, 41, 19),
+        ("CITY", 1409, 740, 44, 62),
+        ("make", 746, 747, 39, 52),
+        ("ordiance", 370, 748, 41, 101),
+        ("the", 1209, 750, 39, 30),
+        ("by", 974, 751, 44, 31),
+        ("approximately", 487, 753, 42, 143),
+        ("COUNCIL", 660, 761, 41, 113),
+        ("and", 865, 764, 33, 38),
+        ("the", 574, 768, 41, 32),
+        ("hereto", 198, 769, 40, 58),
+        ("request", 775, 769, 42, 80),
+        ("that", 1236, 769, 41, 41),
+        ("AND", 1294, 771, 42, 51),
+        ("TEXAS:", 637, 774, 33, 93),
+        ("District", 401, 775, 40, 74),
+        ("LAND", 1324, 776, 41, 72),
+        ("and", 1063, 777, 40, 39),
+        ("Office", 1178, 780, 41, 61),
+        ("l", 974, 781, 44, 17),
+        ("Southeast", 1209, 789, 39, 96),
+        ("forwarded", 1093, 795, 41, 101),
+        ("Bend", 458, 796, 41, 46),
+        ("and", 1004, 796, 44, 34),
+        ("to", 282, 805, 44, 19),
+        ("preamble", 573, 809, 42, 88),
+        ("approximately", 1235, 810, 42, 150),
+        ("BUSINESS", 1381, 810, 41, 116),
+        ("such", 746, 813, 39, 46),
+        ("made", 865, 813, 33, 49),
+        ("OF", 1409, 814, 44, 32),
+        ("recommended", 887, 823, 45, 142),
+        ("from", 428, 830, 41, 39),
+        ("an", 974, 832, 44, 25),
+        ("CREEK", 1294, 833, 41, 85),
+        ("FINAL", 1354, 833, 39, 75),
+        ("reflect", 282, 835, 44, 63),
+        ("the", 1003, 840, 45, 34),
+        ("and", 198, 842, 40, 32),
+        ("(B-O)", 1178, 850, 41, 60),
+        ("SUGAR", 1408, 850, 45, 91),
+        ("Drive,", 458, 851, 41, 59),
+        ("of", 370, 857, 41, 19),
+        ("complies", 775, 858, 41, 87),
+        ("Final", 400, 863, 40, 52),
+        ("a", 865, 868, 33, 11),
+        ("LOCATED", 1324, 871, 41, 118),
+        ("zoning", 745, 872, 40, 72),
+        ("the", 370, 877, 41, 33),
+        ("City", 1003, 884, 44, 42),
+        ("Business", 428, 885, 41, 93),
+        ("incorporated", 197, 888, 41, 125),
+        ("part", 865, 890, 33, 38),
+        ("corner", 1208, 893, 40, 63),
+        ("pable", 973, 898, 45, 84),
+        ("this", 281, 901, 45, 41),
+        ("0.7906", 487, 904, 41, 67),
+        ("its", 1093, 905, 41, 25),
+        ("of", 573, 906, 41, 26),
+        ("Cty", 369, 918, 42, 40),
+        ("described", 458, 918, 40, 93),
+        ("District", 1177, 919, 41, 74),
+        ("Development", 400, 924, 40, 134),
+        ("DEVELOPMENT", 1353, 924, 40, 193),
+        ("BEND", 1294, 928, 41, 65),
+        ("of", 865, 934, 33, 22),
+        ("Council", 1002, 935, 45, 79),
+        ("final", 1092, 939, 42, 46),
+        ("the", 573, 941, 41, 26),
+        ("change", 281, 945, 44, 71),
+        ("LAND,", 1408, 946, 44, 84),
+        ("OFFICE", 1381, 950, 40, 89),
+        ("change;", 745, 957, 39, 80),
+        ("with", 774, 960, 42, 46),
+        ("this", 865, 961, 33, 38),
+        ("0.7906", 1235, 961, 41, 68),
+        ("of", 1208, 964, 39, 25),
+        ("of", 369, 966, 41, 20),
+        ("granting", 886, 975, 45, 81),
+        ("ordinance", 573, 976, 41, 102),
+        ("rezoneord", 78, 982, 33, 56),
+        ("Office", 428, 987, 41, 59),
+        ("acres", 487, 987, 41, 46),
+        ("Sugar", 369, 993, 41, 54),
+        ("3/16/20", 69, 994, 23, 44),
+        ("r", 973, 994, 44, 17),
+        ("report", 1092, 994, 41, 60),
+        ("Lake", 1208, 997, 39, 44),
+        ("to", 1177, 1002, 41, 18),
+        ("DRIVE.", 1294, 1003, 41, 92),
+        ("ordinance;", 865, 1005, 33, 110),
+        ("in", 458, 1012, 40, 25),
+        ("AT", 1324, 1012, 40, 31),
+        ("the", 774, 1015, 41, 25),
+        ("have", 1002, 1016, 44, 49),
+        ("in", 281, 1019, 44, 19),
+        ("into", 197, 1022, 40, 38),
+        ("TEXAS,", 1408, 1034, 44, 89),
+        ("Planned", 1177, 1037, 41, 74),
+        ("acres", 1235, 1037, 41, 54),
+        ("of", 487, 1041, 41, 26),
+        ("Exhibit", 458, 1045, 40, 73),
+        ("zoning", 281, 1048, 44, 71),
+        ("NOW,", 745, 1049, 39, 73),
+        ("Land,", 369, 1055, 41, 60),
+        ("(B-O)", 428, 1055, 41, 60),
+        ("to", 1092, 1055, 41, 26),
+        ("Pointe", 1208, 1055, 39, 64),
+        ("City's", 774, 1056, 41, 67),
+        ("(B-O)", 1381, 1056, 40, 63),
+        ("THE", 1324, 1066, 40, 51),
+        ("e,", 973, 1067, 44, 39),
+        ("land", 487, 1069, 41, 46),
+        ("Plan", 400, 1073, 40, 40),
+        ("such", 886, 1074, 45, 44),
+        ("this", 197, 1075, 40, 38),
+        ("each", 1002, 1075, 44, 42),
+        ("are", 573, 1088, 41, 32),
+        ("the", 1092, 1090, 41, 32),
+        ("of", 1235, 1098, 41, 27),
+        ("a", 973, 1105, 44, 17),
+    ];
+
+    /// Real (text, left, top, width, height) word geometry captured from PaddleOCR word-level
+    /// output on `test_documents/images_extra/ocr_image.tiff` (a scanned newspaper stock table;
+    /// see `test_documents/ground_truth/tiff/image_tiff.md`, 16 rows x 10 cols, 154 non-empty
+    /// cells, dense and numeric) -- the cleanest genuine-table fixture available. All 215
+    /// recognised words are included so the two side-by-side sub-tables reconstruct with their
+    /// real column/row structure intact.
+    #[cfg(feature = "pdf")]
+    const DENSE_TABLE_WORDS: &[(&str, u32, u32, u32, u32)] = &[
+        ("Nasdaq", 48, 72, 185, 84),
+        ("&", 251, 74, 36, 83),
+        ("AMEX", 305, 75, 159, 84),
+        ("Stocks", 44, 152, 52, 32),
+        ("in", 102, 153, 20, 32),
+        ("bold", 128, 153, 37, 33),
+        ("rose", 171, 154, 37, 33),
+        ("or", 214, 155, 15, 32),
+        ("fell", 230, 156, 37, 32),
+        ("5%", 267, 156, 22, 33),
+        ("or", 295, 157, 21, 32),
+        ("more", 322, 158, 43, 32),
+        ("USA", 78, 194, 40, 32),
+        ("Track", 136, 188, 44, 34),
+        ("your", 192, 189, 39, 34),
+        ("investments", 237, 190, 111, 35),
+        ("with", 360, 193, 38, 33),
+        ("our", 404, 194, 26, 33),
+        ("continuously", 442, 195, 113, 34),
+        ("TODAY", 48, 218, 73, 29),
+        ("updated", 135, 215, 73, 33),
+        ("stocks.", 215, 216, 63, 33),
+        ("Visit", 285, 217, 41, 33),
+        ("us", 333, 218, 14, 32),
+        ("on", 360, 218, 14, 33),
+        ("the", 387, 219, 24, 32),
+        ("web", 424, 220, 30, 32),
+        ("at", 467, 220, 14, 32),
+        (".com", 70, 235, 51, 30),
+        ("money.usatoday.com", 137, 238, 197, 37),
+        ("52-week", 41, 272, 48, 19),
+        ("52-week", 335, 273, 50, 26),
+        ("High", 42, 286, 28, 20),
+        ("Low", 96, 287, 26, 20),
+        ("Stock", 137, 287, 33, 20),
+        ("Last", 233, 285, 29, 27),
+        ("Change", 267, 287, 41, 28),
+        ("High", 338, 293, 24, 18),
+        ("Low", 388, 293, 30, 19),
+        ("Stock", 433, 294, 30, 18),
+        ("Last", 528, 293, 26, 24),
+        ("Change", 562, 294, 41, 24),
+        ("45.71", 343, 321, 31, 19),
+        ("32.50", 386, 322, 33, 19),
+        ("Biomet", 429, 319, 51, 25),
+        ("36.71", 526, 324, 32, 19),
+        ("-0.42", 569, 321, 38, 25),
+        ("2.76", 348, 335, 26, 19),
+        ("1.20", 392, 336, 25, 19),
+        ("Biomira", 428, 334, 61, 25),
+        ("BloScrip", 430, 349, 57, 25),
+        ("1.46", 534, 341, 23, 15),
+        ("+0.03", 571, 340, 33, 18),
+        ("9.07", 348, 350, 26, 19),
+        ("5.13", 391, 351, 26, 19),
+        ("8.05", 533, 355, 26, 16),
+        ("+0.34", 567, 352, 39, 22),
+        ("9.19", 54, 365, 24, 18),
+        ("6.89", 97, 366, 23, 18),
+        ("ABX", 136, 363, 29, 24),
+        ("Air", 170, 365, 25, 24),
+        ("n", 197, 366, 9, 23),
+        ("7.52", 234, 365, 27, 23),
+        ("-0.10", 272, 366, 38, 24),
+        ("68.88", 342, 365, 29, 18),
+        ("50.65", 385, 366, 29, 18),
+        ("212.25", 334, 376, 37, 24),
+        ("131.03", 379, 377, 38, 24),
+        ("Biosite", 431, 367, 47, 18),
+        ("50.05", 528, 368, 27, 18),
+        ("BiotechT", 429, 378, 57, 25),
+        ("-4.57", 571, 369, 33, 18),
+        ("33.25", 46, 379, 32, 19),
+        ("12.40", 89, 380, 33, 19),
+        ("ACMoore", 137, 380, 60, 21),
+        ("13.58", 232, 383, 28, 19),
+        ("-1.57", 272, 384, 36, 19),
+        ("204.66", 518, 382, 37, 19),
+        ("BirchMt", 428, 393, 58, 25),
+        ("gn", 489, 395, 16, 23),
+        ("-0.84", 566, 384, 38, 18),
+        ("31.38", 48, 394, 30, 18),
+        ("13.51", 92, 395, 27, 18),
+        ("ADA-ES", 135, 395, 62, 21),
+        ("20.96", 231, 398, 31, 19),
+        ("+3.16", 275, 399, 33, 18),
+        ("8.50", 347, 394, 24, 18),
+        ("1.40", 390, 395, 28, 18),
+        ("ADC", 136, 407, 28, 24),
+        ("Tel", 170, 408, 20, 24),
+        ("rs", 193, 409, 16, 23),
+        ("Bickbaud", 428, 407, 68, 25),
+        ("6.52", 530, 398, 26, 19),
+        ("-0.45", 569, 398, 35, 19),
+        ("27.14", 48, 409, 30, 18),
+        ("12.88", 89, 409, 31, 19),
+        ("23.21", 230, 412, 33, 19),
+        ("+0.13", 272, 413, 36, 19),
+        ("18.21", 341, 408, 32, 19),
+        ("10.73", 384, 409, 32, 19),
+        ("17.90", 524, 412, 31, 19),
+        ("+0.70", 568, 412, 35, 19),
+        ("30.40", 45, 424, 33, 19),
+        ("16.70", 91, 425, 31, 18),
+        ("ADECP", 134, 422, 53, 25),
+        ("27.32", 230, 427, 32, 19),
+        ("+0.73", 272, 428, 36, 19),
+        ("52.73", 341, 425, 31, 16),
+        ("13.86", 383, 424, 33, 19),
+        ("BluCoat", 428, 422, 57, 25),
+        ("AFC", 135, 436, 29, 24),
+        ("Ent", 169, 438, 25, 23),
+        ("s", 196, 439, 9, 22),
+        ("BlueNile", 427, 436, 63, 25),
+        ("41.29", 524, 427, 33, 19),
+        ("+1.30", 567, 428, 33, 18),
+        ("16.45", 46, 438, 32, 19),
+        ("10.47", 89, 440, 29, 18),
+        ("15.40", 230, 442, 31, 18),
+        ("-0.14", 275, 443, 33, 18),
+        ("44.35", 343, 440, 29, 15),
+        ("24.15", 384, 438, 32, 19),
+        ("BobEvn", 426, 451, 57, 25),
+        ("40.30", 526, 443, 28, 15),
+        ("-1.10", 570, 443, 33, 18),
+        ("8.37", 54, 453, 22, 19),
+        ("4.50", 95, 454, 25, 19),
+        ("ASE", 136, 454, 25, 21),
+        ("Tst", 172, 454, 18, 21),
+        ("7.76", 235, 456, 27, 19),
+        ("+0.40", 272, 457, 35, 19),
+        ("26.45", 340, 453, 33, 19),
+        ("19.91", 384, 453, 32, 19),
+        ("22.99", 523, 456, 33, 19),
+        ("19.25", 46, 468, 31, 18),
+        ("12.75", 90, 469, 31, 18),
+        ("ASM", 134, 466, 29, 24),
+        ("Intl", 169, 467, 29, 25),
+        ("17.65", 229, 473, 32, 15),
+        ("-0.03", 272, 472, 36, 19),
+        ("15.94", 340, 469, 32, 15),
+        ("6.12", 390, 470, 23, 15),
+        ("Bodisen", 429, 466, 49, 25),
+        ("n", 486, 469, 7, 23),
+        ("Bookham", 429, 480, 60, 25),
+        ("15.45", 524, 471, 31, 19),
+        ("ASML", 134, 481, 40, 24),
+        ("HId", 180, 483, 24, 23),
+        ("+0.45", 566, 472, 33, 18),
+        ("20.92", 45, 482, 32, 19),
+        ("13.94", 87, 483, 32, 19),
+        ("21.24", 228, 486, 30, 18),
+        ("+0.46", 271, 486, 36, 19),
+        ("6.21", 348, 482, 22, 19),
+        ("1.56", 388, 482, 27, 19),
+        ("5.94", 532, 485, 21, 19),
+        ("+0.06", 567, 486, 36, 19),
+        ("27.38", 44, 497, 32, 19),
+        ("16.39", 87, 498, 31, 19),
+        ("ASV", 134, 496, 23, 24),
+        ("Inc", 164, 497, 24, 24),
+        ("5", 190, 498, 9, 23),
+        ("26.76", 228, 501, 30, 18),
+        ("+0.14", 273, 501, 31, 19),
+        ("11.80", 339, 496, 32, 19),
+        ("4.99", 391, 499, 21, 16),
+        ("Borland", 428, 497, 54, 21),
+        ("10.47", 86, 509, 36, 23),
+        ("BostPrv", 428, 509, 57, 25),
+        ("6.68", 529, 500, 26, 19),
+        ("ATI", 136, 510, 23, 24),
+        ("Tech", 167, 511, 27, 24),
+        ("31.90", 339, 510, 31, 19),
+        ("+0.14", 568, 501, 33, 18),
+        ("19.82", 44, 511, 32, 19),
+        ("17.89", 227, 516, 32, 17),
+        ("+0.68", 270, 516, 37, 18),
+        ("21.10", 384, 512, 30, 18),
+        ("BttmlnT", 428, 524, 55, 25),
+        ("31.18", 522, 515, 35, 18),
+        ("ATMI", 133, 525, 40, 24),
+        ("Inc", 175, 526, 24, 24),
+        ("-0.07", 567, 516, 35, 17),
+        ("33.62", 44, 526, 32, 19),
+        ("20.53", 87, 527, 32, 19),
+        ("29.95", 228, 530, 31, 19),
+        ("+1.29", 272, 531, 33, 18),
+        ("18.62", 339, 527, 31, 16),
+        ("10.01", 382, 528, 30, 16),
+        ("BrigExp", 428, 538, 55, 26),
+        ("11.53", 522, 529, 35, 18),
+        ("+0.20", 564, 530, 38, 18),
+        ("39.20", 43, 541, 33, 18),
+        ("16.76", 87, 542, 30, 18),
+        ("ATP", 133, 542, 26, 20),
+        ("O&G", 166, 542, 29, 20),
+        ("38.40", 228, 545, 30, 18),
+        ("-0.59", 272, 546, 32, 17),
+        ("14.68", 338, 542, 32, 15),
+        ("7.10", 388, 543, 23, 15),
+        ("12.10", 522, 544, 30, 18),
+        ("AVI", 135, 554, 25, 25),
+        ("Bio", 163, 555, 25, 25),
+        ("BrightHrz", 428, 554, 66, 24),
+        ("s", 497, 556, 8, 22),
+        ("-0.23", 567, 545, 35, 17),
+        ("4.24", 49, 556, 26, 19),
+        ("1.99", 92, 556, 26, 19),
+        ("3.62", 233, 560, 26, 19),
+        ("-0.02", 269, 560, 36, 19),
+        ("46.72", 338, 555, 32, 19),
+        ("26.65", 383, 556, 30, 18),
+        ("38.90", 522, 558, 32, 19),
+        ("-0.80", 565, 559, 36, 19),
+        ("20\u{2013}55", 338, 570, 30, 10),
+    ];
+
+    #[cfg(feature = "pdf")]
+    fn hocr_words_from(entries: &[(&str, u32, u32, u32, u32)]) -> Vec<crate::table_core::HocrWord> {
+        entries
+            .iter()
+            .map(|&(text, left, top, width, height)| hocr_word_at(text, left, top, width, height))
+            .collect()
+    }
+
+    /// Reproduces the table-detection loop `process_image` runs once `enable_table_detection`
+    /// is on, including the `post_process_table` structural gate the fix adds. Kept separate
+    /// from `process_image` itself so the discriminator can be exercised directly against real
+    /// fixture geometry without spinning up a PaddleOCR engine.
+    #[cfg(feature = "pdf")]
+    fn detected_table_count(words: &[crate::table_core::HocrWord]) -> usize {
+        let mut count = 0usize;
+        for region_words in crate::table_core::cluster_words_into_table_regions(words) {
+            if region_words.len() < crate::table_core::MIN_TABLE_CANDIDATE_WORDS {
+                continue;
+            }
+            let cells = reconstruct_table(&region_words, TABLE_COLUMN_ALIGNMENT_THRESHOLD_PX, 0.5);
+            if cells.is_empty() || cells[0].is_empty() {
+                continue;
+            }
+            if crate::pdf::table_reconstruct::post_process_table(cells, false, false).is_some() {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// Negative fixture: all 355 words of real ordinary paragraph prose (page 1 of
+    /// `ordinance_2197_scanned.pdf`, which has zero tables) must not fabricate a table.
+    ///
+    /// Fails without the `post_process_table` gate: unfiltered, `cluster_words_into_table_regions`
+    /// puts all 355 words in one region (no gap exceeds the region-split threshold on a page of
+    /// continuous body text) and `reconstruct_table` manufactures a 24-row x 36-column grid from
+    /// it (measured directly from this fixture) -- one fabricated table, not zero.
+    #[test]
+    #[cfg(feature = "pdf")]
+    fn table_discriminator_rejects_real_prose_page() {
+        let words = hocr_words_from(PROSE_PAGE_WORDS);
+
+        // The raw pre-discriminator reconstruction is exactly the pathological shape the bug
+        // report described (many columns, mostly-empty cells) -- confirming this fixture
+        // reproduces the defect rather than accidentally sidestepping it.
+        let regions = crate::table_core::cluster_words_into_table_regions(&words);
+        assert_eq!(
+            regions.len(),
+            1,
+            "a page of continuous prose has no gap wide enough to split"
+        );
+        let raw = reconstruct_table(&regions[0], TABLE_COLUMN_ALIGNMENT_THRESHOLD_PX, 0.5);
+        assert!(
+            raw.first().is_some_and(|row| row.len() >= 20),
+            "raw reconstruction should fabricate a wide grid from unaligned prose word x-positions, \
+             got {} columns",
+            raw.first().map_or(0, Vec::len)
+        );
+
+        assert_eq!(
+            detected_table_count(&words),
+            0,
+            "post_process_table must reject the fabricated prose grid"
+        );
+    }
+
+    /// Positive fixture: all 215 words of a real dense numeric newspaper stock table
+    /// (`ocr_image.tiff`, ground truth 16 rows x 10 cols, 154 non-empty cells) must still be
+    /// detected as a table once the discriminator is in place.
+    #[test]
+    #[cfg(feature = "pdf")]
+    // Still ignored after the #688 cell-merge fix, but for a NARROWER reason than before.
+    // That fix (merging horizontally-adjacent words into cell tokens before column detection)
+    // did unblock the tesseract path on this same document: 0 -> 24 pipe rows end to end, and
+    // native-corpus table cell recall rose 19.3% -> 30.0% with precision 46.2% -> 49.5%.
+    // It does NOT rescue this fixture, because these are paddle word boxes scored at
+    // TABLE_COLUMN_ALIGNMENT_THRESHOLD_PX = 20, where tesseract's path uses
+    // `table_column_threshold` = 50 and merges more aggressively.
+    //
+    // The remaining blocker is REGION ISOLATION, not the validator: all 215 words land in one
+    // region (largest vertical gap on the page is 0, against a 3 x average-word-height
+    // threshold), so the newspaper masthead and a prose sentence are reconstructed together
+    // with the table. Measured separately on docling_scanned.pdf, where every region is a
+    // whole page of prose and tables only appear once `--layout` supplies real table regions.
+    #[ignore = "blocked on table-region isolation, not on the validator: all 215 words cluster \
+               into one region so the masthead is reconstructed with the table. Un-ignore when \
+               regions are isolated structurally (see #694) rather than by vertical gap."]
+    fn table_discriminator_accepts_real_dense_numeric_table() {
+        let words = hocr_words_from(DENSE_TABLE_WORDS);
+
+        assert_eq!(
+            detected_table_count(&words),
+            1,
+            "a genuine dense numeric table must survive post_process_table, not be silenced \
+             along with the prose case"
+        );
     }
 }

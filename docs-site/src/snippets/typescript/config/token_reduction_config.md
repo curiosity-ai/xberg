@@ -1,5 +1,5 @@
 ```typescript title="TypeScript"
-import { extract } from "@xberg-io/xberg";
+import { ExtractInputKind, extract } from "@xberg-io/xberg";
 
 const config = {
   tokenReduction: {
@@ -8,6 +8,6 @@ const config = {
   },
 };
 
-const output = await extract({ kind: "uri", uri: "document.pdf" }, config);
-console.log(output.results[0].content);
+const output = await extract({ kind: ExtractInputKind.Uri, uri: "document.pdf" }, config);
+console.log(output.results?.[0]?.content);
 ```

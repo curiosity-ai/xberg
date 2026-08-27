@@ -4,7 +4,7 @@
 //!   1. `PdfConfig.extract_tables = false` truly suppresses all tables
 //!      (native and heuristic), matching the documented contract.
 //!   2. With the default `extract_tables = true`, a text-layer PDF that
-//!      pdf_oxide's native grid detector can't read still produces
+//!      xberg_native_pdf's native grid detector can't read still produces
 //!      `result.tables` populated by the heuristic fallback.
 //!   3. The composition rule (per-page merge) does not drop tables that
 //!      native already found.
@@ -57,7 +57,7 @@ fn test_extract_tables_flag_false_suppresses_all_tables() {
 }
 
 /// Default config (`extract_tables = true`) on a text-layer table PDF should
-/// produce at least one well-formed table. If pdf_oxide's native detector
+/// produce at least one well-formed table. If xberg_native_pdf's native detector
 /// hits it, fine; otherwise the heuristic fallback fills in. Either way,
 /// the contract from #897 — "result.tables should be populated on
 /// text-layer table PDFs without needing 12 GB of ONNX models" — must hold.
@@ -94,8 +94,8 @@ fn test_default_config_populates_tables_on_text_layer_pdf() {
 }
 
 /// Minimal PDFs must not panic the heuristic path. We don't make assertions
-/// about whether pdf_oxide's native detector finds 0 or 1 spurious tables —
-/// that's a separate concern and may vary across pdf_oxide versions.
+/// about whether xberg_native_pdf's native detector finds 0 or 1 spurious tables —
+/// that's a separate concern and may vary across xberg_native_pdf versions.
 /// The point is just: heuristic + composition both survive the input.
 #[test]
 fn test_minimal_pdf_does_not_panic() {
@@ -106,38 +106,101 @@ fn test_minimal_pdf_does_not_panic() {
     let _ = extract_bytes_document_blocking(&bytes, PDF_MIME, &config).expect("extraction must succeed");
 }
 
+/// Assemble a one-page PDF from a raw content stream and a Standard-14
+/// Helvetica font resource. Hand-built rather than via the (now-removed)
+/// `xberg_native_pdf::writer::DocumentBuilder`: these two table-pipeline
+/// tests assert on GRID structure derived from stroked lines (row/column
+/// counts, row associations), not on exact text placement, so a minimal
+/// `re`/`m`/`l`/`S`/`Tj` content stream reproduces the same geometry the
+/// writer used to emit.
+fn build_pdf_with_content(content: &str) -> Vec<u8> {
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = vec![0usize];
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] \
+          /Contents 4 0 R /Resources << /Font << /Helvetica 5 0 R >> >> >>\nendobj\n",
+    );
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(format!("4 0 obj\n<< /Length {} >>\nstream\n", content.len()).as_bytes());
+    pdf.extend_from_slice(content.as_bytes());
+    pdf.extend_from_slice(b"\nendstream\nendobj\n");
+
+    offsets.push(pdf.len());
+    pdf.extend_from_slice(
+        b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica \
+          /Encoding /WinAnsiEncoding >>\nendobj\n",
+    );
+
+    let xref_pos = pdf.len();
+    pdf.extend_from_slice(format!("xref\n0 {}\n", offsets.len()).as_bytes());
+    pdf.extend_from_slice(b"0000000000 65535 f \n");
+    for &off in &offsets[1..] {
+        pdf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    pdf.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{}\n%%EOF\n",
+            offsets.len(),
+            xref_pos
+        )
+        .as_bytes(),
+    );
+    pdf
+}
+
+/// Emit `{width} w` + black `RG` + a stroked line segment, matching what
+/// `xberg_native_pdf::writer::{DocumentBuilder, LineStyle}::stroke_line`
+/// used to produce.
+fn stroke_line_op(width: f32, x1: f32, y1: f32, x2: f32, y2: f32) -> String {
+    format!("{width} w\n0 0 0 RG\n{x1} {y1} m {x2} {y2} l S\n")
+}
+
+/// Emit a Standard-14 Helvetica `Tj` at `(x, y)`, matching the writer's
+/// `text_in_rect(..., TextAlign::Left)` for the purposes of these tests
+/// (row/column association from the surrounding grid lines, not exact
+/// glyph position).
+fn text_op(text: &str, x: f32, y: f32) -> String {
+    format!("BT\n/Helvetica 10 Tf\n1 0 0 1 {x} {y} Tm\n({text}) Tj\nET\n")
+}
+
 /// Integration test for issue #964: the three-tier pipeline (native → bordered → heuristic)
 /// detects a 2-column stroke-bordered table via the `extract_tables_bordered` tier.
 ///
-/// Uses the same synthetic PDF that the unit tests build (5 rows × 2 columns, all cells
-/// delimited by explicit stroke lines). The unit tests verify the internal function directly;
-/// this test exercises the full public API path: `extract_bytes_document_blocking` with default config.
+/// Uses the same synthetic PDF geometry as the unit tests in
+/// `xberg::pdf::native::table` (5 rows × 2 columns, all cells delimited by
+/// explicit stroke lines). The unit tests verify the internal function
+/// directly; this test exercises the full public API path:
+/// `extract_bytes_document_blocking` with default config.
 #[test]
 fn test_bordered_two_column_table_detected_via_pipeline() {
-    use pdf_oxide::geometry::Rect;
-    use pdf_oxide::writer::{DocumentBuilder, LineStyle, TextAlign};
-
-    let style = LineStyle::new(1.0, 0.0, 0.0, 0.0);
-    let mut doc = DocumentBuilder::new();
-    doc.a4_page()
-        .stroke_rect(50.0, 550.0, 350.0, 200.0, style.clone())
-        .stroke_line(200.0, 550.0, 200.0, 750.0, style.clone())
-        .stroke_line(50.0, 710.0, 400.0, 710.0, style.clone())
-        .stroke_line(50.0, 670.0, 400.0, 670.0, style.clone())
-        .stroke_line(50.0, 630.0, 400.0, 630.0, style.clone())
-        .stroke_line(50.0, 590.0, 400.0, 590.0, style.clone())
-        .text_in_rect(Rect::new(50.0, 710.0, 150.0, 40.0), "Item", TextAlign::Left)
-        .text_in_rect(Rect::new(200.0, 710.0, 200.0, 40.0), "Status", TextAlign::Left)
-        .text_in_rect(Rect::new(50.0, 670.0, 150.0, 40.0), "8", TextAlign::Left)
-        .text_in_rect(Rect::new(200.0, 670.0, 200.0, 40.0), "Not correct", TextAlign::Left)
-        .text_in_rect(Rect::new(50.0, 630.0, 150.0, 40.0), "27", TextAlign::Left)
-        .text_in_rect(Rect::new(200.0, 630.0, 200.0, 40.0), "Incomplete", TextAlign::Left)
-        .text_in_rect(Rect::new(50.0, 590.0, 150.0, 40.0), "29,30", TextAlign::Left)
-        .text_in_rect(Rect::new(200.0, 590.0, 200.0, 40.0), "Missing data", TextAlign::Left)
-        .text_in_rect(Rect::new(50.0, 550.0, 150.0, 40.0), "45", TextAlign::Left)
-        .text_in_rect(Rect::new(200.0, 550.0, 200.0, 40.0), "Fixed", TextAlign::Left)
-        .done();
-    let bytes = doc.build().expect("build synthetic PDF");
+    let mut content = String::new();
+    content.push_str("1 w\n0 0 0 RG\n50 550 350 200 re S\n");
+    content.push_str(&stroke_line_op(1.0, 200.0, 550.0, 200.0, 750.0));
+    for y in [710.0_f32, 670.0, 630.0, 590.0] {
+        content.push_str(&stroke_line_op(1.0, 50.0, y, 400.0, y));
+    }
+    let rows: [(f32, &str, &str); 5] = [
+        (710.0, "Item", "Status"),
+        (670.0, "8", "Not correct"),
+        (630.0, "27", "Incomplete"),
+        (590.0, "29,30", "Missing data"),
+        (550.0, "45", "Fixed"),
+    ];
+    for (row_bottom, left_text, right_text) in rows {
+        let baseline = row_bottom + 16.0;
+        content.push_str(&text_op(left_text, 55.0, baseline));
+        content.push_str(&text_op(right_text, 205.0, baseline));
+    }
+    let bytes = build_pdf_with_content(&content);
 
     let config = ExtractionConfig::default();
     let result = extract_bytes_document_blocking(&bytes, PDF_MIME, &config).expect("extraction must succeed");
@@ -161,16 +224,12 @@ fn test_bordered_two_column_table_detected_via_pipeline() {
 /// Integration test for xberg-io/xberg#1213: a 3-column grid whose vertical
 /// rules are drawn as ~1pt segments stroked with a table-height line width
 /// (the rendered geometry is a full-height vertical bar, but the path's
-/// geometric bounding box is a speck). pdf_oxide 0.3.74 accounts for stroke
+/// geometric bounding box is a speck). xberg_native_pdf 0.3.74 accounts for stroke
 /// width in path bounding boxes, so the native tier detects this through the
 /// full public API path with row associations intact, and the heuristic tier
 /// does not add competing tables on that page.
 #[test]
 fn test_stroke_width_vertical_rules_table_detected_via_pipeline() {
-    use pdf_oxide::geometry::Rect;
-    use pdf_oxide::writer::{DocumentBuilder, LineStyle, TextAlign};
-
-    let thin = LineStyle::new(1.0, 0.0, 0.0, 0.0);
     let rows: [[&str; 3]; 6] = [
         ["Location", "Rating", "Circuit"],
         ["6", "15A*", "Alternator regulator"],
@@ -180,28 +239,26 @@ fn test_stroke_width_vertical_rules_table_detected_via_pipeline() {
         ["101", "40A**", "Blower relay feed"],
     ];
 
-    let mut doc = DocumentBuilder::new();
-    let mut page = doc.a4_page();
+    let mut content = String::new();
     // Horizontal rules: ordinary 1pt strokes at every row boundary. ~keep
     for i in 0..=6u32 {
         let y = 510.0 + 40.0 * i as f32;
-        page = page.stroke_line(50.0, y, 400.0, y, thin.clone());
+        content.push_str(&stroke_line_op(1.0, 50.0, y, 400.0, y));
     }
     // Vertical rules: 1pt-long horizontal segments at the table's vertical
     // midpoint, stroked with the full table height (240pt). ~keep
     for x in [50.0_f32, 150.0, 250.0, 400.0] {
-        page = page.stroke_line(x - 0.5, 630.0, x + 0.5, 630.0, LineStyle::new(240.0, 0.0, 0.0, 0.0));
+        content.push_str(&stroke_line_op(240.0, x - 0.5, 630.0, x + 0.5, 630.0));
     }
     let col_x = [50.0_f32, 150.0, 250.0];
-    let col_w = [100.0_f32, 100.0, 150.0];
     for (i, row) in rows.iter().enumerate() {
         let y = 750.0 - 40.0 * (i as f32 + 1.0);
+        let baseline = y + 16.0;
         for (c, text) in row.iter().enumerate() {
-            page = page.text_in_rect(Rect::new(col_x[c], y, col_w[c], 40.0), text, TextAlign::Left);
+            content.push_str(&text_op(text, col_x[c] + 5.0, baseline));
         }
     }
-    page.done();
-    let bytes = doc.build().expect("build synthetic PDF");
+    let bytes = build_pdf_with_content(&content);
 
     let config = ExtractionConfig::default();
     let result = extract_bytes_document_blocking(&bytes, PDF_MIME, &config).expect("extraction must succeed");

@@ -499,7 +499,7 @@ fn detect_monospace_code_blocks(paragraphs: &mut [PdfParagraph]) {
 /// Mid-sentence fragments from column breaks often start with lowercase words or
 /// common continuation words. Real headings typically start with uppercase letters,
 /// numbers, or section markers.
-fn starts_with_lowercase_or_continuation(text: &str) -> bool {
+pub(super) fn starts_with_lowercase_or_continuation(text: &str) -> bool {
     let first_char = text.chars().next();
     if first_char.is_some_and(|c| c.is_lowercase()) {
         return true;

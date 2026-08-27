@@ -70,16 +70,20 @@ fn parse_xml_inner(
     limits: &SecurityLimits,
 ) -> Result<XmlExtractionResult> {
     let decoded_bytes;
-    let effective_bytes = if xml_bytes.len() >= 2 {
-        if xml_bytes[0] == 0xFF && xml_bytes[1] == 0xFE {
-            decoded_bytes = decode_utf16_to_utf8(xml_bytes, false)?;
-            &decoded_bytes
-        } else if xml_bytes[0] == 0xFE && xml_bytes[1] == 0xFF {
-            decoded_bytes = decode_utf16_to_utf8(xml_bytes, true)?;
-            &decoded_bytes
-        } else {
-            xml_bytes
-        }
+    let effective_bytes = if xml_bytes.len() >= 2 && xml_bytes[0] == 0xFF && xml_bytes[1] == 0xFE {
+        decoded_bytes = decode_utf16_to_utf8(xml_bytes, false)?;
+        &decoded_bytes
+    } else if xml_bytes.len() >= 2 && xml_bytes[0] == 0xFE && xml_bytes[1] == 0xFF {
+        decoded_bytes = decode_utf16_to_utf8(xml_bytes, true)?;
+        &decoded_bytes
+    } else if std::str::from_utf8(xml_bytes).is_err() {
+        // quick-xml validates UTF-8 as it parses, so anything that is not already
+        // UTF-8 has to be transcoded here or the whole document fails to read.
+        // Before quick-xml 0.42 the reader handed back raw bytes and each caller
+        // decoded lossily, which is the graceful degradation #395 requires: a
+        // mis-encoded document must still extract, not vanish. ~keep
+        decoded_bytes = crate::utils::decode_with_provenance(xml_bytes, None).text.into_bytes();
+        &decoded_bytes
     } else {
         xml_bytes
     };
@@ -102,16 +106,14 @@ fn parse_xml_inner(
         match reader.read_event() {
             Ok(Event::Start(e)) => {
                 budget.enter()?;
-                let name_bytes = (e.name().as_ref() as &[u8]).to_vec();
-                let name: Cow<str> = String::from_utf8_lossy(&name_bytes);
-                let name_owned = name.into_owned();
+                let name_owned = e.name().as_ref().to_string();
                 element_count += 1;
                 unique_elements_set.insert(name_owned.clone());
 
                 if !svg_mode {
                     for attr in e.attributes().flatten() {
-                        let key: Cow<str> = String::from_utf8_lossy(attr.key.as_ref());
-                        let val: Cow<str> = String::from_utf8_lossy(&attr.value);
+                        let key: Cow<str> = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                        let val: Cow<str> = std::borrow::Cow::Borrowed(attr.value.as_ref());
                         budget.check_attr(&key, &val)?;
                     }
                     let depth = element_stack.len();
@@ -122,16 +124,14 @@ fn parse_xml_inner(
                 element_stack.push(name_owned);
             }
             Ok(Event::Empty(e)) => {
-                let name_bytes = (e.name().as_ref() as &[u8]).to_vec();
-                let name: Cow<str> = String::from_utf8_lossy(&name_bytes);
-                let name_owned = name.into_owned();
+                let name_owned = e.name().as_ref().to_string();
                 element_count += 1;
                 unique_elements_set.insert(name_owned.clone());
 
                 if !svg_mode {
                     for attr in e.attributes().flatten() {
-                        let key: Cow<str> = String::from_utf8_lossy(attr.key.as_ref());
-                        let val: Cow<str> = String::from_utf8_lossy(&attr.value);
+                        let key: Cow<str> = std::borrow::Cow::Borrowed(attr.key.as_ref());
+                        let val: Cow<str> = std::borrow::Cow::Borrowed(attr.value.as_ref());
                         budget.check_attr(&key, &val)?;
                     }
                     let depth = element_stack.len();
@@ -144,7 +144,7 @@ fn parse_xml_inner(
                 element_stack.pop();
             }
             Ok(Event::Text(e)) => {
-                let text_cow: Cow<str> = String::from_utf8_lossy(e.as_ref());
+                let text_cow: Cow<str> = std::borrow::Cow::Borrowed(e.as_ref());
                 let trimmed = if preserve_whitespace {
                     text_cow.to_string()
                 } else {
@@ -179,7 +179,7 @@ fn parse_xml_inner(
                     }
                 }
 
-                let text_cow: Cow<str> = String::from_utf8_lossy(&e);
+                let text_cow: Cow<str> = std::borrow::Cow::Borrowed(e.as_ref());
                 budget.check_entity(&text_cow)?;
                 budget.account_text(text_cow.len())?;
                 write_text_line(&mut content, &text_cow, element_stack.len());
@@ -233,11 +233,11 @@ fn format_element_label(name: &str, attrs: quick_xml::events::attributes::Attrib
     let attr_parts: Vec<String> = attrs
         .flatten()
         .filter_map(|attr| {
-            let key: Cow<str> = String::from_utf8_lossy(attr.key.as_ref());
+            let key: Cow<str> = std::borrow::Cow::Borrowed(attr.key.as_ref());
             if key.starts_with("xmlns") {
                 return None;
             }
-            let val: Cow<str> = String::from_utf8_lossy(&attr.value);
+            let val: Cow<str> = std::borrow::Cow::Borrowed(attr.value.as_ref());
             let trimmed = val.trim();
             if trimmed.is_empty() {
                 None

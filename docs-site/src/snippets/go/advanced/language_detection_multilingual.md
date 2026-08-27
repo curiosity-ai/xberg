@@ -18,7 +18,7 @@ func main() {
 		LanguageDetection: &xberg.LanguageDetectionConfig{
 			Enabled:        &enabled,
 			MinConfidence:  &minConfidence,
-			DetectMultiple: &detectMultiple,
+			DetectMultiple: detectMultiple,
 		},
 	}
 

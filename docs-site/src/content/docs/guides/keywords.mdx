@@ -2,20 +2,7 @@
 title: "Keyword Extraction"
 ---
 
-import { Tabs, TabItem } from "@astrojs/starlight/components";
-import { Content as Snip_python_utils_keyword_extraction_example } from "../../../snippets/python/utils/keyword_extraction_example.md";
-import { Content as Snip_typescript_utils_keyword_extraction_example } from "../../../snippets/typescript/utils/keyword_extraction_example.md";
-import { Content as Snip_rust_advanced_keyword_extraction_example } from "../../../snippets/rust/advanced/keyword_extraction_example.md";
-import { Content as Snip_go_utils_keyword_extraction_example } from "../../../snippets/go/utils/keyword_extraction_example.md";
-import { Content as Snip_java_utils_keyword_extraction_example } from "../../../snippets/java/utils/keyword_extraction_example.md";
-import { Content as Snip_csharp_advanced_keyword_extraction_example } from "../../../snippets/csharp/advanced/keyword_extraction_example.md";
-import { Content as Snip_ruby_utils_keyword_extraction_example } from "../../../snippets/ruby/utils/keyword_extraction_example.md";
-import { Content as Snip_python_config_keyword_extraction_config } from "../../../snippets/python/config/keyword_extraction_config.md";
-import { Content as Snip_typescript_config_keyword_extraction_config } from "../../../snippets/typescript/config/keyword_extraction_config.md";
-import { Content as Snip_rust_config_keyword_extraction_config } from "../../../snippets/rust/config/keyword_extraction_config.md";
-import { Content as Snip_go_config_keyword_extraction_config } from "../../../snippets/go/config/keyword_extraction_config.md";
-import { Content as Snip_ruby_config_keyword_extraction_config } from "../../../snippets/ruby/config/keyword_extraction_config.md";
-import { Content as Snip_csharp_advanced_keyword_extraction_config } from "../../../snippets/csharp/advanced/keyword_extraction_config.md";
+import ApiSnippetGroup from "../../../components/ApiSnippetGroup.astro";
 
 Extract ranked keywords and key phrases from document text for search indexing, topic detection, and content summarization. Choose between YAKE (best for single terms and multilingual content) or RAKE (best for multi-word phrases in technical documents).
 
@@ -26,43 +13,7 @@ Extract ranked keywords and key phrases from document text for search indexing, 
 
 ## Quick Start
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
-
-<Snip_python_utils_keyword_extraction_example />
-
-</TabItem>
-<TabItem label="TypeScript">
-
-<Snip_typescript_utils_keyword_extraction_example />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_advanced_keyword_extraction_example />
-
-</TabItem>
-<TabItem label="Go">
-
-<Snip_go_utils_keyword_extraction_example />
-
-</TabItem>
-<TabItem label="Java">
-
-<Snip_java_utils_keyword_extraction_example />
-
-</TabItem>
-<TabItem label="C#">
-
-<Snip_csharp_advanced_keyword_extraction_example />
-
-</TabItem>
-<TabItem label="Ruby">
-
-<Snip_ruby_utils_keyword_extraction_example />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="contract/config_keywords" />
 
 Keywords are returned in `result.extracted_keywords` as objects with `text` and `score` fields.
 
@@ -70,38 +21,7 @@ Keywords are returned in `result.extracted_keywords` as objects with `text` and 
 
 See [KeywordConfig reference](/reference/configuration/#keywordconfig) for all configuration options.
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
-
-<Snip_python_config_keyword_extraction_config />
-
-</TabItem>
-<TabItem label="TypeScript">
-
-<Snip_typescript_config_keyword_extraction_config />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_config_keyword_extraction_config />
-
-</TabItem>
-<TabItem label="Go">
-
-<Snip_go_config_keyword_extraction_config />
-
-</TabItem>
-<TabItem label="Ruby">
-
-<Snip_ruby_config_keyword_extraction_config />
-
-</TabItem>
-<TabItem label="C#">
-
-<Snip_csharp_advanced_keyword_extraction_config />
-
-</TabItem>
-</Tabs>
+<ApiSnippetGroup topic="contract/config_keywords" />
 
 ## YAKE Score Tuning
 

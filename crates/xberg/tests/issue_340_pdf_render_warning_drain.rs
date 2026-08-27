@@ -1,11 +1,11 @@
 //! Regression test for #340: `crate::extractors::pdf::mod` must drain
-//! `crate::pdf::render::take_pdf_oxide_render_warnings()` into the returned
+//! `crate::pdf::render::take_xberg_native_pdf_render_warnings()` into the returned
 //! document's `processing_warnings`, not just leave them sitting in the
 //! per-thread capture buffer that `crate::pdf::render` owns.
 //!
 //! `issue_291_dropped_glyph_warning.rs` already proves the capture-and-dedup
 //! logic in isolation by calling `render_pdf_page_to_png` /
-//! `take_pdf_oxide_render_warnings` directly. This test instead goes through
+//! `take_xberg_native_pdf_render_warnings` directly. This test instead goes through
 //! the real public extraction entry point (`xberg::extract`) end to end,
 //! forcing OCR so a page is actually rendered by
 //! `crate::extractors::pdf::ocr::render_full_pdf_ocr_batch` (via
@@ -40,7 +40,7 @@ use xberg::pdf::render::install_pdf_render_diagnostics;
 ///
 /// Duplicated from `build_pdf_with_malformed_font_resource` in
 /// `issue_291_dropped_glyph_warning.rs` (see that file for the detailed
-/// `pdf_oxide` failure-path explanation of why this is the deterministic,
+/// `xberg_native_pdf` failure-path explanation of why this is the deterministic,
 /// installed-font-independent repro) rather than shared, because each
 /// `tests/*.rs` file compiles to its own separate integration-test binary.
 fn build_pdf_with_malformed_font_resource() -> Vec<u8> {
@@ -107,18 +107,22 @@ fn build_pdf_with_malformed_font_resource() -> Vec<u8> {
 ///
 /// To make a single revert-check obvious: deleting the drain loop this test
 /// covers (`crates/xberg/src/extractors/pdf/mod.rs`, the
-/// `for pdf_render_warning in crate::pdf::render::take_pdf_oxide_render_warnings()`
+/// `for pdf_render_warning in crate::pdf::render::take_xberg_native_pdf_render_warnings()`
 /// loop right after `doc.processing_warnings.append(&mut pdf_extraction_warnings);`)
 /// makes this test fail with an empty `processing_warnings`.
 #[tokio::test]
 async fn extract_surfaces_glyph_drop_warning_through_public_api() {
-    // Capture is opt-in — a library must not seize the process-global `log`
-    // backend on its own, so nothing arms it during extraction and without
-    // this call `render_page_capturing_glyph_drops` short-circuits to a plain
-    // render and the drain under test would have nothing to drain.
+    // Capture is opt-in — a library must not seize the process-global `tracing` dispatcher
+    // on its own, so nothing arms it during extraction and without this call
+    // `render_page_capturing_glyph_drops` short-circuits to a plain render and the drain
+    // under test would have nothing to drain.
+    //
+    // ★ A test binary installs no subscriber of its own, so this always wins the single
+    // global dispatcher slot. `xberg-cli` claims that slot first and composes
+    // `glyph_drop_capture_layer()` in instead — this passing says nothing about that path.
     assert!(
         install_pdf_render_diagnostics(),
-        "no other component should own the log backend in this test binary"
+        "no other component should own the tracing dispatcher in this test binary"
     );
 
     let pdf = build_pdf_with_malformed_font_resource();
@@ -150,7 +154,7 @@ async fn extract_surfaces_glyph_drop_warning_through_public_api() {
 
     assert_eq!(
         glyph_drop_warning.source, "pdf-render",
-        "glyph-drop warnings drained from pdf_oxide render capture must be sourced \"pdf-render\""
+        "glyph-drop warnings drained from xberg_native_pdf render capture must be sourced \"pdf-render\""
     );
     assert!(
         glyph_drop_warning.message.contains("Page 1"),
@@ -159,7 +163,7 @@ async fn extract_surfaces_glyph_drop_warning_through_public_api() {
     );
     assert!(
         glyph_drop_warning.message.contains("Failed to parse font"),
-        "warning must carry pdf_oxide's own diagnosis of the cause, got: {}",
+        "warning must carry xberg_native_pdf's own diagnosis of the cause, got: {}",
         glyph_drop_warning.message
     );
 }

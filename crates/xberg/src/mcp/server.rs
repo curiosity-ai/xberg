@@ -92,7 +92,7 @@ pub struct XbergMcp {
     prompt_router: PromptRouter<XbergMcp>,
     /// Default extraction configuration loaded from config file via discovery
     default_config: std::sync::Arc<ExtractionConfig>,
-    /// Tower service for extraction requests with tracing and metrics layers.
+    /// Tower service for extraction requests with tracing and optional metrics layers.
     ///
     /// Wrapped in `Mutex` because `BoxCloneService` is `Send` but not `Sync`,
     /// while `XbergMcp` must be `Sync` for the MCP handler trait.
@@ -152,7 +152,12 @@ impl XbergMcp {
     ///
     /// * `config` - Default extraction configuration for all tool calls
     pub(crate) fn with_config(config: ExtractionConfig) -> Self {
-        let extraction_service = ExtractionServiceBuilder::new().with_tracing().with_metrics().build();
+        let extraction_service_builder = ExtractionServiceBuilder::new().with_tracing();
+        #[cfg(feature = "otel")]
+        let extraction_service_builder = extraction_service_builder.with_metrics();
+        let extraction_service = extraction_service_builder
+            .build()
+            .expect("the built-in MCP extraction service uses a valid concurrency limit");
 
         Self {
             tool_router: Self::tool_router(),
@@ -773,6 +778,10 @@ fn resolve_cache_base() -> std::path::PathBuf {
 }
 
 fn parse_extract_input(value: serde_json::Value) -> Result<crate::ExtractInput, rmcp::ErrorData> {
+    if let Some(config) = value.get("config") {
+        crate::core::config::request_security::validate_caller_extraction_config(config)
+            .map_err(|message| rmcp::ErrorData::invalid_params(message, None))?;
+    }
     serde_json::from_value::<crate::ExtractInput>(value)
         .map_err(|error| rmcp::ErrorData::invalid_params(format!("Invalid ExtractInput: {error}"), None))
 }
@@ -1304,6 +1313,31 @@ mod tests {
 
         assert!(server.default_config.force_ocr);
         assert!(!server.default_config.use_cache);
+    }
+
+    #[test]
+    fn should_reject_llm_transport_config_in_mcp_per_input_override() {
+        let value = serde_json::json!({
+            "kind": "bytes",
+            "data": [115, 97, 102, 101],
+            "mime_type": "text/plain",
+            "config": {
+                "summarization": {
+                    "llm": {"model": "openai/gpt-4o-mini", "api_key": "must-not-leak"}
+                }
+            }
+        });
+
+        let error = parse_extract_input(value).expect_err("caller credential must be rejected");
+
+        assert_eq!(
+            error.message,
+            "Caller extraction config may not set summarization.llm.api_key"
+        );
+        assert!(
+            !error.message.contains("must-not-leak"),
+            "rejection must not include caller-controlled values"
+        );
     }
 
     #[test]

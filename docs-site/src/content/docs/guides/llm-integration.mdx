@@ -3,11 +3,9 @@ title: "LLM Integration"
 ---
 
 import { Tabs, TabItem } from "@astrojs/starlight/components";
+import ApiSnippetGroup from "../../../components/ApiSnippetGroup.astro";
 import { Content as Snip_python_llm_vlm_ocr } from "../../../snippets/python/llm/vlm_ocr.md";
 import { Content as Snip_typescript_llm_vlm_ocr } from "../../../snippets/typescript/llm/vlm_ocr.md";
-import { Content as Snip_python_llm_structured_extraction } from "../../../snippets/python/llm/structured_extraction.md";
-import { Content as Snip_typescript_llm_structured_extraction } from "../../../snippets/typescript/llm/structured_extraction.md";
-import { Content as Snip_rust_llm_structured_extraction } from "../../../snippets/rust/llm/structured_extraction.md";
 import { Content as Snip_python_llm_vlm_embeddings } from "../../../snippets/python/llm/vlm_embeddings.md";
 
 Xberg integrates with 165 LLM providers (including local inference engines) via [liter-llm](https://github.com/xberg-io/liter-llm) for three capabilities: VLM OCR, structured extraction, and provider-hosted embeddings.
@@ -130,22 +128,11 @@ Extract structured JSON data from documents by providing a schema; the document 
 
 ### Basic Usage
 
-<Tabs syncKey="lang">
-<TabItem label="Python">
+<ApiSnippetGroup topic="contract/config_llm_structured_extraction" />
 
-<Snip_python_llm_structured_extraction />
+For CLI and configuration-file usage:
 
-</TabItem>
-<TabItem label="TypeScript">
-
-<Snip_typescript_llm_structured_extraction />
-
-</TabItem>
-<TabItem label="Rust">
-
-<Snip_rust_llm_structured_extraction />
-
-</TabItem>
+<Tabs>
 <TabItem label="CLI">
 
 ```bash title="Terminal"

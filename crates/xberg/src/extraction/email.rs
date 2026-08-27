@@ -1368,10 +1368,10 @@ const RAW_HEADER_SCAN_CAP: usize = 16384;
 /// a slice bound on `data` (byte-slice indexing never panics on non-UTF-8
 /// boundaries, unlike `&str` indexing).
 fn find_header_section_end(data: &[u8], cap: usize) -> usize {
-    if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+    if let Some(pos) = memchr::memmem::find(data, b"\r\n\r\n") {
         return pos;
     }
-    if let Some(pos) = data.windows(2).position(|w| w == b"\n\n") {
+    if let Some(pos) = memchr::memmem::find(data, b"\n\n") {
         return pos;
     }
     data.len().min(cap)
@@ -2336,6 +2336,32 @@ mod tests {
         assert_eq!(headers.get("mime_version").unwrap(), "1.0");
         assert_eq!(headers.get("x_mailer").unwrap(), "MyApp/2.0");
         assert_eq!(headers.get("user_agent").unwrap(), "MyAgent/1.0");
+    }
+
+    #[test]
+    fn test_find_header_section_end_crlf_separator() {
+        let data = b"From: alice@example.com\r\n\r\nBody";
+        // The header line is 23 bytes, so the separator STARTS at index 23; both the
+        // old windows().position() and memmem::find return the match start, not its end.
+        assert_eq!(find_header_section_end(data, 8192), 23);
+    }
+
+    #[test]
+    fn test_find_header_section_end_lf_only_separator() {
+        let data = b"From: alice@example.com\n\nBody";
+        assert_eq!(find_header_section_end(data, 8192), 23);
+    }
+
+    #[test]
+    fn test_find_header_section_end_no_separator_falls_back_to_cap() {
+        let data = b"From: alice@example.com, no blank line here";
+        assert_eq!(find_header_section_end(data, 10), 10);
+    }
+
+    #[test]
+    fn test_find_header_section_end_no_separator_shorter_than_cap() {
+        let data = b"short";
+        assert_eq!(find_header_section_end(data, 8192), data.len());
     }
 
     #[test]

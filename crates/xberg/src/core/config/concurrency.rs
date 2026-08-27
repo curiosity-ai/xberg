@@ -39,7 +39,6 @@ use serde::{Deserialize, Serialize};
 ///     max_threads: Some(2),
 /// };
 /// ```
-#[cfg_attr(alef, alef(skip))]
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ConcurrencyConfig {
@@ -183,6 +182,22 @@ pub(crate) fn resolve_thread_budget(config: Option<&ConcurrencyConfig>) -> usize
     resolve_thread_budget_inner(config, num_cpus::get(), cgroup_cpu_quota_cores())
 }
 
+/// Resolve the asynchronous request limit for a single LLM-backed feature.
+///
+/// An explicit per-LLM limit takes precedence over the general extraction
+/// thread budget. This keeps remote request fan-out independently tunable while
+/// preserving the historical behavior for configurations that do not opt in.
+#[cfg(feature = "captioning")]
+pub(crate) fn resolve_llm_concurrency(
+    llm_config: &crate::core::config::LlmConfig,
+    concurrency: Option<&ConcurrencyConfig>,
+) -> usize {
+    llm_config
+        .max_concurrency
+        .unwrap_or_else(|| resolve_thread_budget(concurrency))
+        .max(1)
+}
+
 /// Pure core of [`resolve_thread_budget`], parameterized on the host CPU
 /// count and any detected cgroup quota so tests can exercise every branch
 /// deterministically regardless of the machine actually running the tests.
@@ -257,21 +272,6 @@ pub(crate) enum LayoutBatchWorkload {
     /// Every input is a PDF using layout inference for Markdown extraction.
     #[cfg(layout_detection)]
     All,
-}
-
-#[cfg(all(test, feature = "tokio-runtime", not(target_arch = "wasm32")))]
-impl LayoutBatchWorkload {
-    pub(crate) fn from_layout_active(layout_active: bool) -> Self {
-        #[cfg(layout_detection)]
-        {
-            if layout_active { Self::Mixed } else { Self::None }
-        }
-        #[cfg(not(layout_detection))]
-        {
-            let _ = layout_active;
-            Self::None
-        }
-    }
 }
 
 /// Allocate batch workers and per-worker model threads without oversubscription.
@@ -401,6 +401,27 @@ mod tests {
     use tracing_subscriber::{EnvFilter, Layer};
 
     use super::*;
+
+    #[cfg(feature = "captioning")]
+    #[test]
+    fn llm_concurrency_overrides_general_thread_budget() {
+        let llm = crate::core::config::LlmConfig {
+            max_concurrency: Some(3),
+            ..Default::default()
+        };
+        let general = ConcurrencyConfig { max_threads: Some(12) };
+
+        assert_eq!(resolve_llm_concurrency(&llm, Some(&general)), 3);
+    }
+
+    #[cfg(feature = "captioning")]
+    #[test]
+    fn llm_concurrency_falls_back_to_general_thread_budget() {
+        let llm = crate::core::config::LlmConfig::default();
+        let general = ConcurrencyConfig { max_threads: Some(5) };
+
+        assert_eq!(resolve_llm_concurrency(&llm, Some(&general)), 5);
+    }
 
     /// A tracing `Layer` that records the level of every emitted event.
     #[derive(Clone, Default)]

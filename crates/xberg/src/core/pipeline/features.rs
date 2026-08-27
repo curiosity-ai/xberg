@@ -313,7 +313,7 @@ fn classify_code_chunk(node_types: &[String]) -> crate::types::extraction::Chunk
 /// disregards, restricted to those the caller set away from their default value.
 ///
 /// Tree-sitter code-aware chunking always bypasses the general-purpose splitter,
-/// so `max_characters`/`overlap`/`chunker_type`/`trim`/`prepend_heading_context`
+/// so `max_characters`/`overlap`/`chunker_type`/`trim`
 /// are *always* ignored in that path — but warning about that unconditionally
 /// would fire on every code-chunked document, including the common case where
 /// the caller never touched chunking config and is relying on defaults. That's
@@ -336,10 +336,6 @@ fn overridden_code_chunk_settings(config: &crate::core::config::ChunkingConfig) 
     if config.trim != default.trim {
         overridden.push("trim");
     }
-    if config.prepend_heading_context != default.prepend_heading_context {
-        overridden.push("prepend_heading_context");
-    }
-
     overridden
 }
 
@@ -434,8 +430,8 @@ pub(super) fn execute_chunking(
             let resolved_config = chunking_config.resolve_preset();
 
             // Tree-sitter code-aware chunking bypasses the general-purpose splitter
-            // entirely, so max_characters/overlap/chunker_type/trim/
-            // prepend_heading_context are silently ignored. Surface that (#260) — but
+            // entirely, so max_characters/overlap/chunker_type/trim are silently
+            // ignored. Surface that (#260) — but
             // only when the caller actually moved one of those settings away from its
             // default; warning on every code-chunked document (the common case, where
             // chunking config is left at defaults) would be noise, not signal.
@@ -840,6 +836,7 @@ mod tests {
             content: content.into(),
             tables: vec![],
             image_indices: vec![],
+            image_preprocessing: None,
             hierarchy: None,
             is_blank: None,
             layout_regions: None,
@@ -1741,7 +1738,7 @@ mod tests {
     }
 
     /// Regression test for #260: tree-sitter code-aware chunking silently bypasses the
-    /// user's `max_characters`/`overlap`/`chunker_type`/`trim`/`prepend_heading_context`
+    /// user's `max_characters`/`overlap`/`chunker_type`/`trim`
     /// with no indication anything was overridden. When the caller has actually moved
     /// settings away from their defaults, the exact overridden names must be surfaced.
     #[cfg(feature = "tree-sitter")]

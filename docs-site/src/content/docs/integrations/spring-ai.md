@@ -8,7 +8,8 @@ Extraction runs locally in-process through the `io.xberg:xberg` native binding. 
 
 ## How it works
 
-1. **Extract** — Xberg parses each resource and runs OCR where needed. A single resource uses `Xberg.extract`; multiple resources use `Xberg.extractBatch` in one call, which is substantially faster.
+1. **Extract** — Xberg parses each resource and runs OCR where needed. A single resource uses `Xberg.extract`;
+   multiple resources use `Xberg.extractBatch` in one call to avoid repeated native crossings.
 2. **Split** — Each extracted document is split into `Document` instances at the highest granularity available: chunks, then elements, then pages, then the whole document.
 3. **Map** — Extraction metadata (title, authors, language, quality score, format-specific fields) plus split-specific fields (chunk index, `heading_path`, element type, bounding box) are attached to each `Document`.
 4. **Consume** — The resulting list feeds any Spring AI pipeline: `TextSplitter`, `EmbeddingModel`, `VectorStore`, and retrieval-augmented generation.
@@ -21,7 +22,7 @@ Add the dependency to your `pom.xml`. Requires Java 21+ and Spring AI 2.0.0.
 <dependency>
     <groupId>io.xberg</groupId>
     <artifactId>spring-ai-xberg</artifactId>
-    <version>1.0.0-rc.32</version>
+    <version>1.0.14</version>
 </dependency>
 ```
 
