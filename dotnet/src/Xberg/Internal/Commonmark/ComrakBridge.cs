@@ -119,9 +119,23 @@ internal static class ComrakBridge
                 }
                 case ElementKindTag.ListItem:
                 {
+                    // The CommonMark writer takes the marker style and the running number from the
+                    // *enclosing* List node alone — an item's own NodeList is not consulted — and
+                    // CommonMark cannot express a lettered or parenthesized marker like "B." or
+                    // "(a)" as an ordinal at all. So when a source label survived, it is written as
+                    // leading text and the list is forced to bulleted: emitting it as ordered would
+                    // print a synthesized "1." beside the real "B.", renumbering a document whose
+                    // clauses are cross-referenced by their printed label. A bullet defers to the
+                    // label instead of competing with it.
+                    string? sourceLabel = elemAttributes is not null
+                        && elemAttributes.TryGetValue(InternalElement.ListItemSourceLabelAttribute, out var rawLabel)
+                        && rawLabel.Length > 0
+                        ? rawLabel
+                        : null;
+                    bool numbered = elemKind.Ordered && sourceLabel is null;
                     var itemList = new NodeList
                     {
-                        ListType = elemKind.Ordered ? ListType.Ordered : ListType.Bullet,
+                        ListType = numbered ? ListType.Ordered : ListType.Bullet,
                         BulletChar = (byte)'-',
                         Start = 1,
                         Tight = true,
@@ -129,12 +143,26 @@ internal static class ComrakBridge
                     };
                     var item = new MdNode(NodeType.Item) { List = itemList };
                     var itemPara = new MdNode(NodeType.Paragraph);
+                    if (sourceLabel is not null) itemPara.Append(MkText(sourceLabel + " "));
                     var (itemText, itemAnnotations) = StripRedundantListMarker(elemText, elemAnnotations);
                     BuildInlines(itemPara, itemText, itemAnnotations);
                     item.Append(itemPara);
 
                     MdNode listParent;
-                    if (parent.Type == NodeType.List) listParent = parent;
+                    if (parent.Type == NodeType.List)
+                    {
+                        // A run opened by ListStart is already numbered; a labelled item joining it
+                        // has to demote the whole run, or the writer resumes counting around it.
+                        // NodeList is a struct, so the demoted copy has to be written back.
+                        if (!numbered)
+                        {
+                            var openList = parent.List;
+                            openList.ListType = ListType.Bullet;
+                            openList.BulletChar = (byte)'-';
+                            parent.List = openList;
+                        }
+                        listParent = parent;
+                    }
                     else
                     {
                         var implicitList = new MdNode(NodeType.List) { List = itemList };

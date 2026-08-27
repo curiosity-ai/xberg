@@ -2447,7 +2447,7 @@ public static class PdfStructure
     /// glyph, a dash followed by a space, or an ordered marker that has both a separator and
     /// alphabetic content after it.
     /// </summary>
-    private static bool LooksLikeListItem(string text)
+    internal static bool LooksLikeListItem(string text)
     {
         string t = text.TrimStart();
         if (t.Length == 0) return false;
@@ -2471,11 +2471,45 @@ public static class PdfStructure
         if (IsNumberedSectionHeading(t)) return false;
 
         if (PdfListMarker.Parse(t) is not { } marker) return false;
+        if (marker.ContentStart >= t.Length) return false;
+        char firstContentChar = t[marker.ContentStart];
         return marker.HasContent
             && marker.HasSeparator
             && !PdfListMarker.IsProbableAuthorByline(t)
-            && marker.ContentStart < t.Length
-            && char.IsLetter(t[marker.ContentStart]);
+            && char.IsLetter(firstContentChar)
+            && !IsInlineParenthesizedQuantity(t, marker, firstContentChar);
+    }
+
+    /// <summary>
+    /// Whether a line-leading <c>(N)</c> reads as a mid-sentence quantity clarification rather
+    /// than a list marker.
+    /// </summary>
+    /// <remarks>
+    /// "Two" followed by a line break and "(2) additional on-street parking spaces" wraps onto a
+    /// physical line that
+    /// <em>starts</em> with <c>(2)</c>, which is shaped identically to a genuine numbered marker
+    /// like <c>(2) Second item</c>, so the sentence was split into a list item mid-clause.
+    /// <para>
+    /// The distinguishing signal is capitalization plus how the marker was separated from its
+    /// content. A newline between the two means the marker arrived as
+    /// its own text run, glued to the next by line reconstruction rather than by the author — that
+    /// shape is trusted regardless of case. A plain space on the same physical line followed by a
+    /// lowercase word is the shape of a number spelled out in prose; a genuine enumerated item is
+    /// a new sentence and starts with a capital.
+    /// </para>
+    /// <para>
+    /// Scoped to parenthesized <em>numeric</em> markers only: <c>(a)</c>/<c>(b)</c> are genuine
+    /// sub-item markers (nobody writes "two (b) items"), and non-parenthesized families
+    /// (<c>"1. "</c>, <c>"[1] "</c>) have no English idiom that produces this false positive.
+    /// </para>
+    /// </remarks>
+    private static bool IsInlineParenthesizedQuantity(
+        string t, PdfListMarker.OrderedListMarker marker, char firstContentChar)
+    {
+        if (!t.StartsWith('(') || marker.NumericValue is null) return false;
+        string separatorRegion = t[..Math.Min(marker.ContentStart, t.Length)];
+        if (separatorRegion.Contains('\n') || separatorRegion.Contains('\r')) return false;
+        return !char.IsUpper(firstContentChar);
     }
 
     private static bool IsStructuralHeadingWord(string text) => text.Trim() switch
@@ -2843,7 +2877,12 @@ public static class PdfStructure
             else anns = new();
             var (normalized, removedPrefixLen) = NormalizeListText(text);
             anns = ShiftAnnotationsAfterPrefixRemoval(anns, removedPrefixLen, Utf8Len(normalized));
-            builder.PushListItem(normalized, ordered, anns, page, bbox);
+            uint listItemIndex = builder.PushListItem(normalized, ordered, anns, page, bbox);
+            // The marker just stripped off `text` is the document's own label. Keep it: an
+            // ordinance is cross-referenced by printed clause number, so a synthesized sequence
+            // position is not an acceptable substitute — "B." rendering as "1." renumbers the text.
+            if (ordered && removedPrefixLen > 0)
+                builder.SetListItemSourceLabel(listItemIndex, text[..removedPrefixLen].Trim());
             return;
         }
 

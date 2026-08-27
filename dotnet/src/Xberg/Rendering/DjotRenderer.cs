@@ -43,7 +43,15 @@ public static class DjotRenderer
                     if (elem.Text.Length > 0) Block(EmitInline(elem));
                     break;
                 case ElementKindTag.ListItem:
-                    sb.Append(elem.Kind.Ordered ? "1. " : "- ").Append(elem.Text).Append('\n');
+                    // Djot's auto-incrementing decimal marker cannot express a literal source
+                    // label (e.g. "B.", "(a)") any more than CommonMark's can, so an item
+                    // carrying one falls back to a bullet with the label written out — the same
+                    // trade-off the markdown renderer makes.
+                    if (elem.ListItemSourceLabel is { Length: > 0 } djotLabel)
+                        sb.Append("- ").Append(djotLabel).Append(' ');
+                    else
+                        sb.Append(elem.Kind.Ordered ? "1. " : "- ");
+                    sb.Append(elem.Text).Append('\n');
                     break;
                 case ElementKindTag.Code:
                     {

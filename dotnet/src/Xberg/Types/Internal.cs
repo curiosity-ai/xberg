@@ -132,6 +132,44 @@ public sealed class InternalElement
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Dictionary<string, string>? Attributes { get; set; }
 
+    /// <summary>
+    /// Attribute key holding a list item's literal source marker text (e.g. <c>"B."</c>,
+    /// <c>"(a)"</c>, <c>"iv."</c>).
+    /// </summary>
+    /// <remarks>
+    /// Deliberately a generic attribute rather than a field on <c>ElementKind.ListItem</c>, which
+    /// is a value type matched by value throughout the renderers and the structure-tree
+    /// derivation. It is also intentionally left out of the public-attribute filter, so it
+    /// reaches the public <c>DocumentStructure</c> tree via a node's attributes with no change
+    /// needed in the derivation.
+    /// </remarks>
+    public const string ListItemSourceLabelAttribute = "list_marker";
+
+    /// <summary>
+    /// The literal source list-marker text, if one was captured.
+    /// </summary>
+    /// <remarks>
+    /// <c>null</c> for every non-PDF extractor and for PDF list items whose marker text was not
+    /// confidently recovered — renderers fall back to the synthesized sequence position there,
+    /// exactly as they did before this attribute existed.
+    /// </remarks>
+    public string? ListItemSourceLabel =>
+        Attributes is not null && Attributes.TryGetValue(ListItemSourceLabelAttribute, out var label)
+            ? label
+            : null;
+
+    /// <summary>
+    /// Attach this element's literal source marker text. An empty label is a caller bug (a
+    /// marker-strip that removed nothing), not a real source marker, so it is ignored rather than
+    /// manufacturing a spurious attribute.
+    /// </summary>
+    public void SetListItemSourceLabel(string label)
+    {
+        if (label.Length == 0) return;
+        (Attributes ??= new Dictionary<string, string>(StringComparer.Ordinal))
+            [ListItemSourceLabelAttribute] = label;
+    }
+
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Anchor { get; set; }
 

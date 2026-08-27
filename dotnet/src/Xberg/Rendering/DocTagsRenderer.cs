@@ -38,10 +38,18 @@ public static class DocTagsRenderer
             switch (elem.Kind.Tag)
             {
                 case ElementKindTag.ListItem:
+                {
                     state.Open(output, elem.Kind.Ordered);
+                    // DocTags' list_item tag carries no separate marker slot — a literal source
+                    // label the auto `ordered` container alone cannot express is prefixed onto the
+                    // visible text, exactly as the other text-based renderers do.
+                    string itemText = elem.ListItemSourceLabel is { Length: > 0 } tagLabel
+                        ? tagLabel + " " + elem.Text
+                        : elem.Text;
                     PushElement(output, "list_item", loc,
-                                RenderCommon.NormalizeInlineText(elem.Text), null);
+                                RenderCommon.NormalizeInlineText(itemText), null);
                     continue;
+                }
                 case ElementKindTag.ListStart:
                     state.OpenExplicit(output, elem.Kind.Ordered);
                     continue;
