@@ -121,6 +121,14 @@ public static class PlainRenderer
                                 sb.Append("\n\n");
                             }
                         }
+                        else if (elem.Text.Trim().Length > 0)
+                        {
+                            // An image the extractor could not resolve (a missing archive member)
+                            // still carries its alt text or caption.
+                            sb.Append("[Image: ");
+                            sb.Append(elem.Text.Trim());
+                            sb.Append("]\n\n");
+                        }
                     }
                     break;
 

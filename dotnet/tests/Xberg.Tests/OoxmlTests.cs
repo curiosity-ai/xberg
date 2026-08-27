@@ -256,6 +256,30 @@ public class OoxmlTests
         Assert.Equal("Hello world", para.Text); // plain text = concatenated run text
     }
 
+    /// <summary>
+    /// Upstream <c>fix(docx): report a Heading1 paragraph as level 1</c>. With no
+    /// <c>styles.xml</c> to resolve, the level comes from the trailing digit of the style id —
+    /// which is already the level the author meant. Adding one to it, as the zero-based
+    /// <c>w:outlineLvl</c> path correctly does, made every heading in such a document a level
+    /// too deep.
+    /// </summary>
+    [Theory]
+    [InlineData("Heading1", 1)]
+    [InlineData("Heading2", 2)]
+    [InlineData("Heading6", 6)]
+    public void Docx_HeadingLevelFromStyleName_IsTheDigitItself(string styleId, int expected)
+    {
+        byte[] docx = Zip(
+            ("word/document.xml",
+                "<w:document xmlns:w=\"http://schemas.openxmlformats.org/wordprocessingml/2006/main\"><w:body>" +
+                $"<w:p><w:pPr><w:pStyle w:val=\"{styleId}\"/></w:pPr><w:r><w:t>Chapter One</w:t></w:r></w:p>" +
+                "</w:body></w:document>"));
+
+        var doc = new DocxExtractor().Extract(docx, DocxMime, new ExtractionConfig());
+        var heading = doc.Elements.First(e => e.Kind.Tag == ElementKindTag.Heading);
+        Assert.Equal(expected, heading.Kind.Level);
+    }
+
     [Fact]
     public void Docx_TableCellsUseRunMarkdown_AndMetadataFormatIsDocx()
     {

@@ -620,13 +620,25 @@ public static class DocxReader
         return HeadingLevelFromStyleName(styleId);
     }
 
+    /// <summary>
+    /// Heading level from a style id, for a document that ships no <c>styles.xml</c> or whose style
+    /// omits <c>w:outlineLvl</c>.
+    /// </summary>
+    /// <remarks>
+    /// The trailing digit of a style id like <c>Heading1</c> is already the level the author meant,
+    /// so it is returned as-is. The style-catalog path reads <c>w:outlineLvl</c>, which ISO 29500
+    /// defines as zero-based, so the <c>+ 1</c> there is correct and stays — this fallback used to
+    /// add one as well, making every heading in such a document a level too deep. There is no
+    /// reserved level for the title: ODT reads <c>text:outline-level</c> straight through with no
+    /// offset, so the extractors do not share one.
+    /// </remarks>
     private static byte? HeadingLevelFromStyleName(string id)
     {
         if (id == "Title") return 1;
         if (id.StartsWith("Heading", StringComparison.Ordinal) || id.StartsWith("heading", StringComparison.Ordinal))
         {
             var suffix = id["Heading".Length..];
-            if (int.TryParse(suffix, out var n) && n >= 1 && n <= 6) return (byte)Math.Min(n + 1, 6);
+            if (int.TryParse(suffix, out var n) && n >= 1 && n <= 6) return (byte)n;
             return null;
         }
         return null;
